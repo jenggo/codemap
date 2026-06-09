@@ -1,0 +1,53 @@
+{
+  "packages": 1,
+  "symbols": 4,
+  "edges": 5,
+  "overview": [
+    {
+      "Path": "codemap/testdata/simple",
+      "Name": "simple",
+      "ExportedSymbols": [
+        {
+          "QualifiedName": "codemap/testdata/simple.NewParser",
+          "Kind": "function",
+          "Receiver": "",
+          "Signature": "func (input string) *Parser",
+          "Doc": "NewParser creates a new Parser.\n",
+          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/simple/parser.go",
+          "PosLine": 9,
+          "Exported": true
+        },
+        {
+          "QualifiedName": "codemap/testdata/simple.Parser",
+          "Kind": "type",
+          "Receiver": "",
+          "Signature": "struct { input string }",
+          "Doc": "Parser parses input and produces output.\n",
+          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/simple/parser.go",
+          "PosLine": 4,
+          "Exported": true
+        },
+        {
+          "QualifiedName": "codemap/testdata/simple.Parser.Parse",
+          "Kind": "method",
+          "Receiver": "Parser",
+          "Signature": "func () (string, error)",
+          "Doc": "Parse processes the input and returns a result.\n",
+          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/simple/parser.go",
+          "PosLine": 14,
+          "Exported": true
+        }
+      ],
+      "ImportCount": 0
+    }
+  ],
+  "list_packages": [
+    {
+      "Path": "codemap/testdata/simple",
+      "Name": "simple",
+      "Dir": "/home/jenggo/go/src/cli/codemap/testdata/simple",
+      "IsTest": false,
+      "SymCount": 4
+    }
+  ]
+}

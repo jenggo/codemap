@@ -1,0 +1,5 @@
+openspec/
+.opencode/
+*.md
+!README.md
+.codemap/

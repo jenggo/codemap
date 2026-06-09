@@ -1,0 +1,83 @@
+{
+  "packages": 1,
+  "symbols": 6,
+  "edges": 19,
+  "overview": [
+    {
+      "Path": "codemap/testdata/interfaces",
+      "Name": "interfaces",
+      "ExportedSymbols": [
+        {
+          "QualifiedName": "codemap/testdata/interfaces.Buffer",
+          "Kind": "type",
+          "Receiver": "",
+          "Signature": "struct { data []byte }",
+          "Doc": "Buffer implements both Reader and Writer.\n",
+          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/interfaces/interfaces.go",
+          "PosLine": 14,
+          "Exported": true
+        },
+        {
+          "QualifiedName": "codemap/testdata/interfaces.Buffer.Read",
+          "Kind": "method",
+          "Receiver": "Buffer",
+          "Signature": "func (p []byte) (int, error)",
+          "Doc": "Read implements the Reader interface.\n",
+          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/interfaces/interfaces.go",
+          "PosLine": 19,
+          "Exported": true
+        },
+        {
+          "QualifiedName": "codemap/testdata/interfaces.Buffer.Write",
+          "Kind": "method",
+          "Receiver": "Buffer",
+          "Signature": "func (p []byte) (int, error)",
+          "Doc": "Write implements the Writer interface.\n",
+          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/interfaces/interfaces.go",
+          "PosLine": 26,
+          "Exported": true
+        },
+        {
+          "QualifiedName": "codemap/testdata/interfaces.Process",
+          "Kind": "function",
+          "Receiver": "",
+          "Signature": "func (r Reader, w Writer) error",
+          "Doc": "Process reads from a Reader and writes to a Writer.\n",
+          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/interfaces/interfaces.go",
+          "PosLine": 32,
+          "Exported": true
+        },
+        {
+          "QualifiedName": "codemap/testdata/interfaces.Reader",
+          "Kind": "interface",
+          "Receiver": "",
+          "Signature": "interface",
+          "Doc": "Reader defines an interface for reading data.\n",
+          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/interfaces/interfaces.go",
+          "PosLine": 4,
+          "Exported": true
+        },
+        {
+          "QualifiedName": "codemap/testdata/interfaces.Writer",
+          "Kind": "interface",
+          "Receiver": "",
+          "Signature": "interface",
+          "Doc": "Writer defines an interface for writing data.\n",
+          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/interfaces/interfaces.go",
+          "PosLine": 9,
+          "Exported": true
+        }
+      ],
+      "ImportCount": 0
+    }
+  ],
+  "list_packages": [
+    {
+      "Path": "codemap/testdata/interfaces",
+      "Name": "interfaces",
+      "Dir": "/home/jenggo/go/src/cli/codemap/testdata/interfaces",
+      "IsTest": false,
+      "SymCount": 6
+    }
+  ]
+}

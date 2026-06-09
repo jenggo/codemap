@@ -1,0 +1,103 @@
+{
+  "packages": 1,
+  "symbols": 8,
+  "edges": 17,
+  "overview": [
+    {
+      "Path": "codemap/testdata/embedding",
+      "Name": "embedding",
+      "ExportedSymbols": [
+        {
+          "QualifiedName": "codemap/testdata/embedding.AnotherBase",
+          "Kind": "type",
+          "Receiver": "",
+          "Signature": "struct { Value int }",
+          "Doc": "AnotherBase provides different common functionality.\n",
+          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/embedding/embedding.go",
+          "PosLine": 25,
+          "Exported": true
+        },
+        {
+          "QualifiedName": "codemap/testdata/embedding.AnotherBase.GetValue",
+          "Kind": "method",
+          "Receiver": "AnotherBase",
+          "Signature": "func () int",
+          "Doc": "GetValue returns the base value.\n",
+          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/embedding/embedding.go",
+          "PosLine": 30,
+          "Exported": true
+        },
+        {
+          "QualifiedName": "codemap/testdata/embedding.Base",
+          "Kind": "type",
+          "Receiver": "",
+          "Signature": "struct { ID int }",
+          "Doc": "Base provides common functionality.\n",
+          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/embedding/embedding.go",
+          "PosLine": 4,
+          "Exported": true
+        },
+        {
+          "QualifiedName": "codemap/testdata/embedding.Base.GetName",
+          "Kind": "method",
+          "Receiver": "Base",
+          "Signature": "func () string",
+          "Doc": "GetName returns the base name.\n",
+          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/embedding/embedding.go",
+          "PosLine": 9,
+          "Exported": true
+        },
+        {
+          "QualifiedName": "codemap/testdata/embedding.Extended",
+          "Kind": "type",
+          "Receiver": "",
+          "Signature": "struct { Base; Name string }",
+          "Doc": "Extended embeds Base and adds more functionality.\n",
+          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/embedding/embedding.go",
+          "PosLine": 14,
+          "Exported": true
+        },
+        {
+          "QualifiedName": "codemap/testdata/embedding.Extended.GetFullName",
+          "Kind": "method",
+          "Receiver": "Extended",
+          "Signature": "func () string",
+          "Doc": "GetFullName returns the full name combining base and extended.\n",
+          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/embedding/embedding.go",
+          "PosLine": 20,
+          "Exported": true
+        },
+        {
+          "QualifiedName": "codemap/testdata/embedding.MultiEmbed",
+          "Kind": "type",
+          "Receiver": "",
+          "Signature": "struct { Base; AnotherBase; Label string }",
+          "Doc": "MultiEmbed embeds both Base and AnotherBase.\n",
+          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/embedding/embedding.go",
+          "PosLine": 35,
+          "Exported": true
+        },
+        {
+          "QualifiedName": "codemap/testdata/embedding.MultiEmbed.GetInfo",
+          "Kind": "method",
+          "Receiver": "MultiEmbed",
+          "Signature": "func () string",
+          "Doc": "GetInfo returns combined information from all embedded types.\n",
+          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/embedding/embedding.go",
+          "PosLine": 42,
+          "Exported": true
+        }
+      ],
+      "ImportCount": 0
+    }
+  ],
+  "list_packages": [
+    {
+      "Path": "codemap/testdata/embedding",
+      "Name": "embedding",
+      "Dir": "/home/jenggo/go/src/cli/codemap/testdata/embedding",
+      "IsTest": false,
+      "SymCount": 8
+    }
+  ]
+}
