@@ -59,7 +59,7 @@ codemap serve
 | **Method search** | Find all methods with a given name across all types |
 
 ### Output Formats
-- **TOON** (default) — human-readable terminal output
+- **TOON** (default) — token-efficient output optimized for LLM consumption
 - **JSON** — machine-readable (`--json`)
 - **Compact** — minimal (`--compact`)
 
