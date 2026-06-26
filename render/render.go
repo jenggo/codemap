@@ -3,6 +3,7 @@ package render
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"codemap/query"
@@ -584,9 +585,9 @@ func renderMethodsOfTOON(methods []query.SymbolDetail) string {
 
 func renderPackageTOON(pkg *query.PackageResult) string {
 	data := map[string]any{
-		"path":            pkg.Path,
-		"name":            pkg.Name,
-		"import_count":    pkg.ImportCount,
+		"path":             pkg.Path,
+		"name":             pkg.Name,
+		"import_count":     pkg.ImportCount,
 		"exported_symbols": pkg.ExportedSymbols,
 	}
 	out, err := gotoon.Encode(data)
@@ -594,4 +595,387 @@ func renderPackageTOON(pkg *query.PackageResult) string {
 		return marshalJSON(pkg)
 	}
 	return out
+}
+
+func RenderSymbolBody(result *query.SymbolBodyResult, opts ...Option) string {
+	options := &Options{}
+	for _, o := range opts {
+		o(options)
+	}
+
+	switch options.Format {
+	case FormatTOON:
+		return renderSymbolBodyTOON(result)
+	case FormatJSON:
+		return renderSymbolBodyJSON(result)
+	case FormatCompact:
+		return renderSymbolBodyCompact(result)
+	case FormatText:
+		return renderSymbolBodyText(result)
+	default:
+		return renderSymbolBodyTOON(result)
+	}
+}
+
+type symbolBodyJSON struct {
+	QualifiedName string `json:"qualified_name"`
+	Kind          string `json:"kind"`
+	PosFile       string `json:"pos_file"`
+	Body          string `json:"body"`
+	ContextBefore string `json:"context_before,omitempty"`
+	ContextAfter  string `json:"context_after,omitempty"`
+	PosLine       int    `json:"pos_line"`
+	PosEndLine    int    `json:"pos_end_line"`
+	GroupMembers  int    `json:"group_members"`
+	PartOfGroup   bool   `json:"part_of_group"`
+}
+
+func renderSymbolBodyJSON(r *query.SymbolBodyResult) string {
+	return marshalJSON(symbolBodyJSON{
+		QualifiedName: r.QualifiedName,
+		Kind:          r.Kind,
+		PosFile:       r.PosFile,
+		PosLine:       r.PosLine,
+		PosEndLine:    r.PosEndLine,
+		Body:          r.Body,
+		PartOfGroup:   r.PartOfGroup,
+		GroupMembers:  r.GroupMembers,
+		ContextBefore: r.ContextBefore,
+		ContextAfter:  r.ContextAfter,
+	})
+}
+
+func renderSymbolBodyTOON(r *query.SymbolBodyResult) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s (%s)\n", r.QualifiedName, r.Kind)
+	fmt.Fprintf(&b, "pos: %s:%d-%d\n", r.PosFile, r.PosLine, r.PosEndLine)
+	if r.PartOfGroup {
+		fmt.Fprintf(&b, "part_of_group: true (group_members=%d)\n", r.GroupMembers)
+	}
+	if r.ContextBefore != "" {
+		b.WriteString("\n--- context before ---\n")
+		b.WriteString(r.ContextBefore)
+		b.WriteString("\n")
+	}
+	b.WriteString("\n```go\n")
+	b.WriteString(r.Body)
+	if !strings.HasSuffix(r.Body, "\n") {
+		b.WriteString("\n")
+	}
+	b.WriteString("```\n")
+	if r.ContextAfter != "" {
+		b.WriteString("\n--- context after ---\n")
+		b.WriteString(r.ContextAfter)
+		if !strings.HasSuffix(r.ContextAfter, "\n") {
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
+func renderSymbolBodyCompact(r *query.SymbolBodyResult) string {
+	return fmt.Sprintf("%s %s:%d-%d (%d bytes)", r.Kind, r.PosFile, r.PosLine, r.PosEndLine, len(r.Body))
+}
+
+func renderSymbolBodyText(r *query.SymbolBodyResult) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s (%s) %s:%d-%d\n", r.QualifiedName, r.Kind, r.PosFile, r.PosLine, r.PosEndLine)
+	if r.PartOfGroup {
+		fmt.Fprintf(&b, "[part of group, %d members]\n", r.GroupMembers)
+	}
+	b.WriteString("----\n")
+	b.WriteString(r.Body)
+	if !strings.HasSuffix(r.Body, "\n") {
+		b.WriteString("\n")
+	}
+	b.WriteString("----\n")
+	return b.String()
+}
+
+func RenderDependencyLayers(result *query.LayersResult, opts ...Option) string {
+	options := &Options{}
+	for _, o := range opts {
+		o(options)
+	}
+
+	switch options.Format {
+	case FormatTOON:
+		return renderDependencyLayersTOON(result)
+	case FormatJSON:
+		return renderDependencyLayersJSON(result)
+	case FormatCompact:
+		return renderDependencyLayersCompact(result)
+	case FormatText:
+		return renderDependencyLayersText(result)
+	default:
+		return renderDependencyLayersTOON(result)
+	}
+}
+
+type layerJSON struct {
+	Packages []string `json:"packages"`
+	Level    int      `json:"level"`
+}
+
+type hubJSON struct {
+	Package string `json:"package"`
+	FanIn   int    `json:"fan_in"`
+	FanOut  int    `json:"fan_out"`
+}
+
+type layersJSON struct {
+	Layers []layerJSON `json:"layers"`
+	Hubs   []hubJSON   `json:"hubs"`
+}
+
+func renderDependencyLayersJSON(r *query.LayersResult) string {
+	out := layersJSON{
+		Layers: make([]layerJSON, 0, len(r.Layers)),
+		Hubs:   make([]hubJSON, 0, len(r.Hubs)),
+	}
+	for _, l := range r.Layers {
+		out.Layers = append(out.Layers, layerJSON{Level: l.Level, Packages: l.Packages})
+	}
+	for _, h := range r.Hubs {
+		out.Hubs = append(out.Hubs, hubJSON{Package: h.Package, FanIn: h.FanIn, FanOut: h.FanOut})
+	}
+	return marshalJSON(out)
+}
+
+func renderDependencyLayersText(r *query.LayersResult) string {
+	var b strings.Builder
+	b.WriteString("Layers:\n")
+	for _, l := range r.Layers {
+		fmt.Fprintf(&b, "  level %d:\n", l.Level)
+		for _, p := range l.Packages {
+			fmt.Fprintf(&b, "    - %s\n", p)
+		}
+	}
+	b.WriteString("\nHubs (by fan-in):\n")
+	for _, h := range r.Hubs {
+		fmt.Fprintf(&b, "  %s — fan_in=%d fan_out=%d\n", h.Package, h.FanIn, h.FanOut)
+	}
+	return b.String()
+}
+
+func renderDependencyLayersCompact(r *query.LayersResult) string {
+	var b strings.Builder
+	for _, l := range r.Layers {
+		fmt.Fprintf(&b, "L%d: %s\n", l.Level, strings.Join(l.Packages, ", "))
+	}
+	return b.String()
+}
+
+func renderDependencyLayersTOON(r *query.LayersResult) string {
+	data := map[string]any{
+		"layers": r.Layers,
+		"hubs":   r.Hubs,
+	}
+	out, err := gotoon.Encode(data)
+	if err != nil {
+		return renderDependencyLayersJSON(r)
+	}
+	return out
+}
+
+func RenderDependencyFlow(result *query.FlowResult, opts ...Option) string {
+	options := &Options{}
+	for _, o := range opts {
+		o(options)
+	}
+
+	switch options.Format {
+	case FormatTOON:
+		return renderDependencyFlowTOON(result)
+	case FormatJSON:
+		return marshalJSON(result)
+	case FormatCompact:
+		return renderDependencyFlowCompact(result)
+	case FormatText:
+		return renderDependencyFlowText(result)
+	default:
+		return renderDependencyFlowTOON(result)
+	}
+}
+
+func renderDependencyFlowTOON(r *query.FlowResult) string {
+	data := map[string]any{
+		"package":            r.Package,
+		"imports":            r.Imports,
+		"importers":          r.Importers,
+		"transitive_imports": r.TransitiveImports,
+	}
+	out, err := gotoon.Encode(data)
+	if err != nil {
+		return marshalJSON(r)
+	}
+	return out
+}
+
+func renderDependencyFlowText(r *query.FlowResult) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s\n\n", r.Package)
+
+	b.WriteString("imports (immediate):\n")
+	if len(r.Imports) == 0 {
+		b.WriteString("  (none)\n")
+	}
+	for _, e := range r.Imports {
+		fmt.Fprintf(&b, "  -> %s [%s:%d]\n", e.ToRef, e.PosFile, e.PosLine)
+	}
+
+	b.WriteString("\nimporters (immediate):\n")
+	if len(r.Importers) == 0 {
+		b.WriteString("  (none)\n")
+	}
+	for _, e := range r.Importers {
+		fmt.Fprintf(&b, "  <- %s [%s:%d]\n", e.FromRef, e.PosFile, e.PosLine)
+	}
+
+	b.WriteString("\ntransitive imports:\n")
+	if len(r.TransitiveImports) == 0 {
+		b.WriteString("  (none)\n")
+	}
+	for _, e := range r.TransitiveImports {
+		fmt.Fprintf(&b, "  -> %s [%s:%d]\n", e.ToRef, e.PosFile, e.PosLine)
+	}
+	return b.String()
+}
+
+func renderDependencyFlowCompact(r *query.FlowResult) string {
+	return fmt.Sprintf("%s: %d imports, %d importers, %d transitive",
+		r.Package, len(r.Imports), len(r.Importers), len(r.TransitiveImports))
+}
+
+func RenderEntryPoints(entries []query.EntryPoint, opts ...Option) string {
+	options := &Options{}
+	for _, o := range opts {
+		o(options)
+	}
+
+	switch options.Format {
+	case FormatTOON:
+		return renderEntryPointsTOON(entries)
+	case FormatJSON:
+		return marshalJSON(entries)
+	case FormatCompact:
+		return renderEntryPointsCompact(entries)
+	case FormatText:
+		return renderEntryPointsText(entries)
+	default:
+		return renderEntryPointsTOON(entries)
+	}
+}
+
+func renderEntryPointsTOON(entries []query.EntryPoint) string {
+	byReason := make(map[string][]query.EntryPoint)
+	for _, e := range entries {
+		byReason[e.Reason] = append(byReason[e.Reason], e)
+	}
+	data := map[string]any{
+		"entry_points": entries,
+		"by_reason":    byReason,
+	}
+	out, err := gotoon.Encode(data)
+	if err != nil {
+		return marshalJSON(entries)
+	}
+	return out
+}
+
+func renderEntryPointsText(entries []query.EntryPoint) string {
+	var b strings.Builder
+	currentReason := ""
+	for _, e := range entries {
+		if e.Reason != currentReason {
+			currentReason = e.Reason
+			fmt.Fprintf(&b, "\n[%s]\n", e.Reason)
+		}
+		fmt.Fprintf(&b, "  %s (%s) %s:%d\n", e.QualifiedName, e.Kind, e.PosFile, e.PosLine)
+	}
+	return b.String()
+}
+
+func renderEntryPointsCompact(entries []query.EntryPoint) string {
+	byReason := make(map[string]int)
+	for _, e := range entries {
+		byReason[e.Reason]++
+	}
+	parts := make([]string, 0, len(byReason))
+	for k, v := range byReason {
+		parts = append(parts, fmt.Sprintf("%s=%d", k, v))
+	}
+	sort.Strings(parts)
+	return fmt.Sprintf("entry_points: %d (%s)", len(entries), strings.Join(parts, ", "))
+}
+
+func RenderChangedSymbols(result *query.ChangedSymbolsResult, opts ...Option) string {
+	options := &Options{}
+	for _, o := range opts {
+		o(options)
+	}
+
+	switch options.Format {
+	case FormatTOON:
+		return renderChangedSymbolsTOON(result)
+	case FormatJSON:
+		return marshalJSON(result)
+	case FormatCompact:
+		return renderChangedSymbolsCompact(result)
+	case FormatText:
+		return renderChangedSymbolsText(result)
+	default:
+		return renderChangedSymbolsTOON(result)
+	}
+}
+
+func renderChangedSymbolsTOON(r *query.ChangedSymbolsResult) string {
+	data := map[string]any{
+		"summary": r.Summary,
+		"symbols": r.Symbols,
+	}
+	out, err := gotoon.Encode(data)
+	if err != nil {
+		return marshalJSON(r)
+	}
+	return out
+}
+
+func renderChangedSymbolsText(r *query.ChangedSymbolsResult) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Files changed: %d, modified: %d, added: %d, removed: %d\n\n",
+		r.Summary.FilesChanged, r.Summary.Modified, r.Summary.Added, r.Summary.Removed)
+	for _, sym := range r.Symbols {
+		fmt.Fprintf(&b, "[%s] %s (%s) %s:%d\n", sym.ChangeType, sym.QualifiedName, sym.Kind, sym.PosFile, sym.PosLine)
+		if sym.BlastRadius != nil {
+			fmt.Fprintf(&b, "  blast_radius: direct=%d transitive=%d\n",
+				sym.BlastRadius.DirectCallers, sym.BlastRadius.TransitiveCallers)
+		}
+		if sym.Body != "" {
+			b.WriteString("  ```go\n")
+			b.WriteString(indentEach(sym.Body, "  "))
+			b.WriteString("  ```\n")
+		}
+	}
+	return b.String()
+}
+
+func renderChangedSymbolsCompact(r *query.ChangedSymbolsResult) string {
+	return fmt.Sprintf("files=%d modified=%d added=%d removed=%d",
+		r.Summary.FilesChanged, r.Summary.Modified, r.Summary.Added, r.Summary.Removed)
+}
+
+func indentEach(s, prefix string) string {
+	lines := strings.Split(s, "\n")
+	var b strings.Builder
+	for i, line := range lines {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		if line != "" {
+			b.WriteString(prefix)
+		}
+		b.WriteString(line)
+	}
+	return b.String()
 }

@@ -724,55 +724,74 @@ func IsStale(dbPath string, repoPath string) (bool, error) {
 		return true, nil
 	}
 
+	indexedAt, ok := readIndexedAt(dbPath)
+	if !ok {
+		return true, nil
+	}
+
+	return hasNewerGoFiles(repoPath, indexedAt), nil
+}
+
+func readIndexedAt(dbPath string) (time.Time, bool) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
-		return true, nil
+		return time.Time{}, false
 	}
 	defer func() { _ = db.Close() }()
 
 	var val string
 	if err := db.QueryRowContext(context.Background(), `SELECT value FROM meta WHERE key = 'indexed_at'`).Scan(&val); err != nil {
-		return true, nil
+		return time.Time{}, false
 	}
 
 	indexedAt, err := time.Parse(time.RFC3339, val)
 	if err != nil {
-		return true, nil
+		return time.Time{}, false
 	}
+	return indexedAt, true
+}
 
+func hasNewerGoFiles(repoPath string, indexedAt time.Time) bool {
 	stale := false
-	err = filepath.Walk(repoPath, func(path string, info os.FileInfo, err error) error {
+	err := filepath.Walk(repoPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil || stale {
 			return err
 		}
 		if !info.IsDir() {
 			return nil
 		}
-		name := info.Name()
-		if strings.HasPrefix(name, ".") || name == "vendor" || name == "node_modules" {
+		if skipStaleDir(info.Name()) {
 			return filepath.SkipDir
 		}
-		entries, _ := os.ReadDir(path)
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			if strings.HasSuffix(e.Name(), ".go") {
-				fi, err := e.Info()
-				if err != nil {
-					continue
-				}
-				if fi.ModTime().After(indexedAt) {
-					stale = true
-					return filepath.SkipDir
-				}
-			}
+		if dirHasNewerGoFile(path, indexedAt) {
+			stale = true
+			return filepath.SkipDir
 		}
 		return nil
 	})
 	if err != nil {
-		return true, nil
+		return true
 	}
+	return stale
+}
 
-	return stale, nil
+func skipStaleDir(name string) bool {
+	return strings.HasPrefix(name, ".") || name == "vendor" || name == "node_modules"
+}
+
+func dirHasNewerGoFile(dir string, indexedAt time.Time) bool {
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") {
+			continue
+		}
+		fi, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if fi.ModTime().After(indexedAt) {
+			return true
+		}
+	}
+	return false
 }

@@ -2,11 +2,17 @@ package query
 
 import (
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
 
 	"codemap/store"
+	"codemap/vcs"
 )
 
 type Options struct {
@@ -127,9 +133,30 @@ func edgeTypeAllowed(edgeType string, allowed []string) bool {
 	return slices.Contains(allowed, edgeType)
 }
 
+func edgeToDetail(e store.Edge) EdgeDetail {
+	return EdgeDetail{
+		FromRef:  e.FromRef,
+		ToRef:    e.ToRef,
+		EdgeType: e.EdgeType,
+		PosFile:  e.PosFile,
+		PosLine:  e.PosLine,
+	}
+}
+
 var allEdgeTypes = []string{"calls", "references", "satisfies", "embeds", "imports"}
 
 const edgeTypeSatisfies = "satisfies"
+const edgeTypeCalls = "calls"
+const edgeTypeReferences = "references"
+const edgeTypeImports = "imports"
+
+const kindFunction = "function"
+const kindMain = "main"
+const kindMethod = "method"
+const kindVar = "var"
+
+const changeTypeModified = "modified"
+const changeTypeAdded = "added"
 
 type edgeFetcher func(ref string) ([]store.Edge, error)
 
@@ -303,7 +330,7 @@ func buildPackageSummary(s *store.Store, p store.Package, includeTests bool) Pac
 
 	importEdges, _ := s.EdgesFrom(p.Path)
 	for _, e := range importEdges {
-		if e.EdgeType == "imports" {
+		if e.EdgeType == edgeTypeImports {
 			summary.ImportCount++
 		}
 	}
@@ -376,7 +403,7 @@ func matchTier(nameLower, patternLower string) int {
 
 func kindPriority(kind string) int {
 	switch kind {
-	case "function", "method":
+	case kindFunction, kindMethod:
 		return 0
 	case "interface", "type":
 		return 1
@@ -473,7 +500,7 @@ func Package(s *store.Store, pkgPath string, opts ...Option) (*PackageResult, er
 	importEdges, _ := s.EdgesFrom(pkgPath)
 	importCount := 0
 	for _, e := range importEdges {
-		if e.EdgeType == "imports" {
+		if e.EdgeType == edgeTypeImports {
 			importCount++
 		}
 	}
@@ -557,29 +584,61 @@ func ImportersOf(s *store.Store, pkgPath string, opts ...Option) ([]EdgeDetail, 
 		o(options)
 	}
 
+	allowTypes := options.EdgeTypes
+	if len(allowTypes) == 0 {
+		allowTypes = []string{edgeTypeImports}
+	}
+
 	edges, err := s.EdgesTo(pkgPath)
 	if err != nil {
 		return nil, err
 	}
 
-	allowTypes := options.EdgeTypes
-	if len(allowTypes) == 0 {
-		allowTypes = []string{"imports"}
+	result := filterEdgesByType(edges, allowTypes)
+	if len(result) > 0 {
+		return result, nil
 	}
 
-	result := make([]EdgeDetail, 0)
-	for _, e := range edges {
-		if edgeTypeAllowed(e.EdgeType, allowTypes) {
-			result = append(result, EdgeDetail{
-				FromRef:  e.FromRef,
-				ToRef:    e.ToRef,
-				EdgeType: e.EdgeType,
-				PosFile:  e.PosFile,
-				PosLine:  e.PosLine,
-			})
-		}
+	fallback := importersViaShortPath(s, pkgPath, allowTypes)
+	if fallback != nil {
+		return fallback, nil
 	}
 	return result, nil
+}
+
+func filterEdgesByType(edges []store.Edge, allowTypes []string) []EdgeDetail {
+	result := make([]EdgeDetail, 0, len(edges))
+	for _, e := range edges {
+		if edgeTypeAllowed(e.EdgeType, allowTypes) {
+			result = append(result, edgeToDetail(e))
+		}
+	}
+	return result
+}
+
+func importersViaShortPath(s *store.Store, pkgPath string, allowTypes []string) []EdgeDetail {
+	allImports, err := s.EdgesByType(edgeTypeImports)
+	if err != nil {
+		return nil
+	}
+	pkgs, err := s.ListPackages()
+	if err != nil {
+		return nil
+	}
+	projectSet := make(map[string]bool)
+	for _, p := range pkgs {
+		projectSet[p.Path] = true
+	}
+	reverseMap := buildImportPathMap(allImports, projectSet)
+	importPath, ok := reverseMap[pkgPath]
+	if !ok || importPath == pkgPath {
+		return nil
+	}
+	edges, err := s.EdgesTo(importPath)
+	if err != nil {
+		return nil
+	}
+	return filterEdgesByType(edges, allowTypes)
 }
 
 func ImportsOf(s *store.Store, pkgPath string, opts ...Option) ([]EdgeDetail, error) {
@@ -595,7 +654,7 @@ func ImportsOf(s *store.Store, pkgPath string, opts ...Option) ([]EdgeDetail, er
 
 	allowTypes := options.EdgeTypes
 	if len(allowTypes) == 0 {
-		allowTypes = []string{"imports"}
+		allowTypes = []string{edgeTypeImports}
 	}
 
 	result := make([]EdgeDetail, 0)
@@ -642,22 +701,74 @@ func SearchByPrefix(s *store.Store, prefix string, opts ...Option) ([]SearchResu
 }
 
 func TransitiveImports(s *store.Store, pkgPath string, opts ...Option) ([]EdgeDetail, error) {
-	edges, err := s.TransitiveImports(pkgPath)
+	pkgs, err := s.ListPackages()
+	if err != nil {
+		return nil, err
+	}
+	projectSet, found := buildProjectSet(pkgs, pkgPath)
+	if !found {
+		return transitiveImportsLegacy(s, pkgPath)
+	}
+
+	allImports, err := s.EdgesByType(edgeTypeImports)
 	if err != nil {
 		return nil, err
 	}
 
-	result := make([]EdgeDetail, len(edges))
-	for i, e := range edges {
-		result[i] = EdgeDetail{
-			FromRef:  e.FromRef,
-			ToRef:    e.ToRef,
-			EdgeType: e.EdgeType,
-			PosFile:  e.PosFile,
-			PosLine:  e.PosLine,
+	return transitiveImportBFS(pkgPath, allImports, projectSet), nil
+}
+
+func buildProjectSet(pkgs []store.Package, pkgPath string) (map[string]bool, bool) {
+	projectSet := make(map[string]bool)
+	found := false
+	for _, p := range pkgs {
+		projectSet[p.Path] = true
+		if p.Path == pkgPath {
+			found = true
 		}
 	}
+	return projectSet, found
+}
+
+func transitiveImportsLegacy(s *store.Store, pkgPath string) ([]EdgeDetail, error) {
+	edges, err := s.TransitiveImports(pkgPath)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]EdgeDetail, len(edges))
+	for i, e := range edges {
+		result[i] = edgeToDetail(e)
+	}
 	return result, nil
+}
+
+func transitiveImportBFS(pkgPath string, allImports []store.Edge, projectSet map[string]bool) []EdgeDetail {
+	var out []EdgeDetail
+	visited := map[string]bool{pkgPath: true}
+	queue := []string{pkgPath}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		for _, e := range allImports {
+			if e.FromRef != current {
+				continue
+			}
+			target := resolveProjectTarget(e.ToRef, projectSet)
+			if target == "" || visited[target] {
+				continue
+			}
+			out = append(out, edgeToDetail(e))
+			visited[target] = true
+			queue = append(queue, target)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].FromRef != out[j].FromRef {
+			return out[i].FromRef < out[j].FromRef
+		}
+		return out[i].ToRef < out[j].ToRef
+	})
+	return out
 }
 
 func TypeUsage(s *store.Store, typeName string, opts ...Option) ([]SearchResult, error) {
@@ -696,16 +807,26 @@ type PathStep struct {
 	PosLine  int
 }
 
+type pathNode struct {
+	name string
+	path []PathStep
+}
+
+func enqueueIfUnvisited(name string, e store.Edge, path []PathStep, visited map[string]bool, queue []pathNode) []pathNode {
+	if visited[name] {
+		return queue
+	}
+	step := PathStep{From: e.FromRef, To: e.ToRef, EdgeType: e.EdgeType, PosFile: e.PosFile, PosLine: e.PosLine}
+	nextPath := append(append([]PathStep{}, path...), step)
+	return append(queue, pathNode{name: name, path: nextPath})
+}
+
 func FindPath(s *store.Store, from, to string, maxDepth int, opts ...Option) ([]PathStep, error) {
 	if maxDepth <= 0 {
 		maxDepth = 10
 	}
-	type node struct {
-		name string
-		path []PathStep
-	}
 	visited := make(map[string]bool)
-	queue := []node{{name: from}}
+	queue := []pathNode{{name: from}}
 
 	for len(queue) > 0 {
 		current := queue[0]
@@ -729,10 +850,7 @@ func FindPath(s *store.Store, from, to string, maxDepth int, opts ...Option) ([]
 			return nil, err
 		}
 		for _, e := range edges {
-			if !visited[e.ToRef] {
-				step := PathStep{From: e.FromRef, To: e.ToRef, EdgeType: e.EdgeType, PosFile: e.PosFile, PosLine: e.PosLine}
-				queue = append(queue, node{name: e.ToRef, path: append(append([]PathStep{}, current.path...), step)})
-			}
+			queue = enqueueIfUnvisited(e.ToRef, e, current.path, visited, queue)
 		}
 
 		edges, err = s.EdgesTo(current.name)
@@ -740,10 +858,7 @@ func FindPath(s *store.Store, from, to string, maxDepth int, opts ...Option) ([]
 			return nil, err
 		}
 		for _, e := range edges {
-			if !visited[e.FromRef] {
-				step := PathStep{From: e.FromRef, To: e.ToRef, EdgeType: e.EdgeType, PosFile: e.PosFile, PosLine: e.PosLine}
-				queue = append(queue, node{name: e.FromRef, path: append(append([]PathStep{}, current.path...), step)})
-			}
+			queue = enqueueIfUnvisited(e.FromRef, e, current.path, visited, queue)
 		}
 	}
 
@@ -853,7 +968,7 @@ func UnusedSymbols(s *store.Store, opts ...Option) ([]UnusedSymbol, error) {
 
 	called := make(map[string]bool)
 	for _, e := range edgesFrom {
-		if e.EdgeType == "calls" || e.EdgeType == "references" || e.EdgeType == edgeTypeSatisfies || e.EdgeType == "embeds" {
+		if e.EdgeType == edgeTypeCalls || e.EdgeType == edgeTypeReferences || e.EdgeType == edgeTypeSatisfies || e.EdgeType == "embeds" {
 			called[e.ToRef] = true
 		}
 	}
@@ -963,12 +1078,12 @@ func SymbolsInFile(s *store.Store, filePath string, opts ...Option) ([]SearchRes
 }
 
 type BlastRadius struct {
-	Symbol           string
-	DirectCallers    int
+	Symbol            string
+	DirectCallers     int
 	TransitiveCallers int
-	Implementations  int
-	Embedders        int
-	TypeUsers        int
+	Implementations   int
+	Embedders         int
+	TypeUsers         int
 }
 
 func GetBlastRadius(s *store.Store, qualifiedName string, depth int, opts ...Option) (*BlastRadius, error) {
@@ -982,7 +1097,7 @@ func GetBlastRadius(s *store.Store, qualifiedName string, depth int, opts ...Opt
 	}
 	directCount := 0
 	for _, e := range directCallers {
-		if e.EdgeType == "calls" || e.EdgeType == "references" {
+		if e.EdgeType == edgeTypeCalls || e.EdgeType == edgeTypeReferences {
 			directCount++
 		}
 	}
@@ -1044,4 +1159,976 @@ func ListPackages(s *store.Store, opts ...Option) ([]store.Package, error) {
 	}
 
 	return pkgs, nil
+}
+
+type spanMatch struct {
+	startOff     int
+	endOff       int
+	docStartOff  int
+	partOfGroup  bool
+	groupMembers int
+}
+
+func matchFuncDecl(d *ast.FuncDecl, fset *token.FileSet, posLine int, name, kind string) *spanMatch {
+	if kind != kindFunction && kind != kindMethod && kind != "" {
+		return nil
+	}
+	if d.Name == nil || d.Name.Name != name || fset.Position(d.Pos()).Line != posLine {
+		return nil
+	}
+	isMethod := d.Recv != nil
+	if kind == kindFunction && isMethod {
+		return nil
+	}
+	if kind == kindMethod && !isMethod {
+		return nil
+	}
+	docStart := -1
+	if d.Doc != nil {
+		docStart = fset.Position(d.Doc.Pos()).Offset
+	}
+	return &spanMatch{
+		startOff:    fset.Position(d.Pos()).Offset,
+		endOff:      fset.Position(d.End()).Offset,
+		docStartOff: docStart,
+	}
+}
+
+func matchTypeSpec(s *ast.TypeSpec, d *ast.GenDecl, fset *token.FileSet, posLine int, name string, grouped bool) *spanMatch {
+	if s.Name == nil || s.Name.Name != name || fset.Position(s.Pos()).Line != posLine {
+		return nil
+	}
+	startTok, endTok := declRange(fset, d, s, grouped)
+	return &spanMatch{
+		startOff:     fset.Position(startTok).Offset,
+		endOff:       fset.Position(endTok).Offset,
+		docStartOff:  typeDocOffset(fset, d, s),
+		partOfGroup:  grouped,
+		groupMembers: len(d.Specs),
+	}
+}
+
+func matchValueSpec(s *ast.ValueSpec, d *ast.GenDecl, fset *token.FileSet, posLine int, name string, grouped bool) *spanMatch {
+	if len(s.Names) == 0 || fset.Position(s.Pos()).Line != posLine {
+		return nil
+	}
+	found := false
+	for _, n := range s.Names {
+		if n != nil && n.Name == name {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil
+	}
+	startTok, endTok := declRange(fset, d, s, grouped)
+	docStart := -1
+	if d.Doc != nil {
+		docStart = fset.Position(d.Doc.Pos()).Offset
+	}
+	return &spanMatch{
+		startOff:     fset.Position(startTok).Offset,
+		endOff:       fset.Position(endTok).Offset,
+		docStartOff:  docStart,
+		partOfGroup:  grouped,
+		groupMembers: len(d.Specs),
+	}
+}
+
+func matchGenDecl(d *ast.GenDecl, fset *token.FileSet, posLine int, name, kind string) *spanMatch {
+	tok, ok := genDeclTokForKind(kind)
+	if !ok || d.Tok != tok {
+		return nil
+	}
+	grouped := d.Lparen != token.NoPos
+	for _, spec := range d.Specs {
+		switch s := spec.(type) {
+		case *ast.TypeSpec:
+			if m := matchTypeSpec(s, d, fset, posLine, name, grouped); m != nil {
+				return m
+			}
+		case *ast.ValueSpec:
+			if m := matchValueSpec(s, d, fset, posLine, name, grouped); m != nil {
+				return m
+			}
+		}
+	}
+	return nil
+}
+
+func symbolSpan(filePath string, posLine int, name string, kind string) (startOff, endOff, docStartOff int, partOfGroup bool, groupMembers int, err error) {
+	data, readErr := os.ReadFile(filePath)
+	if readErr != nil {
+		return 0, 0, 0, false, 0, fmt.Errorf("read source file %s: %w", filePath, readErr)
+	}
+
+	fset := token.NewFileSet()
+	f, parseErr := parser.ParseFile(fset, filePath, data, parser.ParseComments)
+	if parseErr != nil {
+		return 0, 0, 0, false, 0, fmt.Errorf("parse source file %s: %w", filePath, parseErr)
+	}
+
+	for _, decl := range f.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			if m := matchFuncDecl(d, fset, posLine, name, kind); m != nil {
+				return m.startOff, m.endOff, m.docStartOff, m.partOfGroup, m.groupMembers, nil
+			}
+		case *ast.GenDecl:
+			if m := matchGenDecl(d, fset, posLine, name, kind); m != nil {
+				return m.startOff, m.endOff, m.docStartOff, m.partOfGroup, m.groupMembers, nil
+			}
+		}
+	}
+
+	return 0, 0, 0, false, 0, fmt.Errorf("declaration not found: %s (kind=%s) at line %d in %s", name, kind, posLine, filePath)
+}
+
+func symbolEndLine(filePath string, posLine int, name string, kind string) (int, error) {
+	startOff, endOff, _, _, _, err := symbolSpan(filePath, posLine, name, kind)
+	if err != nil {
+		return 0, err
+	}
+	_ = startOff
+	data, readErr := os.ReadFile(filePath)
+	if readErr != nil {
+		return 0, readErr
+	}
+	lineOffsets := computeLineOffsets(data)
+	return offsetToLine(lineOffsets, endOff), nil
+}
+
+func genDeclTokForKind(kind string) (token.Token, bool) {
+	switch kind {
+	case "type", "interface", "struct":
+		return token.TYPE, true
+	case kindVar:
+		return token.VAR, true
+	case "const":
+		return token.CONST, true
+	}
+	return token.ILLEGAL, false
+}
+
+func declRange(_ *token.FileSet, gd *ast.GenDecl, _ ast.Spec, _ bool) (token.Pos, token.Pos) {
+	return gd.Pos(), gd.End()
+}
+
+func typeDocOffset(fset *token.FileSet, gd *ast.GenDecl, spec *ast.TypeSpec) int {
+	if spec.Doc != nil {
+		return fset.Position(spec.Doc.Pos()).Offset
+	}
+	if gd.Doc != nil {
+		return fset.Position(gd.Doc.Pos()).Offset
+	}
+	return -1
+}
+
+type SymbolBodyResult struct {
+	QualifiedName string
+	Kind          string
+	PosFile       string
+	Body          string
+	ContextBefore string
+	ContextAfter  string
+	PosLine       int
+	PosEndLine    int
+	GroupMembers  int
+	PartOfGroup   bool
+}
+
+func GetSymbolBody(s *store.Store, qualifiedName string, contextLines int, includeDoc bool) (*SymbolBodyResult, error) {
+	sym, err := s.SymbolByName(qualifiedName)
+	if err != nil {
+		return nil, fmt.Errorf("symbol not found: %s", qualifiedName)
+	}
+
+	startOff, endOff, docStartOff, partOfGroup, groupMembers, err := symbolSpan(sym.PosFile, sym.PosLine, sym.Name, sym.Kind)
+	if err != nil {
+		return nil, err
+	}
+
+	data, err := os.ReadFile(sym.PosFile)
+	if err != nil {
+		return nil, fmt.Errorf("read source file %s: %w", sym.PosFile, err)
+	}
+
+	bodyStart := startOff
+	if includeDoc && docStartOff >= 0 {
+		bodyStart = docStartOff
+	}
+	body := string(data[bodyStart:endOff])
+
+	lineOffsets := computeLineOffsets(data)
+	posEndLine := offsetToLine(lineOffsets, endOff)
+	posStartLine := offsetToLine(lineOffsets, bodyStart)
+
+	var before, after string
+	if contextLines > 0 {
+		startLineIdx := max(posStartLine-1-contextLines, 0)
+		endLineIdx := posStartLine - 1
+		if endLineIdx >= 0 && startLineIdx <= endLineIdx {
+			before = sliceLines(data, lineOffsets, startLineIdx, endLineIdx)
+		}
+
+		afterStart := posEndLine
+		afterEnd := posEndLine - 1 + contextLines
+		if afterStart < len(lineOffsets) && afterEnd < len(lineOffsets) {
+			after = sliceLines(data, lineOffsets, afterStart, afterEnd)
+		}
+	}
+
+	return &SymbolBodyResult{
+		QualifiedName: sym.QualifiedName,
+		Kind:          sym.Kind,
+		PosFile:       sym.PosFile,
+		PosLine:       sym.PosLine,
+		PosEndLine:    posEndLine,
+		Body:          body,
+		PartOfGroup:   partOfGroup,
+		GroupMembers:  groupMembers,
+		ContextBefore: before,
+		ContextAfter:  after,
+	}, nil
+}
+
+func computeLineOffsets(data []byte) []int {
+	offsets := []int{0}
+	for i, b := range data {
+		if b == '\n' {
+			offsets = append(offsets, i+1)
+		}
+	}
+	return offsets
+}
+
+func offsetToLine(offsets []int, off int) int {
+	lo, hi := 0, len(offsets)-1
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		if offsets[mid] <= off {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	return lo + 1
+}
+
+func sliceLines(data []byte, offsets []int, startLine, endLine int) string {
+	if startLine < 1 {
+		startLine = 1
+	}
+	if endLine < startLine {
+		return ""
+	}
+	if endLine > len(offsets) {
+		endLine = len(offsets)
+	}
+	start := offsets[startLine-1]
+	if endLine >= len(offsets) {
+		return string(data[start:])
+	}
+	end := offsets[endLine]
+	if end > 0 && data[end-1] == '\n' {
+		end--
+	}
+	return string(data[start:end])
+}
+
+type Layer struct {
+	Packages []string
+	Level    int
+}
+
+type Hub struct {
+	Package string
+	FanIn   int
+	FanOut  int
+}
+
+type LayersResult struct {
+	Layers []Layer
+	Hubs   []Hub
+}
+
+type hubEntry struct {
+	pkg    string
+	fanIn  int
+	fanOut int
+}
+
+func buildProjectGraph(s *store.Store, projectSet map[string]bool) (graph map[string][]string, fanIn, fanOut map[string]int, err error) {
+	imports, err := s.EdgesByType(edgeTypeImports)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	fanIn = make(map[string]int)
+	fanOut = make(map[string]int)
+	graph = make(map[string][]string)
+	for _, e := range imports {
+		if !projectSet[e.FromRef] {
+			continue
+		}
+		target := resolveProjectTarget(e.ToRef, projectSet)
+		if target == "" {
+			continue
+		}
+		graph[e.FromRef] = append(graph[e.FromRef], target)
+		fanOut[e.FromRef]++
+		fanIn[target]++
+	}
+	return graph, fanIn, fanOut, nil
+}
+
+func kahnLayers(projectSet map[string]bool, graph map[string][]string) map[string]int {
+	level := make(map[string]int)
+	reverse := buildReverseGraph(graph)
+	var queue []string
+	for p := range projectSet {
+		if len(graph[p]) == 0 {
+			level[p] = 0
+			queue = append(queue, p)
+		}
+	}
+	sort.Strings(queue)
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		candidate := level[current] + 1
+		for _, d := range reverse[current] {
+			if existing, ok := level[d]; !ok || candidate > existing {
+				level[d] = candidate
+			}
+		}
+		for _, d := range reverse[current] {
+			if depsReady(d, graph, level) {
+				queue = append(queue, d)
+			}
+		}
+	}
+	for p := range projectSet {
+		if _, ok := level[p]; !ok {
+			level[p] = 0
+		}
+	}
+	return level
+}
+
+func buildReverseGraph(graph map[string][]string) map[string][]string {
+	reverse := make(map[string][]string)
+	for from, tos := range graph {
+		for _, to := range tos {
+			reverse[to] = append(reverse[to], from)
+		}
+	}
+	return reverse
+}
+
+func depsReady(pkg string, graph map[string][]string, level map[string]int) bool {
+	for _, dep := range graph[pkg] {
+		if _, ok := level[dep]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func levelsToLayers(level map[string]int) []Layer {
+	byLevel := make(map[int][]string)
+	for p, lv := range level {
+		byLevel[lv] = append(byLevel[lv], p)
+	}
+	for lv := range byLevel {
+		sort.Strings(byLevel[lv])
+	}
+	levels := make([]int, 0, len(byLevel))
+	for lv := range byLevel {
+		levels = append(levels, lv)
+	}
+	sort.Ints(levels)
+	layers := make([]Layer, 0, len(levels))
+	for _, lv := range levels {
+		layers = append(layers, Layer{Level: lv, Packages: byLevel[lv]})
+	}
+	return layers
+}
+
+func topHubEntries(projectSet map[string]bool, fanIn, fanOut map[string]int, topHubs int) []Hub {
+	allHubs := make([]hubEntry, 0, len(projectSet))
+	for p := range projectSet {
+		allHubs = append(allHubs, hubEntry{pkg: p, fanIn: fanIn[p], fanOut: fanOut[p]})
+	}
+	sort.Slice(allHubs, func(i, j int) bool {
+		if allHubs[i].fanIn != allHubs[j].fanIn {
+			return allHubs[i].fanIn > allHubs[j].fanIn
+		}
+		return allHubs[i].pkg < allHubs[j].pkg
+	})
+	limit := min(topHubs, len(allHubs))
+	hubs := make([]Hub, 0, limit)
+	for i := range limit {
+		hubs = append(hubs, Hub{Package: allHubs[i].pkg, FanIn: allHubs[i].fanIn, FanOut: allHubs[i].fanOut})
+	}
+	return hubs
+}
+
+func DependencyLayers(s *store.Store, includeTests bool, topHubs int) (*LayersResult, error) {
+	if topHubs <= 0 {
+		topHubs = 5
+	}
+	pkgs, err := s.ListPackages()
+	if err != nil {
+		return nil, err
+	}
+	projectSet := make(map[string]bool)
+	for _, p := range pkgs {
+		if !includeTests && p.IsTest {
+			continue
+		}
+		projectSet[p.Path] = true
+	}
+	graph, fanIn, fanOut, err := buildProjectGraph(s, projectSet)
+	if err != nil {
+		return nil, err
+	}
+	level := kahnLayers(projectSet, graph)
+	return &LayersResult{
+		Layers: levelsToLayers(level),
+		Hubs:   topHubEntries(projectSet, fanIn, fanOut, topHubs),
+	}, nil
+}
+
+func resolveProjectTarget(toRef string, projectSet map[string]bool) string {
+	if projectSet[toRef] {
+		return toRef
+	}
+	suffix := "/" + toRef
+	for p := range projectSet {
+		if strings.HasSuffix(p, suffix) || p == toRef {
+			return p
+		}
+	}
+	if idx := strings.LastIndex(toRef, "/"); idx >= 0 {
+		bare := toRef[idx+1:]
+		if projectSet[bare] {
+			return bare
+		}
+	}
+	return ""
+}
+
+type FlowResult struct {
+	Package           string
+	Imports           []EdgeDetail
+	Importers         []EdgeDetail
+	TransitiveImports []EdgeDetail
+}
+
+func directImports(pkgPath string, allImports []store.Edge, projectSet map[string]bool) []EdgeDetail {
+	var out []EdgeDetail
+	for _, e := range allImports {
+		if e.FromRef == pkgPath && (projectSet[e.ToRef] || resolveProjectTarget(e.ToRef, projectSet) != "") {
+			out = append(out, edgeToDetail(e))
+		}
+	}
+	return out
+}
+
+func directImporters(pkgPath string, allImports []store.Edge, reverseMap map[string]string) []EdgeDetail {
+	var out []EdgeDetail
+	for _, e := range allImports {
+		if e.ToRef == pkgPath {
+			out = append(out, edgeToDetail(e))
+		}
+	}
+	if len(out) > 0 || reverseMap == nil {
+		return out
+	}
+	importPath := reverseMap[pkgPath]
+	if importPath == "" || importPath == pkgPath {
+		return out
+	}
+	for _, e := range allImports {
+		if e.ToRef == importPath {
+			out = append(out, edgeToDetail(e))
+		}
+	}
+	return out
+}
+
+func buildImportPathMap(allImports []store.Edge, projectSet map[string]bool) map[string]string {
+	m := make(map[string]string)
+	for _, e := range allImports {
+		if e.EdgeType != edgeTypeImports {
+			continue
+		}
+		target := resolveProjectTarget(e.ToRef, projectSet)
+		if target != "" && target != e.ToRef {
+			m[target] = e.ToRef
+		}
+	}
+	return m
+}
+
+func transitiveImports(pkgPath string, allImports []store.Edge, projectSet map[string]bool) []EdgeDetail {
+	var out []EdgeDetail
+	visited := map[string]bool{pkgPath: true}
+	queue := []string{pkgPath}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		for _, e := range allImports {
+			if e.FromRef != current {
+				continue
+			}
+			targetBare := resolveProjectTarget(e.ToRef, projectSet)
+			if targetBare == "" || visited[targetBare] {
+				continue
+			}
+			out = append(out, edgeToDetail(e))
+			visited[targetBare] = true
+			queue = append(queue, targetBare)
+		}
+	}
+	return out
+}
+
+func DependencyFlow(s *store.Store, pkgPath string) (*FlowResult, error) {
+	if pkgPath == "" {
+		return nil, fmt.Errorf("package_path is required")
+	}
+	pkgs, err := s.ListPackages()
+	if err != nil {
+		return nil, err
+	}
+	projectSet := make(map[string]bool)
+	found := false
+	for _, p := range pkgs {
+		projectSet[p.Path] = true
+		if p.Path == pkgPath {
+			found = true
+		}
+	}
+	if !found {
+		return nil, fmt.Errorf("package not found: %s", pkgPath)
+	}
+	allImports, err := s.EdgesByType(edgeTypeImports)
+	if err != nil {
+		return nil, err
+	}
+	reverseMap := buildImportPathMap(allImports, projectSet)
+
+	return &FlowResult{
+		Package:           pkgPath,
+		Imports:           directImports(pkgPath, allImports, projectSet),
+		Importers:         directImporters(pkgPath, allImports, reverseMap),
+		TransitiveImports: transitiveImports(pkgPath, allImports, projectSet),
+	}, nil
+}
+
+type EntryPoint struct {
+	QualifiedName string
+	Kind          string
+	Signature     string
+	PosFile       string
+	Reason        string
+	PosLine       int
+}
+
+var defaultEntryHeuristics = []string{kindMain, "test", "uncalled_exported"}
+
+var entryPointHeuristics = map[string]bool{
+	kindMain:             true,
+	"test":              true,
+	"uncalled_exported": true,
+	"handler_sig":       true,
+	"handler_name":      true,
+}
+
+var handlerNames = map[string]bool{
+	"Serve":  true,
+	"Handle": true,
+	"Run":    true,
+	"Start":  true,
+	"Listen": true,
+}
+
+func addEntryPoint(out []EntryPoint, seen map[string]bool, sym store.Symbol, reason string) []EntryPoint {
+	qn := sym.QualifiedName
+	if seen[qn] {
+		return out
+	}
+	seen[qn] = true
+	return append(out, EntryPoint{
+		QualifiedName: qn,
+		Kind:          sym.Kind,
+		Signature:     sym.Signature,
+		PosFile:       sym.PosFile,
+		PosLine:       sym.PosLine,
+		Reason:        reason,
+	})
+}
+
+func checkEntryHeuristics(out []EntryPoint, seen map[string]bool, sym store.Symbol, allowed map[string]bool, pkgMain, pkgIsTest, incoming map[string]bool) []EntryPoint {
+	pkgPath := sym.PackagePath
+	if pkgPath == "" {
+		pkgPath = extractPkgPath(sym.QualifiedName)
+	}
+	isTest := sym.IsTest || pkgIsTest[pkgPath]
+
+	if allowed["test"] && isTest && isTestEntryName(sym.Name) {
+		out = addEntryPoint(out, seen, sym, "test")
+	}
+	if allowed[kindMain] && !isTest && sym.Name == kindMain && sym.Kind == kindFunction && pkgMain[pkgPath] {
+		out = addEntryPoint(out, seen, sym, kindMain)
+	}
+	if allowed["uncalled_exported"] && !isTest && sym.Exported && (sym.Kind == kindFunction || sym.Kind == kindMethod) && !incoming[sym.QualifiedName] && !isTestEntryName(sym.Name) {
+		out = addEntryPoint(out, seen, sym, "uncalled_exported")
+	}
+	if allowed["handler_sig"] && !isTest && sym.Kind == kindMethod && containsHTTPHandler(sym.Signature) {
+		out = addEntryPoint(out, seen, sym, "handler_sig")
+	}
+	if allowed["handler_name"] && !isTest && sym.Kind == kindMethod && handlerNames[sym.Name] {
+		out = addEntryPoint(out, seen, sym, "handler_name")
+	}
+	return out
+}
+
+func EntryPoints(s *store.Store, heuristics []string, includeTests bool) ([]EntryPoint, error) {
+	if len(heuristics) == 0 {
+		heuristics = defaultEntryHeuristics
+	}
+	allowed := make(map[string]bool, len(heuristics))
+	for _, h := range heuristics {
+		if entryPointHeuristics[h] {
+			allowed[h] = true
+		}
+	}
+	if len(allowed) == 0 {
+		return nil, fmt.Errorf("no recognized heuristics: %v", heuristics)
+	}
+
+	pkgs, err := s.ListPackages()
+	if err != nil {
+		return nil, err
+	}
+	pkgMain := make(map[string]bool)
+	pkgIsTest := make(map[string]bool)
+	for _, p := range pkgs {
+		pkgMain[p.Path] = p.Name == kindMain && !p.IsTest
+		pkgIsTest[p.Path] = p.IsTest
+	}
+
+	allSyms, err := s.AllSymbols(includeTests)
+	if err != nil {
+		return nil, err
+	}
+	allEdges, err := s.AllEdges()
+	if err != nil {
+		return nil, err
+	}
+	incoming := make(map[string]bool)
+	for _, e := range allEdges {
+		if e.EdgeType == edgeTypeCalls || e.EdgeType == edgeTypeReferences {
+			incoming[e.ToRef] = true
+		}
+	}
+
+	var out []EntryPoint
+	seen := make(map[string]bool)
+
+	for _, sym := range allSyms {
+		out = checkEntryHeuristics(out, seen, sym, allowed, pkgMain, pkgIsTest, incoming)
+	}
+
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Reason != out[j].Reason {
+			return out[i].Reason < out[j].Reason
+		}
+		return out[i].QualifiedName < out[j].QualifiedName
+	})
+	return out, nil
+}
+
+func isTestEntryName(name string) bool {
+	for _, prefix := range []string{"Test", "Benchmark", "Fuzz"} {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsHTTPHandler(sig string) bool {
+	return strings.Contains(sig, "http.ResponseWriter") && strings.Contains(sig, "*http.Request")
+}
+
+func extractPkgPath(qn string) string {
+	idx := strings.LastIndex(qn, ".")
+	if idx < 0 {
+		return ""
+	}
+	return qn[:idx]
+}
+
+type ChangedSymbol struct {
+	BlastRadius   *BlastRadius
+	QualifiedName string
+	Kind          string
+	ChangeType    string
+	PosFile       string
+	Body          string
+	PosLine       int
+}
+
+type ChangedSymbolsSummary struct {
+	Modified     int
+	Added        int
+	Removed      int
+	FilesChanged int
+}
+
+type ChangedSymbolsResult struct {
+	Symbols []ChangedSymbol
+	Summary ChangedSymbolsSummary
+}
+
+func ChangedSymbols(s *store.Store, repoDir, ref string, withBlast, includeBodies, includeTests bool) (*ChangedSymbolsResult, error) {
+	if ref == "" {
+		ref = kindMain
+	}
+	repoDir, err := resolveRepoDir(repoDir)
+	if err != nil {
+		return nil, err
+	}
+
+	statuses, err := vcs.GitFileStatuses(repoDir, ref)
+	if err != nil {
+		return nil, err
+	}
+
+	result := &ChangedSymbolsResult{
+		Summary: ChangedSymbolsSummary{FilesChanged: len(statuses)},
+	}
+	seen := make(map[string]bool)
+
+	for _, st := range statuses {
+		if st.Status == "D" {
+			processDeletedFile(s, repoDir, ref, result, st.Path, withBlast, includeTests, seen)
+			continue
+		}
+		hunks, herr := vcs.GitHunks(repoDir, ref, st.Path)
+		if herr != nil {
+			continue
+		}
+		ct := changeTypeModified
+		if strings.HasPrefix(st.Status, "A") {
+			ct = changeTypeAdded
+		}
+		processChangedFile(s, result, st.Path, ct, withBlast, includeBodies, includeTests, seen, hunks)
+	}
+
+	return result, nil
+}
+
+func processDeletedFile(s *store.Store, repoDir, ref string, result *ChangedSymbolsResult, file string, withBlast, _ bool, seen map[string]bool) {
+	syms, err := symbolsAtRef(repoDir, ref, file)
+	if err != nil {
+		return
+	}
+	for _, sym := range syms {
+		qn := file + "." + sym.Name
+		if seen[qn] {
+			continue
+		}
+		seen[qn] = true
+		cs := ChangedSymbol{
+			QualifiedName: qn,
+			Kind:          sym.Kind,
+			ChangeType:    "removed",
+			PosFile:       file,
+			PosLine:       sym.PosLine,
+		}
+		if withBlast {
+			br, _ := GetBlastRadius(s, qn, 3)
+			cs.BlastRadius = br
+		}
+		result.Symbols = append(result.Symbols, cs)
+		result.Summary.Removed++
+	}
+}
+
+func readChangedBody(filePath, name, kind string, posLine int, include bool) string {
+	if !include {
+		return ""
+	}
+	startOff, endOff, _, _, _, spanErr := symbolSpan(filePath, posLine, name, kind)
+	if spanErr != nil {
+		return ""
+	}
+	data, rerr := os.ReadFile(filePath)
+	if rerr != nil {
+		return ""
+	}
+	return string(data[startOff:endOff])
+}
+
+func incSummary(ct string, result *ChangedSymbolsResult) {
+	switch ct {
+	case changeTypeAdded:
+		result.Summary.Added++
+	case changeTypeModified:
+		result.Summary.Modified++
+	case "removed":
+		result.Summary.Removed++
+	}
+}
+
+func processChangedFile(s *store.Store, result *ChangedSymbolsResult, file, changeType string, withBlast, includeBodies, includeTests bool, seen map[string]bool, hunks []vcs.Hunk) {
+	syms, err := s.SearchSymbolsByFile(file, "", nil, includeTests)
+	if err != nil {
+		return
+	}
+	for _, sym := range syms {
+		if seen[sym.QualifiedName] {
+			continue
+		}
+		seen[sym.QualifiedName] = true
+
+		ct := changeType
+		if ct == changeTypeModified && hunks != nil {
+			endLine := sym.PosLine
+			if el, elErr := symbolEndLine(sym.PosFile, sym.PosLine, sym.Name, sym.Kind); elErr == nil && el > 0 {
+				endLine = el
+			}
+			ct = refineChangeType(sym.PosLine, endLine, hunks)
+			if ct == "" {
+				continue
+			}
+		}
+
+		cs := ChangedSymbol{
+			QualifiedName: sym.QualifiedName,
+			Kind:          sym.Kind,
+			ChangeType:    ct,
+			PosFile:       sym.PosFile,
+			PosLine:       sym.PosLine,
+		}
+
+		if ct != "removed" {
+			cs.Body = readChangedBody(sym.PosFile, sym.Name, sym.Kind, sym.PosLine, includeBodies)
+		}
+
+		if withBlast {
+			br, _ := GetBlastRadius(s, sym.QualifiedName, 3)
+			cs.BlastRadius = br
+		}
+		result.Symbols = append(result.Symbols, cs)
+		incSummary(ct, result)
+	}
+}
+
+func funcDeclToSymbol(d *ast.FuncDecl, fset *token.FileSet, out []removedSymbol) []removedSymbol {
+	if d.Name == nil {
+		return out
+	}
+	pos := fset.Position(d.Pos())
+	kind := kindFunction
+	if d.Recv != nil {
+		kind = kindMethod
+	}
+	return append(out, removedSymbol{Name: d.Name.Name, Kind: kind, PosLine: pos.Line})
+}
+
+func typeSpecToSymbol(s *ast.TypeSpec, fset *token.FileSet, out []removedSymbol) []removedSymbol {
+	if s.Name == nil {
+		return out
+	}
+	return append(out, removedSymbol{Name: s.Name.Name, Kind: "type", PosLine: fset.Position(s.Pos()).Line})
+}
+
+func valueSpecToSymbols(s *ast.ValueSpec, tok token.Token, fset *token.FileSet, out []removedSymbol) []removedSymbol {
+	for _, n := range s.Names {
+		if n == nil {
+			continue
+		}
+		out = append(out, removedSymbol{Name: n.Name, Kind: varOrConstKind(tok), PosLine: fset.Position(s.Pos()).Line})
+	}
+	return out
+}
+
+func symbolsAtRef(refRepoDir, ref, file string) ([]removedSymbol, error) {
+	data, err := vcs.GitShowFile(refRepoDir, ref, file)
+	if err != nil {
+		return nil, err
+	}
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, file, data, parser.ParseComments)
+	if err != nil {
+		return nil, err
+	}
+	var out []removedSymbol
+	for _, decl := range f.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			out = funcDeclToSymbol(d, fset, out)
+		case *ast.GenDecl:
+			for _, spec := range d.Specs {
+				switch s := spec.(type) {
+				case *ast.TypeSpec:
+					out = typeSpecToSymbol(s, fset, out)
+				case *ast.ValueSpec:
+					out = valueSpecToSymbols(s, d.Tok, fset, out)
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
+type removedSymbol struct {
+	Name    string
+	Kind    string
+	PosLine int
+}
+
+func varOrConstKind(tok token.Token) string {
+	if tok == token.VAR {
+		return kindVar
+	}
+	if tok == token.CONST {
+		return "const"
+	}
+	return ""
+}
+
+func refineChangeType(startLine, endLine int, hunks []vcs.Hunk) string {
+	for _, h := range hunks {
+		hunkStart := h.NewStart
+		hunkEnd := h.NewStart + h.NewCount - 1
+		if h.NewCount == 0 {
+			hunkStart = h.NewStart
+			hunkEnd = h.NewStart
+		}
+		if startLine <= hunkEnd && endLine >= hunkStart {
+			if h.OldCount == 0 {
+				return changeTypeAdded
+			}
+			return changeTypeModified
+		}
+	}
+	return ""
+}
+
+func resolveRepoDir(repoDir string) (string, error) {
+	if repoDir == "" {
+		repoDir = "."
+	}
+	abs, err := filepath.Abs(repoDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve repo dir: %w", err)
+	}
+	return abs, nil
 }

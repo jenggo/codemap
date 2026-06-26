@@ -217,6 +217,11 @@ func (s *Server) handleTool(name string, args map[string]any) string {
 		"codemap_cycles":               handleCycles,
 		"codemap_symbols_in_file":      handleSymbolsInFile,
 		"codemap_blast_radius":         handleBlastRadius,
+		"codemap_get_symbol_body":      handleSymbolBody,
+		"codemap_dependency_layers":    handleDependencyLayers,
+		"codemap_dependency_flow":      handleDependencyFlow,
+		"codemap_entry_points":         handleEntryPoints,
+		"codemap_changed_symbols":      handleChangedSymbols,
 	}
 
 	handler, ok := handlers[name]
@@ -541,6 +546,102 @@ func handleBlastRadius(st *store.Store, opts []query.Option, renderOpts []render
 	return string(data)
 }
 
+func handleSymbolBody(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) string {
+	qn := requiredString(args, "qualified_name")
+	if qn == "" {
+		return errQualifiedNameRequired
+	}
+	contextLines := 0
+	if v, ok := args["context_lines"].(float64); ok && v > 0 {
+		contextLines = int(v)
+	}
+	includeDoc := true
+	if b, ok := args["include_doc"].(bool); ok {
+		includeDoc = b
+	}
+	result, err := query.GetSymbolBody(st, qn, contextLines, includeDoc)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err)
+	}
+	return render.RenderSymbolBody(result, renderOpts...)
+}
+
+func handleDependencyLayers(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) string {
+	topHubs := 5
+	if v, ok := args["top_hubs"].(float64); ok && v > 0 {
+		topHubs = int(v)
+	}
+	includeTests := false
+	if b, ok := args["include_tests"].(bool); ok {
+		includeTests = b
+	}
+	result, err := query.DependencyLayers(st, includeTests, topHubs)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err)
+	}
+	return render.RenderDependencyLayers(result, renderOpts...)
+}
+
+func handleDependencyFlow(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) string {
+	pkgPath := requiredString(args, "package_path")
+	if pkgPath == "" {
+		return errPackagePathRequired
+	}
+	result, err := query.DependencyFlow(st, pkgPath)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err)
+	}
+	return render.RenderDependencyFlow(result, renderOpts...)
+}
+
+func handleEntryPoints(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) string {
+	var heuristics []string
+	if v, ok := args["heuristics"].([]any); ok {
+		for _, h := range v {
+			if s, ok := h.(string); ok {
+				heuristics = append(heuristics, s)
+			}
+		}
+	}
+	includeTests := false
+	if b, ok := args["include_tests"].(bool); ok {
+		includeTests = b
+	}
+	entries, err := query.EntryPoints(st, heuristics, includeTests)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err)
+	}
+	return render.RenderEntryPoints(entries, renderOpts...)
+}
+
+func handleChangedSymbols(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) string {
+	ref := "main"
+	if v, ok := args["ref"].(string); ok && v != "" {
+		ref = v
+	}
+	repoDir := "."
+	if v, ok := args["repo_dir"].(string); ok && v != "" {
+		repoDir = v
+	}
+	withBlast := true
+	if b, ok := args["with_blast_radius"].(bool); ok {
+		withBlast = b
+	}
+	includeBodies := false
+	if b, ok := args["include_bodies"].(bool); ok {
+		includeBodies = b
+	}
+	includeTests := false
+	if b, ok := args["include_tests"].(bool); ok {
+		includeTests = b
+	}
+	result, err := query.ChangedSymbols(st, repoDir, ref, withBlast, includeBodies, includeTests)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err)
+	}
+	return render.RenderChangedSymbols(result, renderOpts...)
+}
+
 func (s *Server) handleIndex(args map[string]any) string {
 	path := "."
 	if v, ok := args["path"].(string); ok && v != "" {
@@ -619,61 +720,120 @@ const (
 	errPatternRequired       = "Error: pattern is required"
 )
 
+var returnTypeSchemas = map[string]any{
+	"SymbolDetail": map[string]any{
+		"qualified_name": "string — fully qualified name (e.g., cli/codemap/extract.Run)",
+		"kind":           "string — symbol kind: function, method, type, interface, const, var",
+		"receiver":       "string — receiver type for methods (empty for functions)",
+		"signature":      "string — type signature (e.g., 'func(string) error', 'struct { Name string }')",
+		"doc":            "string — documentation comment",
+		"pos_file":       "string — source file path",
+		"pos_line":       "int — line number in source file",
+		"exported":       "bool — whether the symbol is exported (capitalized)",
+	},
+	"EdgeDetail": map[string]any{
+		"from_ref":  "string — source symbol qualified name",
+		"to_ref":    "string — target symbol qualified name",
+		"edge_type": "string — relationship type: calls, references, satisfies, embeds, imports",
+		"pos_file":  "string — source file where edge occurs",
+		"pos_line":  "int — line number where edge occurs",
+	},
+	"SearchResult": map[string]any{
+		"qualified_name": "string — fully qualified name",
+		"kind":           "string — symbol kind",
+		"signature":      "string — type signature",
+		"doc":            "string — documentation comment",
+		"receiver":       "string — receiver type for methods",
+		"pos_file":       "string — source file path",
+		"pos_line":       "int — line number",
+		"exported":       "bool — whether exported",
+	},
+	"ShowResult": map[string]any{
+		"symbol":         "SymbolDetail — the symbol being shown",
+		"incoming_edges": "[]EdgeDetail — edges pointing TO this symbol",
+		"outgoing_edges": "[]EdgeDetail — edges pointing FROM this symbol",
+	},
+	"PackageSummary": map[string]any{
+		"path":             "string — package import path",
+		"name":             "string — package name",
+		"exported_symbols": "[]SymbolDetail — exported symbols in this package",
+		"import_count":     "int — number of imports from this package",
+	},
+	"PackageResult": map[string]any{
+		"path":             "string — package import path",
+		"name":             "string — package name",
+		"exported_symbols": "[]SymbolDetail — exported symbols",
+		"import_count":     "int — number of imports",
+	},
+	"EdgeTypes": map[string]any{
+		"calls":      "A calls B — function/method A invokes function/method B",
+		"references": "A references B — symbol A uses symbol B in a non-call context (field access, variable read, type usage)",
+		"satisfies":  "A satisfies B — type A implements interface B (found via callers_of on interfaces)",
+		"embeds":     "A embeds B — struct A embeds struct/interface B",
+		"imports":    "A imports B — package A imports package B",
+	},
+	"SymbolBodyResult": map[string]any{
+		"qualified_name": "string — fully qualified symbol name",
+		"kind":           "string — symbol kind (function, method, type, const, var, interface, struct)",
+		"pos_file":       "string — source file path",
+		"pos_line":       "int — start line of the declaration",
+		"pos_end_line":   "int — end line of the declaration",
+		"body":           "string — source text of the declaration (and optional doc comment when include_doc=true)",
+		"part_of_group":  "bool — true if this is a member of a grouped var/const/type block",
+		"group_members":  "int — number of members in the group (when part_of_group=true)",
+		"context_before": "string — N file lines before the declaration (when context_lines > 0)",
+		"context_after":  "string — N file lines after the declaration (when context_lines > 0)",
+	},
+	"ChangedSymbol": map[string]any{
+		"qualified_name": "string — fully qualified symbol name",
+		"kind":           "string — symbol kind",
+		"change_type":    "string — modified | added | removed",
+		"pos_file":       "string — source file path",
+		"pos_line":       "int — start line",
+		"blast_radius":   "*BlastRadius — optional blast radius (present when with_blast_radius=true)",
+		"body":           "string — optional source body (present when include_bodies=true)",
+	},
+	"ChangedSymbolsSummary": map[string]any{
+		"modified":      "int — number of modified symbols",
+		"added":         "int — number of added symbols",
+		"removed":       "int — number of removed symbols",
+		"files_changed": "int — number of .go files in the diff",
+	},
+	"ChangedSymbolsResult": map[string]any{
+		"summary": "ChangedSymbolsSummary — aggregate counts",
+		"symbols": "[]ChangedSymbol — per-symbol change details",
+	},
+	"Layer": map[string]any{
+		"level":    "int — Kahn topological level (0 = foundation)",
+		"packages": "[]string — package paths at this level",
+	},
+	"Hub": map[string]any{
+		"package": "string — package path",
+		"fan_in":  "int — number of intra-project importers",
+		"fan_out": "int — number of intra-project imports",
+	},
+	"LayersResult": map[string]any{
+		"layers": "[]Layer — topological layers (Kahn)",
+		"hubs":   "[]Hub — top packages ranked by fan-in",
+	},
+	"FlowResult": map[string]any{
+		"package":            "string — package path",
+		"imports":            "[]EdgeDetail — immediate intra-project imports",
+		"importers":          "[]EdgeDetail — immediate intra-project importers",
+		"transitive_imports": "[]EdgeDetail — transitive intra-project imports",
+	},
+	"EntryPoint": map[string]any{
+		"qualified_name": "string — fully qualified symbol name",
+		"kind":           "string — symbol kind",
+		"signature":      "string — symbol signature",
+		"pos_file":       "string — source file path",
+		"pos_line":       "int — start line",
+		"reason":         "string — heuristic that matched: main | test | uncalled_exported | handler_sig | handler_name",
+	},
+}
+
 func handleSchema() string {
-	schema := map[string]any{
-		"SymbolDetail": map[string]any{
-			"qualified_name": "string — fully qualified name (e.g., cli/codemap/extract.Run)",
-			"kind":           "string — symbol kind: function, method, type, interface, const, var",
-			"receiver":       "string — receiver type for methods (empty for functions)",
-			"signature":      "string — type signature (e.g., 'func(string) error', 'struct { Name string }')",
-			"doc":            "string — documentation comment",
-			"pos_file":       "string — source file path",
-			"pos_line":       "int — line number in source file",
-			"exported":       "bool — whether the symbol is exported (capitalized)",
-		},
-		"EdgeDetail": map[string]any{
-			"from_ref":  "string — source symbol qualified name",
-			"to_ref":    "string — target symbol qualified name",
-			"edge_type": "string — relationship type: calls, references, satisfies, embeds, imports",
-			"pos_file":  "string — source file where edge occurs",
-			"pos_line":  "int — line number where edge occurs",
-		},
-		"SearchResult": map[string]any{
-			"qualified_name": "string — fully qualified name",
-			"kind":           "string — symbol kind",
-			"signature":      "string — type signature",
-			"doc":            "string — documentation comment",
-			"receiver":       "string — receiver type for methods",
-			"pos_file":       "string — source file path",
-			"pos_line":       "int — line number",
-			"exported":       "bool — whether exported",
-		},
-		"ShowResult": map[string]any{
-			"symbol":         "SymbolDetail — the symbol being shown",
-			"incoming_edges": "[]EdgeDetail — edges pointing TO this symbol",
-			"outgoing_edges": "[]EdgeDetail — edges pointing FROM this symbol",
-		},
-		"PackageSummary": map[string]any{
-			"path":             "string — package import path",
-			"name":             "string — package name",
-			"exported_symbols": "[]SymbolDetail — exported symbols in this package",
-			"import_count":     "int — number of imports from this package",
-		},
-		"PackageResult": map[string]any{
-			"path":             "string — package import path",
-			"name":             "string — package name",
-			"exported_symbols": "[]SymbolDetail — exported symbols",
-			"import_count":     "int — number of imports",
-		},
-		"EdgeTypes": map[string]any{
-			"calls":      "A calls B — function/method A invokes function/method B",
-			"references": "A references B — symbol A uses symbol B in a non-call context (field access, variable read, type usage)",
-			"satisfies":  "A satisfies B — type A implements interface B (found via callers_of on interfaces)",
-			"embeds":     "A embeds B — struct A embeds struct/interface B",
-			"imports":    "A imports B — package A imports package B",
-		},
-	}
-	data, err := json.MarshalIndent(schema, "", "  ")
+	data, err := json.MarshalIndent(returnTypeSchemas, "", "  ")
 	if err != nil {
 		return fmt.Sprintf(`{"error": "schema marshal failed: %s"}`, err.Error())
 	}
@@ -714,6 +874,8 @@ func buildToolsList() []map[string]any {
 	tools := make([]map[string]any, 0, 14)
 	tools = append(tools, indexTools()...)
 	tools = append(tools, queryTools()...)
+	tools = append(tools, sourceTools()...)
+	tools = append(tools, shapeTools()...)
 	return tools
 }
 
@@ -953,4 +1115,48 @@ func stringArrayProp(desc string) map[string]any {
 
 func intProp(desc string) map[string]any {
 	return map[string]any{"type": "integer", "description": desc}
+}
+
+func sourceTools() []map[string]any {
+	return []map[string]any{
+		toolDef("codemap_get_symbol_body",
+			"Get the source text of a single Go symbol (function, method, type, const, or var) by qualified name. Re-parses the file at query time to extract the exact declaration span, with optional doc comment and context-line padding. Replaces read(whole_file) for 'show me this one symbol' lookups with ~20x token reduction.",
+			map[string]any{
+				"qualified_name": stringProp("Fully qualified symbol name (e.g., cli/codemap/extract.Run)"),
+				"context_lines":  intProp("Number of file lines to include before and after the declaration as context (default 0)"),
+				"include_doc":    boolProp("Prepend the leading doc comment to the body (default true)"),
+			},
+			"qualified_name"),
+		toolDef("codemap_changed_symbols",
+			"Get the symbols changed in the working tree relative to a git ref (default 'main'), classified by change_type (modified/added/removed). Each changed symbol can carry an optional blast_radius and source body. Replaces 'git diff' + manual hunk-to-symbol mapping + per-symbol blast_radius lookups.",
+			map[string]any{
+				"ref":                stringProp("Git ref to diff against (default 'main')"),
+				"with_blast_radius":  boolProp("Attach blast_radius to each changed symbol (default true)"),
+				"include_bodies":     boolProp("Attach source body to each changed symbol (default false)"),
+				"include_tests":      boolProp("Include test packages/symbols (default false)"),
+			}),
+	}
+}
+
+func shapeTools() []map[string]any {
+	return []map[string]any{
+		toolDef("codemap_dependency_layers",
+			"Get a topological layering of the project's packages based on the stored 'imports' edges (Kahn's algorithm), plus the top packages ranked by fan-in. Scoped to intra-project packages; standard library and third-party imports are excluded. Replaces N calls to codemap_importers_of to judge 'is this a hub' or 'what's the layer order'.",
+			map[string]any{
+				"include_tests": boolProp("Include _test packages in the layering (default false)"),
+				"top_hubs":      intProp("Maximum number of hub entries to return (default 5)"),
+			}),
+		toolDef("codemap_dependency_flow",
+			"Get the immediate imports, immediate importers, and transitive imports of a single package in one call. Composes codemap_imports_of, codemap_importers_of, and codemap_transitive_imports.",
+			map[string]any{
+				"package_path": stringProp("Package import path"),
+			},
+			"package_path"),
+		toolDef("codemap_entry_points",
+			"Get the entry points of the codebase: main() functions, test entry symbols, exported funcs/methods with no incoming callers, and optionally HTTP handlers. Use to surface 'where do I start reading' without grep.",
+			map[string]any{
+				"heuristics": stringArrayProp("Heuristic set to apply: main, test, uncalled_exported, handler_sig, handler_name (default [\"main\",\"test\",\"uncalled_exported\"])"),
+				"include_tests": boolProp("Include _test packages; required to surface test-entry symbols (default false)"),
+			}),
+	}
 }

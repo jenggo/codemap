@@ -63,6 +63,13 @@ type fileExtractor struct {
 func (e *fileExtractor) extract() {
 	e.extractImports()
 
+	if !e.isTest {
+		pos := e.fset.Position(e.astFile.Pos())
+		if strings.HasSuffix(pos.Filename, "_test.go") {
+			e.isTest = true
+		}
+	}
+
 	for _, decl := range e.astFile.Decls {
 		switch d := decl.(type) {
 		case *ast.FuncDecl:

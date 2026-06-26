@@ -86,16 +86,7 @@ func resolveCrossPackageSatisfaction(typePackages []*types.Package, result *Resu
 
 	pkgs := make([]pkgTypes, 0, len(typePackages))
 	for _, pkg := range typePackages {
-		namedTypes := getExportedNamedTypes(pkg)
-		ifaces := make(map[string]*types.Named)
-		constructors := make(map[string]*types.Named)
-		for name, named := range namedTypes {
-			if isInterfaceNamed(named) {
-				ifaces[name] = named
-			} else {
-				constructors[name] = named
-			}
-		}
+		constructors, ifaces := classifyTypes(pkg)
 		pkgs = append(pkgs, pkgTypes{pkg: pkg, types: constructors, ifaces: ifaces})
 	}
 
@@ -104,23 +95,46 @@ func resolveCrossPackageSatisfaction(typePackages []*types.Package, result *Resu
 			if pt.pkg == other.pkg {
 				continue
 			}
-			for ctorName, ctorType := range pt.types {
-				for ifaceName, ifaceType := range other.ifaces {
-					if types.Implements(ctorType, ifaceType.Underlying().(*types.Interface)) ||
-						types.Implements(types.NewPointer(ctorType), ifaceType.Underlying().(*types.Interface)) {
-						result.Edges = append(result.Edges, ResolvedEdge{
-							Edge: extract.Edge{
-								FromRef:  pt.pkg.Path() + "." + ctorName,
-								ToRef:    other.pkg.Path() + "." + ifaceName,
-								EdgeType: "satisfies",
-								Pos:      extract.Position{File: "", Line: 0},
-							},
-						})
-					}
-				}
+			findCrossPackageSatisfies(pt.pkg.Path(), pt.types, other.pkg.Path(), other.ifaces, result)
+		}
+	}
+}
+
+func classifyTypes(pkg *types.Package) (constructors, ifaces map[string]*types.Named) {
+	namedTypes := getExportedNamedTypes(pkg)
+	constructors = make(map[string]*types.Named)
+	ifaces = make(map[string]*types.Named)
+	for name, named := range namedTypes {
+		if isInterfaceNamed(named) {
+			ifaces[name] = named
+		} else {
+			constructors[name] = named
+		}
+	}
+	return constructors, ifaces
+}
+
+func findCrossPackageSatisfies(fromPkg string, ctors map[string]*types.Named, toPkg string, ifaces map[string]*types.Named, result *Result) {
+	for ctorName, ctorType := range ctors {
+		for ifaceName, ifaceType := range ifaces {
+			if satisfiesInterface(ctorType, ifaceType) {
+				result.Edges = append(result.Edges, ResolvedEdge{
+					Edge: extract.Edge{
+						FromRef:  fromPkg + "." + ctorName,
+						ToRef:    toPkg + "." + ifaceName,
+						EdgeType: "satisfies",
+						Pos:      extract.Position{File: "", Line: 0},
+					},
+				})
 			}
 		}
 	}
+}
+
+func satisfiesInterface(ctorType, ifaceType *types.Named) bool {
+	iface := ifaceType.Underlying().(*types.Interface)
+	return types.Implements(ctorType, iface) ||
+		types.Implements(types.NewPointer(ctorType), iface)
 }
 
 func processPackage(conf *types.Config, parseResult *parse.Result, pkgFiles map[string][]*ast.File, pkgInfo parse.PackageInfo, result *Result) *types.Package {
@@ -414,47 +428,62 @@ func funcQualifiedName(fn *types.Func, pkgPath string) string {
 func resolveInterfaceSatisfaction(pkg *types.Package, pkgPath string, result *Result) {
 	scope := pkg.Scope()
 	for _, name := range scope.Names() {
-		obj := scope.Lookup(name)
-		if !obj.Exported() {
-			continue
-		}
-
-		named, ok := obj.Type().(*types.Named)
+		named, ok := exportedNonInterfaceNamed(scope, name)
 		if !ok {
 			continue
 		}
+		findInPackageInterfaces(scope, pkgPath, name, named, result)
+	}
+}
 
-		if _, isInterface := named.Underlying().(*types.Interface); isInterface {
+func exportedNonInterfaceNamed(scope *types.Scope, name string) (*types.Named, bool) {
+	obj := scope.Lookup(name)
+	if !obj.Exported() {
+		return nil, false
+	}
+	named, ok := obj.Type().(*types.Named)
+	if !ok {
+		return nil, false
+	}
+	if isInterfaceNamed(named) {
+		return nil, false
+	}
+	return named, true
+}
+
+func exportedInterfaceNamed(scope *types.Scope, name string) (*types.Named, bool) {
+	obj := scope.Lookup(name)
+	if !obj.Exported() {
+		return nil, false
+	}
+	named, ok := obj.Type().(*types.Named)
+	if !ok {
+		return nil, false
+	}
+	if !isInterfaceNamed(named) {
+		return nil, false
+	}
+	return named, true
+}
+
+func findInPackageInterfaces(scope *types.Scope, pkgPath, name string, named *types.Named, result *Result) {
+	for _, otherName := range scope.Names() {
+		if otherName == name {
 			continue
 		}
-
-		for _, otherName := range scope.Names() {
-			if otherName == name {
-				continue
-			}
-			otherObj := scope.Lookup(otherName)
-			if !otherObj.Exported() {
-				continue
-			}
-			otherNamed, ok := otherObj.Type().(*types.Named)
-			if !ok {
-				continue
-			}
-			if _, isInterface := otherNamed.Underlying().(*types.Interface); !isInterface {
-				continue
-			}
-
-			if types.Implements(named, otherNamed.Underlying().(*types.Interface)) ||
-				types.Implements(types.NewPointer(named), otherNamed.Underlying().(*types.Interface)) {
-				result.Edges = append(result.Edges, ResolvedEdge{
-					Edge: extract.Edge{
-						FromRef:  pkgPath + "." + name,
-						ToRef:    pkgPath + "." + otherName,
-						EdgeType: "satisfies",
-						Pos:      extract.Position{File: "", Line: 0},
-					},
-				})
-			}
+		otherNamed, ok := exportedInterfaceNamed(scope, otherName)
+		if !ok {
+			continue
+		}
+		if satisfiesInterface(named, otherNamed) {
+			result.Edges = append(result.Edges, ResolvedEdge{
+				Edge: extract.Edge{
+					FromRef:  pkgPath + "." + name,
+					ToRef:    pkgPath + "." + otherName,
+					EdgeType: "satisfies",
+					Pos:      extract.Position{File: "", Line: 0},
+				},
+			})
 		}
 	}
 }
