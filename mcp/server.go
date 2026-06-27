@@ -152,7 +152,7 @@ func (s *Server) handleInitialize(id json.RawMessage) {
 	s.sendResponse(id, map[string]any{
 		"protocolVersion": "2024-11-05",
 		"capabilities":    map[string]any{"tools": map[string]any{}},
-		"serverInfo":      map[string]any{"name": "codemap", "version": "0.1.0"},
+		"serverInfo":      map[string]any{keyName: "codemap", "version": "0.1.0"},
 	})
 }
 
@@ -173,7 +173,7 @@ func (s *Server) handleToolsCall(id json.RawMessage, msg map[string]json.RawMess
 
 	result := s.handleTool(toolCall.Name, toolCall.Arguments)
 	s.sendResponse(id, map[string]any{
-		"content": []map[string]any{{"type": "text", "text": result}},
+		"content": []map[string]any{{keyType: "text", "text": result}},
 	})
 }
 
@@ -720,33 +720,56 @@ const (
 	errPatternRequired       = "Error: pattern is required"
 )
 
+const (
+	keyQualifiedName    = "qualified_name"
+	keyKind             = "kind"
+	keySignature        = "signature"
+	keyPosFile          = "pos_file"
+	keyPosLine          = "pos_line"
+	keyExported         = "exported"
+	keyEdgeType         = "edge_type"
+	keyPath             = "path"
+	keyIncludeTests     = "include_tests"
+	keyDepth            = "depth"
+	keyPackagePath      = "package_path"
+	keyName             = "name"
+	keyType             = "type"
+	keyDescription      = "description"
+)
+
+const (
+	descFullyQualifiedName = "string — fully qualified symbol name"
+	descSymbolKind         = "string — symbol kind"
+	descSourceFilePath     = "string — source file path"
+)
+
 var returnTypeSchemas = map[string]any{
 	"SymbolDetail": map[string]any{
-		"qualified_name": "string — fully qualified name (e.g., cli/codemap/extract.Run)",
-		"kind":           "string — symbol kind: function, method, type, interface, const, var",
+		keyQualifiedName: "string — fully qualified name (e.g., cli/codemap/extract.Run)",
+		keyKind:          "string — symbol kind: function, method, type, interface, const, var",
 		"receiver":       "string — receiver type for methods (empty for functions)",
-		"signature":      "string — type signature (e.g., 'func(string) error', 'struct { Name string }')",
+		keySignature:     "string — type signature (e.g., 'func(string) error', 'struct { Name string }')",
 		"doc":            "string — documentation comment",
-		"pos_file":       "string — source file path",
-		"pos_line":       "int — line number in source file",
-		"exported":       "bool — whether the symbol is exported (capitalized)",
+		keyPosFile:       descSourceFilePath,
+		keyPosLine:       "int — line number in source file",
+		keyExported:      "bool — whether the symbol is exported (capitalized)",
 	},
 	"EdgeDetail": map[string]any{
 		"from_ref":  "string — source symbol qualified name",
 		"to_ref":    "string — target symbol qualified name",
-		"edge_type": "string — relationship type: calls, references, satisfies, embeds, imports",
-		"pos_file":  "string — source file where edge occurs",
-		"pos_line":  "int — line number where edge occurs",
+		keyEdgeType: "string — relationship type: calls, references, satisfies, embeds, imports",
+		keyPosFile:  "string — source file where edge occurs",
+		keyPosLine:  "int — line number where edge occurs",
 	},
 	"SearchResult": map[string]any{
-		"qualified_name": "string — fully qualified name",
-		"kind":           "string — symbol kind",
-		"signature":      "string — type signature",
+		keyQualifiedName: "string — fully qualified name",
+		keyKind:          "string — symbol kind",
+		keySignature:     "string — type signature",
 		"doc":            "string — documentation comment",
 		"receiver":       "string — receiver type for methods",
-		"pos_file":       "string — source file path",
-		"pos_line":       "int — line number",
-		"exported":       "bool — whether exported",
+		keyPosFile:       descSourceFilePath,
+		keyPosLine:       "int — line number",
+		keyExported:      "bool — whether exported",
 	},
 	"ShowResult": map[string]any{
 		"symbol":         "SymbolDetail — the symbol being shown",
@@ -754,14 +777,14 @@ var returnTypeSchemas = map[string]any{
 		"outgoing_edges": "[]EdgeDetail — edges pointing FROM this symbol",
 	},
 	"PackageSummary": map[string]any{
-		"path":             "string — package import path",
-		"name":             "string — package name",
+		keyPath:             "string — package import path",
+		keyName:             "string — package name",
 		"exported_symbols": "[]SymbolDetail — exported symbols in this package",
 		"import_count":     "int — number of imports from this package",
 	},
 	"PackageResult": map[string]any{
-		"path":             "string — package import path",
-		"name":             "string — package name",
+		keyPath:             "string — package import path",
+		keyName:             "string — package name",
 		"exported_symbols": "[]SymbolDetail — exported symbols",
 		"import_count":     "int — number of imports",
 	},
@@ -773,10 +796,10 @@ var returnTypeSchemas = map[string]any{
 		"imports":    "A imports B — package A imports package B",
 	},
 	"SymbolBodyResult": map[string]any{
-		"qualified_name": "string — fully qualified symbol name",
-		"kind":           "string — symbol kind (function, method, type, const, var, interface, struct)",
-		"pos_file":       "string — source file path",
-		"pos_line":       "int — start line of the declaration",
+		keyQualifiedName: "string — fully qualified symbol name",
+		keyKind:          descSymbolKind + " (function, method, type, const, var, interface, struct)",
+		keyPosFile:       descSourceFilePath,
+		keyPosLine:       "int — start line of the declaration",
 		"pos_end_line":   "int — end line of the declaration",
 		"body":           "string — source text of the declaration (and optional doc comment when include_doc=true)",
 		"part_of_group":  "bool — true if this is a member of a grouped var/const/type block",
@@ -785,11 +808,11 @@ var returnTypeSchemas = map[string]any{
 		"context_after":  "string — N file lines after the declaration (when context_lines > 0)",
 	},
 	"ChangedSymbol": map[string]any{
-		"qualified_name": "string — fully qualified symbol name",
-		"kind":           "string — symbol kind",
+		keyQualifiedName: "string — fully qualified symbol name",
+		keyKind:          "string — symbol kind",
 		"change_type":    "string — modified | added | removed",
-		"pos_file":       "string — source file path",
-		"pos_line":       "int — start line",
+		keyPosFile:       descSourceFilePath,
+		keyPosLine:       "int — start line",
 		"blast_radius":   "*BlastRadius — optional blast radius (present when with_blast_radius=true)",
 		"body":           "string — optional source body (present when include_bodies=true)",
 	},
@@ -823,11 +846,11 @@ var returnTypeSchemas = map[string]any{
 		"transitive_imports": "[]EdgeDetail — transitive intra-project imports",
 	},
 	"EntryPoint": map[string]any{
-		"qualified_name": "string — fully qualified symbol name",
-		"kind":           "string — symbol kind",
-		"signature":      "string — symbol signature",
-		"pos_file":       "string — source file path",
-		"pos_line":       "int — start line",
+		keyQualifiedName: descFullyQualifiedName,
+		keyKind:          descSymbolKind,
+		keySignature:     "string — symbol signature",
+		keyPosFile:       descSourceFilePath,
+		keyPosLine:       "int — start line",
 		"reason":         "string — heuristic that matched: main | test | uncalled_exported | handler_sig | handler_name",
 	},
 }
@@ -889,30 +912,30 @@ func indexTools() []map[string]any {
 		toolDef("codemap_overview",
 			"Get a bird's-eye architecture summary of all indexed Go packages: each package's path, exported symbols with signatures, and import counts. Use instead of reading multiple files to understand project structure.",
 			map[string]any{
-				"include_tests": boolProp("Include test packages and symbols"),
+				keyIncludeTests: boolProp("Include test packages and symbols"),
 				"full_docs":     boolProp("Show full documentation instead of first sentence"),
 			}),
 		toolDef("codemap_show",
 			"Get full details for a Go symbol: file path, line number, type signature, documentation, and all call relationships (who calls it and what it calls). Use instead of reading source files when you need symbol context and relationships. Requires a fully qualified name like 'fmt.Println' or 'encoding/json.Decoder.Decode'.",
 			map[string]any{
-				"qualified_name": stringProp("Fully qualified symbol name (e.g., cli/codemap/extract.Run)"),
+				keyQualifiedName: stringProp("Fully qualified symbol name (e.g., cli/codemap/extract.Run)"),
 				"full_docs":      boolProp("Show full documentation instead of first sentence"),
 			},
 			"qualified_name"),
 		toolDef("codemap_callers_of",
 			"Find all callers of a Go function, method, or type: returns caller names, file paths, line numbers, and edge types (calls, references, satisfies, embeds, imports). For interfaces, this returns types that implement the interface (satisfies edges). Use instead of grep for tracing call sites and understanding where a symbol is used.",
 			map[string]any{
-				"qualified_name": stringProp("Fully qualified symbol name"),
+				keyQualifiedName: stringProp("Fully qualified symbol name"),
 				"edge_types":     stringArrayProp("Optional filter for specific edge types (e.g., calls, references, satisfies, embeds, imports)"),
-				"depth":          intProp("Traversal depth for transitive callers (default: 1 = direct only)"),
+				keyDepth: intProp("Traversal depth for transitive callers (default: 1 = direct only)"),
 			},
 			"qualified_name"),
 		toolDef("codemap_callees_of",
 			"Find all functions and methods called by a Go symbol: returns callee names, file paths, line numbers, and edge types (calls, references, satisfies, embeds, imports). For types, this returns embedded types and implemented interfaces. Use to trace dependencies and understand what a function relies on.",
 			map[string]any{
-				"qualified_name": stringProp("Fully qualified symbol name"),
+				keyQualifiedName: stringProp("Fully qualified symbol name"),
 				"edge_types":     stringArrayProp("Optional filter for specific edge types (e.g., calls, references, satisfies, embeds, imports)"),
-				"depth":          intProp("Traversal depth for transitive callees (default: 1 = direct only)"),
+				keyDepth: intProp("Traversal depth for transitive callees (default: 1 = direct only)"),
 			},
 			"qualified_name"),
 	}
@@ -954,7 +977,7 @@ func symbolTools() []map[string]any {
 			"Search Go symbols (functions, types, methods, interfaces, constants, variables) by name. Returns qualified names, file paths, line numbers, signatures, and documentation. More precise than grep for finding Go symbol definitions and declarations. Use this when you know a symbol name but not its location.",
 			map[string]any{
 				"pattern":       stringProp("Search pattern (case-insensitive substring match)"),
-				"include_tests": boolProp("Include test packages and symbols"),
+				keyIncludeTests: boolProp("Include test packages and symbols"),
 				"kind":          stringProp("Filter by symbol kind (e.g., function, method, type, const, var, interface)"),
 				"exported":      boolProp("Filter by exported status"),
 				"file":          stringProp("Filter by file path (substring match on pos_file, e.g., 'server.go' or 'mcp/')"),
@@ -963,7 +986,7 @@ func symbolTools() []map[string]any {
 		toolDef("codemap_list_packages",
 			"List all indexed Go packages with their import paths, names, and symbol counts. Use to discover what packages exist in the codebase before diving into specific symbols.",
 			map[string]any{
-				"include_tests": boolProp("Include test packages"),
+				keyIncludeTests: boolProp("Include test packages"),
 			}),
 	}
 }
@@ -973,19 +996,19 @@ func graphTools() []map[string]any {
 		toolDef("codemap_importers_of",
 			"Find all Go packages that import the given package. Returns package paths and line numbers. Use to understand a package's downstream dependents and blast radius of changes.",
 			map[string]any{
-				"package_path": stringProp("Package import path"),
+				keyPackagePath: stringProp("Package import path"),
 			},
 			"package_path"),
 		toolDef("codemap_imports_of",
 			"Find all packages imported by the given Go package. Returns import paths and line numbers. Use to understand a package's upstream dependencies.",
 			map[string]any{
-				"package_path": stringProp("Package import path"),
+				keyPackagePath: stringProp("Package import path"),
 			},
 			"package_path"),
 		toolDef("codemap_edges_by_type",
 			"List all edges of a specific relationship type (calls, references, satisfies, embeds, imports) across the entire indexed codebase. Use to trace a specific category of relationships globally.",
 			map[string]any{
-				"edge_type": stringProp("Edge type to filter by (e.g., calls, references, satisfies, embeds, imports)"),
+				keyEdgeType: stringProp("Edge type to filter by (e.g., calls, references, satisfies, embeds, imports)"),
 			},
 			"edge_type"),
 		toolDef("codemap_all_edges",
@@ -1008,20 +1031,20 @@ func typeAndImportTools() []map[string]any {
 			"Find all symbols that use a given type in their signatures (parameters, return types, fields). Returns qualified names, kinds, signatures, and file locations. Use to find where a type is used across the codebase.",
 			map[string]any{
 				"type_name":     stringProp("Type name to search for (e.g., 'error', 'string', 'MyStruct')"),
-				"include_tests": boolProp("Include test packages and symbols"),
+				keyIncludeTests: boolProp("Include test packages and symbols"),
 			},
 			"type_name"),
 		toolDef("codemap_transitive_imports",
 			"Find all packages transitively imported by a given package (direct and indirect dependencies). Returns import edges with file paths and line numbers. Use to understand the full dependency tree.",
 			map[string]any{
-				"package_path": stringProp("Package import path"),
+				keyPackagePath: stringProp("Package import path"),
 			},
 			"package_path"),
 		toolDef("codemap_search_prefix",
 			"Search Go symbols by qualified name prefix. Returns all symbols whose qualified name starts with the given prefix. Use to find all symbols in a package or subpackage.",
 			map[string]any{
 				"prefix":         stringProp("Qualified name prefix (e.g., 'cli/codemap/' or 'encoding/json.Decoder')"),
-				"include_tests": boolProp("Include test packages and symbols"),
+				keyIncludeTests: boolProp("Include test packages and symbols"),
 			},
 			"prefix"),
 	}
@@ -1038,19 +1061,19 @@ func analysisTools() []map[string]any {
 		toolDef("codemap_unused",
 			"Find all unexported symbols that have zero incoming callers/references. Returns symbol names, kinds, signatures, and file locations. Use to find dead code.",
 			map[string]any{
-				"include_tests": boolProp("Include test packages and symbols"),
+				keyIncludeTests: boolProp("Include test packages and symbols"),
 			}),
 		toolDef("codemap_cycles",
 			"Detect cycles in a specific edge type graph (e.g., imports, calls). Returns all cycles found as paths. Use to find circular dependencies or call cycles.",
 			map[string]any{
-				"edge_type": stringProp("Edge type to check for cycles (e.g., 'imports', 'calls')"),
+				keyEdgeType: stringProp("Edge type to check for cycles (e.g., 'imports', 'calls')"),
 			},
 			"edge_type"),
 		toolDef("codemap_blast_radius",
 			"Analyze the impact of changing a symbol: direct callers, transitive callers, interface implementations, embedders, and type users. Returns a summary of impact metrics. Use before refactoring to understand blast radius.",
 			map[string]any{
-				"qualified_name": stringProp("Symbol qualified name"),
-				"depth":          intProp("Transitive caller depth (default: 3)"),
+				keyQualifiedName: stringProp("Symbol qualified name"),
+				keyDepth: intProp("Transitive caller depth (default: 3)"),
 			},
 			"qualified_name"),
 	}
@@ -1070,7 +1093,7 @@ func pathAndSearchTools() []map[string]any {
 			"Search for all methods with a given name across all types. Returns each method's qualified name, receiver type, signature, and file location. Use to find all implementations of a method name.",
 			map[string]any{
 				"method_name":   stringProp("Method name to search for (e.g., 'Read', 'GetName')"),
-				"include_tests": boolProp("Include test packages and symbols"),
+				keyIncludeTests: boolProp("Include test packages and symbols"),
 			},
 			"method_name"),
 		toolDef("codemap_symbols_in_file",
@@ -1084,10 +1107,10 @@ func pathAndSearchTools() []map[string]any {
 
 func toolDef(name, description string, properties map[string]any, required ...string) map[string]any {
 	t := map[string]any{
-		"name":        name,
-		"description": description,
+		keyName:        name,
+		keyDescription: description,
 		"inputSchema": map[string]any{
-			"type":       "object",
+			keyType:       "object",
 			"properties": properties,
 		},
 	}
@@ -1098,23 +1121,23 @@ func toolDef(name, description string, properties map[string]any, required ...st
 }
 
 func stringProp(desc string) map[string]any {
-	return map[string]any{"type": "string", "description": desc}
+	return map[string]any{keyType: "string", keyDescription: desc}
 }
 
 func boolProp(desc string) map[string]any {
-	return map[string]any{"type": "boolean", "description": desc}
+	return map[string]any{keyType: "boolean", keyDescription: desc}
 }
 
 func stringArrayProp(desc string) map[string]any {
 	return map[string]any{
-		"type":        "array",
-		"items":       map[string]any{"type": "string"},
-		"description": desc,
+		keyType:        "array",
+		"items":       map[string]any{keyType: "string"},
+		keyDescription: desc,
 	}
 }
 
 func intProp(desc string) map[string]any {
-	return map[string]any{"type": "integer", "description": desc}
+	return map[string]any{keyType: "integer", keyDescription: desc}
 }
 
 func sourceTools() []map[string]any {
@@ -1122,7 +1145,7 @@ func sourceTools() []map[string]any {
 		toolDef("codemap_get_symbol_body",
 			"Get the source text of a single Go symbol (function, method, type, const, or var) by qualified name. Re-parses the file at query time to extract the exact declaration span, with optional doc comment and context-line padding. Replaces read(whole_file) for 'show me this one symbol' lookups with ~20x token reduction.",
 			map[string]any{
-				"qualified_name": stringProp("Fully qualified symbol name (e.g., cli/codemap/extract.Run)"),
+				keyQualifiedName: stringProp("Fully qualified symbol name (e.g., cli/codemap/extract.Run)"),
 				"context_lines":  intProp("Number of file lines to include before and after the declaration as context (default 0)"),
 				"include_doc":    boolProp("Prepend the leading doc comment to the body (default true)"),
 			},
@@ -1143,20 +1166,20 @@ func shapeTools() []map[string]any {
 		toolDef("codemap_dependency_layers",
 			"Get a topological layering of the project's packages based on the stored 'imports' edges (Kahn's algorithm), plus the top packages ranked by fan-in. Scoped to intra-project packages; standard library and third-party imports are excluded. Replaces N calls to codemap_importers_of to judge 'is this a hub' or 'what's the layer order'.",
 			map[string]any{
-				"include_tests": boolProp("Include _test packages in the layering (default false)"),
+				keyIncludeTests: boolProp("Include _test packages in the layering (default false)"),
 				"top_hubs":      intProp("Maximum number of hub entries to return (default 5)"),
 			}),
 		toolDef("codemap_dependency_flow",
 			"Get the immediate imports, immediate importers, and transitive imports of a single package in one call. Composes codemap_imports_of, codemap_importers_of, and codemap_transitive_imports.",
 			map[string]any{
-				"package_path": stringProp("Package import path"),
+				keyPackagePath: stringProp("Package import path"),
 			},
 			"package_path"),
 		toolDef("codemap_entry_points",
 			"Get the entry points of the codebase: main() functions, test entry symbols, exported funcs/methods with no incoming callers, and optionally HTTP handlers. Use to surface 'where do I start reading' without grep.",
 			map[string]any{
 				"heuristics": stringArrayProp("Heuristic set to apply: main, test, uncalled_exported, handler_sig, handler_name (default [\"main\",\"test\",\"uncalled_exported\"])"),
-				"include_tests": boolProp("Include _test packages; required to surface test-entry symbols (default false)"),
+				keyIncludeTests: boolProp("Include _test packages; required to surface test-entry symbols (default false)"),
 			}),
 	}
 }

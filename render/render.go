@@ -21,6 +21,8 @@ const (
 	FormatCompact
 )
 
+const keyPackages = "packages"
+
 type Options struct {
 	Format   Format
 	FullDocs bool
@@ -521,11 +523,11 @@ func firstSentence(s string) string {
 func renderOverviewTOON(result *query.OverviewResult) string {
 	data := map[string]any{
 		"summary": map[string]any{
-			"packages": result.TotalPackages,
+			keyPackages: result.TotalPackages,
 			"symbols":  result.TotalSymbols,
 			"edges":    result.TotalEdges,
 		},
-		"packages": result.Packages,
+		keyPackages: result.Packages,
 	}
 	out, err := gotoon.Encode(data)
 	if err != nil {
@@ -566,7 +568,7 @@ func renderSearchTOON(results []query.SearchResult) string {
 }
 
 func renderListPackagesTOON(pkgs []store.Package) string {
-	data := map[string]any{"packages": pkgs}
+	data := map[string]any{keyPackages: pkgs}
 	out, err := gotoon.Encode(data)
 	if err != nil {
 		return marshalJSON(pkgs)

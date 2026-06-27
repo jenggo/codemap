@@ -143,20 +143,24 @@ func edgeToDetail(e store.Edge) EdgeDetail {
 	}
 }
 
-var allEdgeTypes = []string{"calls", "references", "satisfies", "embeds", "imports"}
+var allEdgeTypes = []string{edgeTypeCalls, edgeTypeReferences, edgeTypeSatisfies, edgeTypeEmbeds, edgeTypeImports}
 
 const edgeTypeSatisfies = "satisfies"
 const edgeTypeCalls = "calls"
 const edgeTypeReferences = "references"
 const edgeTypeImports = "imports"
+const edgeTypeEmbeds = "embeds"
 
 const kindFunction = "function"
 const kindMain = "main"
 const kindMethod = "method"
 const kindVar = "var"
+const kindInterface = "interface"
+const kindType = "type"
 
 const changeTypeModified = "modified"
 const changeTypeAdded = "added"
+const changeTypeRemoved = "removed"
 
 type edgeFetcher func(ref string) ([]store.Edge, error)
 
@@ -405,7 +409,7 @@ func kindPriority(kind string) int {
 	switch kind {
 	case kindFunction, kindMethod:
 		return 0
-	case "interface", "type":
+	case kindInterface, kindType:
 		return 1
 	default:
 		return 2
@@ -968,7 +972,7 @@ func UnusedSymbols(s *store.Store, opts ...Option) ([]UnusedSymbol, error) {
 
 	called := make(map[string]bool)
 	for _, e := range edgesFrom {
-		if e.EdgeType == edgeTypeCalls || e.EdgeType == edgeTypeReferences || e.EdgeType == edgeTypeSatisfies || e.EdgeType == "embeds" {
+		if e.EdgeType == edgeTypeCalls || e.EdgeType == edgeTypeReferences || e.EdgeType == edgeTypeSatisfies || e.EdgeType == edgeTypeEmbeds {
 			called[e.ToRef] = true
 		}
 	}
@@ -1116,7 +1120,7 @@ func GetBlastRadius(s *store.Store, qualifiedName string, depth int, opts ...Opt
 		if e.EdgeType == edgeTypeSatisfies {
 			implCount++
 		}
-		if e.EdgeType == "embeds" {
+		if e.EdgeType == edgeTypeEmbeds {
 			embedCount++
 		}
 	}
@@ -1947,7 +1951,7 @@ func processDeletedFile(s *store.Store, repoDir, ref string, result *ChangedSymb
 		cs := ChangedSymbol{
 			QualifiedName: qn,
 			Kind:          sym.Kind,
-			ChangeType:    "removed",
+			ChangeType:    changeTypeRemoved,
 			PosFile:       file,
 			PosLine:       sym.PosLine,
 		}
@@ -1981,7 +1985,7 @@ func incSummary(ct string, result *ChangedSymbolsResult) {
 		result.Summary.Added++
 	case changeTypeModified:
 		result.Summary.Modified++
-	case "removed":
+	case changeTypeRemoved:
 		result.Summary.Removed++
 	}
 }
@@ -2017,7 +2021,7 @@ func processChangedFile(s *store.Store, result *ChangedSymbolsResult, file, chan
 			PosLine:       sym.PosLine,
 		}
 
-		if ct != "removed" {
+		if ct != changeTypeRemoved {
 			cs.Body = readChangedBody(sym.PosFile, sym.Name, sym.Kind, sym.PosLine, includeBodies)
 		}
 
