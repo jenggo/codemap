@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -36,7 +37,10 @@ CREATE TABLE IF NOT EXISTS symbols (
     pos_file        TEXT    NOT NULL,
     pos_line        INTEGER NOT NULL,
     exported        BOOLEAN NOT NULL DEFAULT FALSE,
-    is_test         BOOLEAN NOT NULL DEFAULT FALSE
+    is_test         BOOLEAN NOT NULL DEFAULT FALSE,
+    complexity      INTEGER NOT NULL DEFAULT 0,
+    churn_count     INTEGER NOT NULL DEFAULT 0,
+    importance      REAL    NOT NULL DEFAULT 0.0
 );
 
 CREATE TABLE IF NOT EXISTS edges (
@@ -46,6 +50,11 @@ CREATE TABLE IF NOT EXISTS edges (
     edge_type   TEXT    NOT NULL,
     pos_file    TEXT    NOT NULL,
     pos_line    INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS files (
+    path    TEXT PRIMARY KEY,
+    content TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_symbols_package   ON symbols(package_id);
@@ -69,6 +78,14 @@ CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
     doc,
     content=symbols,
     content_rowid=id,
+    tokenize='porter unicode61'
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS file_content_fts USING fts5(
+    path,
+    content,
+    content=files,
+    content_rowid=rowid,
     tokenize='porter unicode61'
 );
 `
@@ -114,7 +131,7 @@ func Create(path string) (*Store, error) {
 
 func Open(path string) (*Store, error) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return nil, fmt.Errorf("codemap index not found: run 'codemap index' first or use the codemap_index MCP tool")
+		return nil, fmt.Errorf("codemap index not found: run 'codemap index' first or use the index MCP tool")
 	}
 
 	db, err := sql.Open("sqlite", path)
@@ -125,7 +142,7 @@ func Open(path string) (*Store, error) {
 	var count int
 	if err := db.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM symbols").Scan(&count); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("codemap database is empty: run 'codemap index' first or use the codemap_index MCP tool")
+		return nil, fmt.Errorf("codemap database is empty: run 'codemap index' first or use the index MCP tool")
 	}
 
 	return &Store{db: db}, nil
@@ -135,7 +152,7 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-func (s *Store) Write(result *resolve.Result) error {
+func (s *Store) Write(result *resolve.Result, files map[string]string, churn map[string]int) error {
 	ctx := context.Background()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -156,11 +173,30 @@ func (s *Store) Write(result *resolve.Result) error {
 		return err
 	}
 
+	if churn != nil {
+		if err := applyChurn(ctx, tx, churn); err != nil {
+			return err
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return err
 	}
 
-	return s.populateFTS()
+	if err := s.populateFTS(); err != nil {
+		return err
+	}
+
+	if len(files) > 0 {
+		if err := s.WriteFiles(files); err != nil {
+			return err
+		}
+		if err := s.populateFileContentFTS(); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func writePackages(ctx context.Context, tx *sql.Tx, packages []parse.PackageInfo) (map[string]int64, error) {
@@ -183,7 +219,7 @@ func writePackages(ctx context.Context, tx *sql.Tx, packages []parse.PackageInfo
 }
 
 func writeSymbols(ctx context.Context, tx *sql.Tx, symbols []resolve.ResolvedSymbol, pkgCache map[string]int64) error {
-	symInsert := `INSERT OR IGNORE INTO symbols (qualified_name, package_id, name, kind, receiver, signature, doc, pos_file, pos_line, exported, is_test) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	symInsert := `INSERT OR IGNORE INTO symbols (qualified_name, package_id, name, kind, receiver, signature, doc, pos_file, pos_line, exported, is_test, complexity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	for _, sym := range symbols {
 		pkgID, ok := pkgCache[sym.Symbol.QualifiedName]
 		if !ok {
@@ -210,6 +246,7 @@ func writeSymbols(ctx context.Context, tx *sql.Tx, symbols []resolve.ResolvedSym
 			sym.Symbol.Pos.Line,
 			sym.Symbol.Exported,
 			sym.Symbol.IsTest,
+			sym.Symbol.Complexity,
 		)
 		if err != nil {
 			return fmt.Errorf("inserting symbol %s: %w", sym.Symbol.QualifiedName, err)
@@ -268,10 +305,10 @@ func sanitizeFTSQuery(pattern string) string {
 }
 
 type Package struct {
-	Path    string
-	Name    string
-	Dir     string
-	IsTest  bool
+	Path     string
+	Name     string
+	Dir      string
+	IsTest   bool
 	SymCount int
 }
 
@@ -287,6 +324,17 @@ type Symbol struct {
 	PosLine       int
 	Exported      bool
 	IsTest        bool
+	Complexity    int
+	ChurnCount    int
+	Importance    float64
+}
+
+type FileMatch struct {
+	FilePath      string
+	Line          string
+	ContextBefore string
+	ContextAfter  string
+	LineNumber    int
 }
 
 type Edge struct {
@@ -326,7 +374,7 @@ func (s *Store) ListPackages() ([]Package, error) {
 
 func (s *Store) SymbolsByPackage(pkgPath string, includeTests bool) ([]Symbol, error) {
 	query := `
-		SELECT s.qualified_name, p.path, s.name, s.kind, s.receiver, s.signature, s.doc, s.pos_file, s.pos_line, s.exported, s.is_test
+		SELECT s.qualified_name, p.path, s.name, s.kind, s.receiver, s.signature, s.doc, s.pos_file, s.pos_line, s.exported, s.is_test, s.complexity, s.churn_count, s.importance
 		FROM symbols s
 		JOIN packages p ON s.package_id = p.id
 		WHERE p.path = ?
@@ -346,7 +394,7 @@ func (s *Store) SymbolsByPackage(pkgPath string, includeTests bool) ([]Symbol, e
 	var syms []Symbol
 	for rows.Next() {
 		var sym Symbol
-		if err := rows.Scan(&sym.QualifiedName, &sym.PackagePath, &sym.Name, &sym.Kind, &sym.Receiver, &sym.Signature, &sym.Doc, &sym.PosFile, &sym.PosLine, &sym.Exported, &sym.IsTest); err != nil {
+		if err := rows.Scan(&sym.QualifiedName, &sym.PackagePath, &sym.Name, &sym.Kind, &sym.Receiver, &sym.Signature, &sym.Doc, &sym.PosFile, &sym.PosLine, &sym.Exported, &sym.IsTest, &sym.Complexity, &sym.ChurnCount, &sym.Importance); err != nil {
 			return nil, err
 		}
 		syms = append(syms, sym)
@@ -360,11 +408,11 @@ func (s *Store) SymbolsByPackage(pkgPath string, includeTests bool) ([]Symbol, e
 func (s *Store) SymbolByName(qualifiedName string) (*Symbol, error) {
 	var sym Symbol
 	err := s.db.QueryRowContext(context.Background(), `
-		SELECT s.qualified_name, p.path, s.name, s.kind, s.receiver, s.signature, s.doc, s.pos_file, s.pos_line, s.exported, s.is_test
+		SELECT s.qualified_name, p.path, s.name, s.kind, s.receiver, s.signature, s.doc, s.pos_file, s.pos_line, s.exported, s.is_test, s.complexity, s.churn_count, s.importance
 		FROM symbols s
 		JOIN packages p ON s.package_id = p.id
 		WHERE s.qualified_name = ?
-	`, qualifiedName).Scan(&sym.QualifiedName, &sym.PackagePath, &sym.Name, &sym.Kind, &sym.Receiver, &sym.Signature, &sym.Doc, &sym.PosFile, &sym.PosLine, &sym.Exported, &sym.IsTest)
+	`, qualifiedName).Scan(&sym.QualifiedName, &sym.PackagePath, &sym.Name, &sym.Kind, &sym.Receiver, &sym.Signature, &sym.Doc, &sym.PosFile, &sym.PosLine, &sym.Exported, &sym.IsTest, &sym.Complexity, &sym.ChurnCount, &sym.Importance)
 	if err != nil {
 		return nil, err
 	}
@@ -408,9 +456,9 @@ func (s *Store) queryEdges(where string, arg any) ([]Edge, error) {
 	return edges, nil
 }
 
-func (s *Store) SearchSymbolsByFile(filePattern string, kind string, exported *bool, includeTests bool) ([]Symbol, error) {
+func (s *Store) SearchSymbolsByFile(filePattern, kind string, exported *bool, includeTests bool) ([]Symbol, error) {
 	query := `
-		SELECT s.qualified_name, p.path, s.name, s.kind, s.receiver, s.signature, s.doc, s.pos_file, s.pos_line, s.exported, s.is_test
+		SELECT s.qualified_name, p.path, s.name, s.kind, s.receiver, s.signature, s.doc, s.pos_file, s.pos_line, s.exported, s.is_test, s.complexity, s.churn_count, s.importance
 		FROM symbols s
 		JOIN packages p ON s.package_id = p.id
 		WHERE s.pos_file LIKE ?
@@ -439,7 +487,7 @@ func (s *Store) SearchSymbolsByFile(filePattern string, kind string, exported *b
 	var syms []Symbol
 	for rows.Next() {
 		var sym Symbol
-		if err := rows.Scan(&sym.QualifiedName, &sym.PackagePath, &sym.Name, &sym.Kind, &sym.Receiver, &sym.Signature, &sym.Doc, &sym.PosFile, &sym.PosLine, &sym.Exported, &sym.IsTest); err != nil {
+		if err := rows.Scan(&sym.QualifiedName, &sym.PackagePath, &sym.Name, &sym.Kind, &sym.Receiver, &sym.Signature, &sym.Doc, &sym.PosFile, &sym.PosLine, &sym.Exported, &sym.IsTest, &sym.Complexity, &sym.ChurnCount, &sym.Importance); err != nil {
 			return nil, err
 		}
 		syms = append(syms, sym)
@@ -450,14 +498,14 @@ func (s *Store) SearchSymbolsByFile(filePattern string, kind string, exported *b
 	return syms, nil
 }
 
-func (s *Store) SearchSymbols(pattern string, kind string, exported *bool, pkgPath string, includeTests bool) ([]Symbol, error) {
+func (s *Store) SearchSymbols(pattern, kind string, exported *bool, pkgPath string, includeTests bool) ([]Symbol, error) {
 	ftsQuery := sanitizeFTSQuery(pattern)
 	if ftsQuery == "" {
 		return nil, nil
 	}
 
 	query := `
-		SELECT s.qualified_name, p.path, s.name, s.kind, s.receiver, s.signature, s.doc, s.pos_file, s.pos_line, s.exported, s.is_test
+		SELECT s.qualified_name, p.path, s.name, s.kind, s.receiver, s.signature, s.doc, s.pos_file, s.pos_line, s.exported, s.is_test, s.complexity, s.churn_count, s.importance
 		FROM symbols_fts fts
 		JOIN symbols s ON s.id = fts.rowid
 		JOIN packages p ON s.package_id = p.id
@@ -491,7 +539,7 @@ func (s *Store) SearchSymbols(pattern string, kind string, exported *bool, pkgPa
 	var syms []Symbol
 	for rows.Next() {
 		var sym Symbol
-		if err := rows.Scan(&sym.QualifiedName, &sym.PackagePath, &sym.Name, &sym.Kind, &sym.Receiver, &sym.Signature, &sym.Doc, &sym.PosFile, &sym.PosLine, &sym.Exported, &sym.IsTest); err != nil {
+		if err := rows.Scan(&sym.QualifiedName, &sym.PackagePath, &sym.Name, &sym.Kind, &sym.Receiver, &sym.Signature, &sym.Doc, &sym.PosFile, &sym.PosLine, &sym.Exported, &sym.IsTest, &sym.Complexity, &sym.ChurnCount, &sym.Importance); err != nil {
 			return nil, err
 		}
 		syms = append(syms, sym)
@@ -504,7 +552,7 @@ func (s *Store) SearchSymbols(pattern string, kind string, exported *bool, pkgPa
 
 func (s *Store) SearchByQualifiedNamePrefix(prefix string, includeTests bool) ([]Symbol, error) {
 	query := `
-		SELECT s.qualified_name, p.path, s.name, s.kind, s.receiver, s.signature, s.doc, s.pos_file, s.pos_line, s.exported, s.is_test
+		SELECT s.qualified_name, p.path, s.name, s.kind, s.receiver, s.signature, s.doc, s.pos_file, s.pos_line, s.exported, s.is_test, s.complexity, s.churn_count, s.importance
 		FROM symbols s
 		JOIN packages p ON s.package_id = p.id
 		WHERE s.qualified_name LIKE ?
@@ -525,7 +573,7 @@ func (s *Store) SearchByQualifiedNamePrefix(prefix string, includeTests bool) ([
 	var syms []Symbol
 	for rows.Next() {
 		var sym Symbol
-		if err := rows.Scan(&sym.QualifiedName, &sym.PackagePath, &sym.Name, &sym.Kind, &sym.Receiver, &sym.Signature, &sym.Doc, &sym.PosFile, &sym.PosLine, &sym.Exported, &sym.IsTest); err != nil {
+		if err := rows.Scan(&sym.QualifiedName, &sym.PackagePath, &sym.Name, &sym.Kind, &sym.Receiver, &sym.Signature, &sym.Doc, &sym.PosFile, &sym.PosLine, &sym.Exported, &sym.IsTest, &sym.Complexity, &sym.ChurnCount, &sym.Importance); err != nil {
 			return nil, err
 		}
 		syms = append(syms, sym)
@@ -570,7 +618,7 @@ func (s *Store) TransitiveImports(pkgPath string) ([]Edge, error) {
 
 func (s *Store) SearchByType(typeName string, includeTests bool) ([]Symbol, error) {
 	query := `
-		SELECT s.qualified_name, p.path, s.name, s.kind, s.receiver, s.signature, s.doc, s.pos_file, s.pos_line, s.exported, s.is_test
+		SELECT s.qualified_name, p.path, s.name, s.kind, s.receiver, s.signature, s.doc, s.pos_file, s.pos_line, s.exported, s.is_test, s.complexity, s.churn_count, s.importance
 		FROM symbols s
 		JOIN packages p ON s.package_id = p.id
 		WHERE s.signature LIKE '%' || ? || ' %'
@@ -596,7 +644,7 @@ func (s *Store) SearchByType(typeName string, includeTests bool) ([]Symbol, erro
 	var syms []Symbol
 	for rows.Next() {
 		var sym Symbol
-		if err := rows.Scan(&sym.QualifiedName, &sym.PackagePath, &sym.Name, &sym.Kind, &sym.Receiver, &sym.Signature, &sym.Doc, &sym.PosFile, &sym.PosLine, &sym.Exported, &sym.IsTest); err != nil {
+		if err := rows.Scan(&sym.QualifiedName, &sym.PackagePath, &sym.Name, &sym.Kind, &sym.Receiver, &sym.Signature, &sym.Doc, &sym.PosFile, &sym.PosLine, &sym.Exported, &sym.IsTest, &sym.Complexity, &sym.ChurnCount, &sym.Importance); err != nil {
 			return nil, err
 		}
 		syms = append(syms, sym)
@@ -609,7 +657,7 @@ func (s *Store) SearchByType(typeName string, includeTests bool) ([]Symbol, erro
 
 func (s *Store) MethodsByReceiver(typeName string, includeTests bool) ([]Symbol, error) {
 	query := `
-		SELECT s.qualified_name, p.path, s.name, s.kind, s.receiver, s.signature, s.doc, s.pos_file, s.pos_line, s.exported, s.is_test
+		SELECT s.qualified_name, p.path, s.name, s.kind, s.receiver, s.signature, s.doc, s.pos_file, s.pos_line, s.exported, s.is_test, s.complexity, s.churn_count, s.importance
 		FROM symbols s
 		JOIN packages p ON s.package_id = p.id
 		WHERE (s.receiver = ? OR s.receiver = ?)
@@ -629,7 +677,7 @@ func (s *Store) MethodsByReceiver(typeName string, includeTests bool) ([]Symbol,
 	var syms []Symbol
 	for rows.Next() {
 		var sym Symbol
-		if err := rows.Scan(&sym.QualifiedName, &sym.PackagePath, &sym.Name, &sym.Kind, &sym.Receiver, &sym.Signature, &sym.Doc, &sym.PosFile, &sym.PosLine, &sym.Exported, &sym.IsTest); err != nil {
+		if err := rows.Scan(&sym.QualifiedName, &sym.PackagePath, &sym.Name, &sym.Kind, &sym.Receiver, &sym.Signature, &sym.Doc, &sym.PosFile, &sym.PosLine, &sym.Exported, &sym.IsTest, &sym.Complexity, &sym.ChurnCount, &sym.Importance); err != nil {
 			return nil, err
 		}
 		syms = append(syms, sym)
@@ -642,7 +690,7 @@ func (s *Store) MethodsByReceiver(typeName string, includeTests bool) ([]Symbol,
 
 func (s *Store) MethodsByName(methodName string, includeTests bool) ([]Symbol, error) {
 	query := `
-		SELECT s.qualified_name, p.path, s.name, s.kind, s.receiver, s.signature, s.doc, s.pos_file, s.pos_line, s.exported, s.is_test
+		SELECT s.qualified_name, p.path, s.name, s.kind, s.receiver, s.signature, s.doc, s.pos_file, s.pos_line, s.exported, s.is_test, s.complexity, s.churn_count, s.importance
 		FROM symbols s
 		JOIN packages p ON s.package_id = p.id
 		WHERE s.kind = 'method' AND s.name = ?
@@ -663,7 +711,7 @@ func (s *Store) MethodsByName(methodName string, includeTests bool) ([]Symbol, e
 	var syms []Symbol
 	for rows.Next() {
 		var sym Symbol
-		if err := rows.Scan(&sym.QualifiedName, &sym.PackagePath, &sym.Name, &sym.Kind, &sym.Receiver, &sym.Signature, &sym.Doc, &sym.PosFile, &sym.PosLine, &sym.Exported, &sym.IsTest); err != nil {
+		if err := rows.Scan(&sym.QualifiedName, &sym.PackagePath, &sym.Name, &sym.Kind, &sym.Receiver, &sym.Signature, &sym.Doc, &sym.PosFile, &sym.PosLine, &sym.Exported, &sym.IsTest, &sym.Complexity, &sym.ChurnCount, &sym.Importance); err != nil {
 			return nil, err
 		}
 		syms = append(syms, sym)
@@ -676,7 +724,7 @@ func (s *Store) MethodsByName(methodName string, includeTests bool) ([]Symbol, e
 
 func (s *Store) AllSymbols(includeTests bool) ([]Symbol, error) {
 	query := `
-		SELECT s.qualified_name, p.path, s.name, s.kind, s.receiver, s.signature, s.doc, s.pos_file, s.pos_line, s.exported, s.is_test
+		SELECT s.qualified_name, p.path, s.name, s.kind, s.receiver, s.signature, s.doc, s.pos_file, s.pos_line, s.exported, s.is_test, s.complexity, s.churn_count, s.importance
 		FROM symbols s
 		JOIN packages p ON s.package_id = p.id
 	`
@@ -694,7 +742,7 @@ func (s *Store) AllSymbols(includeTests bool) ([]Symbol, error) {
 	var syms []Symbol
 	for rows.Next() {
 		var sym Symbol
-		if err := rows.Scan(&sym.QualifiedName, &sym.PackagePath, &sym.Name, &sym.Kind, &sym.Receiver, &sym.Signature, &sym.Doc, &sym.PosFile, &sym.PosLine, &sym.Exported, &sym.IsTest); err != nil {
+		if err := rows.Scan(&sym.QualifiedName, &sym.PackagePath, &sym.Name, &sym.Kind, &sym.Receiver, &sym.Signature, &sym.Doc, &sym.PosFile, &sym.PosLine, &sym.Exported, &sym.IsTest, &sym.Complexity, &sym.ChurnCount, &sym.Importance); err != nil {
 			return nil, err
 		}
 		syms = append(syms, sym)
@@ -710,6 +758,130 @@ func (s *Store) SetIndexedAt(t time.Time) error {
 	return err
 }
 
+func (s *Store) WriteFiles(files map[string]string) error {
+	ctx := context.Background()
+	for path, content := range files {
+		_, err := s.db.ExecContext(ctx, `INSERT OR REPLACE INTO files (path, content) VALUES (?, ?)`, path, content)
+		if err != nil {
+			return fmt.Errorf("writing file %s: %w", path, err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) populateFileContentFTS() error {
+	_, err := s.db.ExecContext(context.Background(), `
+		INSERT INTO file_content_fts(rowid, path, content)
+		SELECT rowid, path, content FROM files
+	`)
+	return err
+}
+
+func (s *Store) SearchFileContent(pattern, filePattern string, isRegex bool, contextLines int) ([]FileMatch, error) {
+	var query string
+	var args []any
+
+	if isRegex {
+		query = `SELECT path, content FROM files WHERE content REGEXP ?`
+		args = []any{pattern}
+	} else {
+		sanitized := sanitizeFTSQuery(pattern)
+		if sanitized == "" {
+			return nil, nil
+		}
+		query = `SELECT f.path, f.content FROM file_content_fts fts JOIN files f ON f.rowid = fts.rowid WHERE file_content_fts MATCH ?`
+		args = []any{sanitized}
+	}
+
+	if filePattern != "" {
+		if isRegex {
+			query += " AND path REGEXP ?"
+		} else {
+			query += " AND path LIKE ?"
+			args = append(args, "%"+filePattern+"%")
+		}
+	}
+
+	rows, err := s.db.QueryContext(context.Background(), query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var matches []FileMatch
+	for rows.Next() {
+		var filePath, content string
+		if err := rows.Scan(&filePath, &content); err != nil {
+			return nil, err
+		}
+		fileMatches := extractMatches(filePath, content, pattern, isRegex, contextLines)
+		matches = append(matches, fileMatches...)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return matches, nil
+}
+
+func extractMatches(filePath, content, pattern string, isRegex bool, contextLines int) []FileMatch {
+	lines := strings.Split(content, "\n")
+	var matches []FileMatch
+	for i, line := range lines {
+		var matched bool
+		if isRegex {
+			re, err := compileRegex(pattern)
+			if err != nil {
+				continue
+			}
+			matched = re.MatchString(line)
+		} else {
+			matched = strings.Contains(line, pattern)
+		}
+		if matched {
+			_fm := FileMatch{
+				FilePath:   filePath,
+				LineNumber: i + 1,
+				Line:       line,
+			}
+			if contextLines > 0 {
+				start := max(0, i-contextLines)
+				end := min(len(lines), i+contextLines+1)
+				if start < i {
+					_fm.ContextBefore = strings.Join(lines[start:i], "\n")
+				}
+				if i+1 < end {
+					_fm.ContextAfter = strings.Join(lines[i+1:end], "\n")
+				}
+			}
+			matches = append(matches, _fm)
+		}
+	}
+	return matches
+}
+
+func compileRegex(pattern string) (*regexp.Regexp, error) {
+	return regexp.Compile(pattern)
+}
+
+func (s *Store) FileContent(filePath string) (string, error) {
+	var content string
+	err := s.db.QueryRowContext(context.Background(), `SELECT content FROM files WHERE path = ?`, filePath).Scan(&content)
+	if err != nil {
+		return "", err
+	}
+	return content, nil
+}
+
+func applyChurn(ctx context.Context, tx *sql.Tx, churn map[string]int) error {
+	for filePath, count := range churn {
+		_, err := tx.ExecContext(ctx, `UPDATE symbols SET churn_count = ? WHERE pos_file = ?`, count, filePath)
+		if err != nil {
+			return fmt.Errorf("applying churn to %s: %w", filePath, err)
+		}
+	}
+	return nil
+}
+
 func (s *Store) IndexedAt() (time.Time, error) {
 	var val string
 	err := s.db.QueryRowContext(context.Background(), `SELECT value FROM meta WHERE key = 'indexed_at'`).Scan(&val)
@@ -719,7 +891,7 @@ func (s *Store) IndexedAt() (time.Time, error) {
 	return time.Parse(time.RFC3339, val)
 }
 
-func IsStale(dbPath string, repoPath string) (bool, error) {
+func IsStale(dbPath, repoPath string) (bool, error) {
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
 		return true, nil
 	}

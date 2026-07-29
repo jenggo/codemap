@@ -15,32 +15,40 @@ This project uses ` + "`codemap`" + ` MCP tools for Go codebase analysis. These 
 
 | You want... | Use this | Not this |
 |---|---|---|
-| Find a function/type by name | ` + "`codemap_search`" + ` | grep |
-| Understand a symbol's signature, docs, callers, callees | ` + "`codemap_show`" + ` | reading source files |
-| Find who calls a function | ` + "`codemap_callers_of`" + ` | grep for function name |
-| Find what a function depends on | ` + "`codemap_callees_of`" + ` | reading imports |
-| Get a package's full API | ` + "`codemap_package`" + ` | listing .go files |
-| Find all methods on a type | ` + "`codemap_methods_of`" + ` | grep for receiver patterns |
-| See project architecture | ` + "`codemap_overview`" + ` | guessing from directory structure |
-| Find where a package is imported | ` + "`codemap_importers_of`" + ` | grep for import path |
-| Find what a package depends on | ` + "`codemap_imports_of`" + ` | reading import blocks |
-| List all packages | ` + "`codemap_list_packages`" + ` | ls and guess |
+| Find a function/type by name | ` + "`search`" + ` | grep |
+| Understand a symbol's signature, docs, callers, callees | ` + "`show`" + ` | reading source files |
+| Find who calls a function | ` + "`callers_of`" + ` | grep for function name |
+| Find what a function depends on | ` + "`callees_of`" + ` | reading imports |
+| Get a package's full API | ` + "`package`" + ` | listing .go files |
+| Find all methods on a type | ` + "`methods_of`" + ` | grep for receiver patterns |
+| See project architecture | ` + "`overview`" + ` | guessing from directory structure |
+| Find where a package is imported | ` + "`importers_of`" + ` | grep for import path |
+| Find what a package depends on | ` + "`imports_of`" + ` | reading import blocks |
+| List all packages | ` + "`list_packages`" + ` | ls and guess |
+| Search file contents | ` + "`search_text`" + ` | grep |
+| Get symbol context bundle | ` + "`get_context_bundle`" + ` | manual assembly |
+| Find code hotspots | ` + "`get_hotspots`" + ` | manual review |
+| Rank symbol importance | ` + "`get_symbol_importance`" + ` | guessing |
 
 ## Available Tools
 
-- ` + "`codemap_index`" + ` — Force a full re-index. Indexing happens automatically on first tool call.
-- ` + "`codemap_overview`" + ` — Architecture summary: packages, exported symbols, import counts.
-- ` + "`codemap_search`" + ` — Search symbols by name. Returns qualified names, file paths, line numbers, signatures.
-- ` + "`codemap_show`" + ` — Full symbol detail: signature, docs, file:line, incoming/outgoing edges.
-- ` + "`codemap_callers_of`" + ` — Who calls this symbol? Returns caller names, file paths, line numbers.
-- ` + "`codemap_callees_of`" + ` — What does this symbol call? Returns callee names, file paths, line numbers.
-- ` + "`codemap_package`" + ` — All symbols in a package with signatures and docs.
-- ` + "`codemap_methods_of`" + ` — All methods on a type (short name like ` + "`Store`" + `).
-- ` + "`codemap_list_packages`" + ` — All indexed packages with paths and symbol counts.
-- ` + "`codemap_importers_of`" + ` — Packages that import the given package.
-- ` + "`codemap_imports_of`" + ` — Packages imported by the given package.
-- ` + "`codemap_edges_by_type`" + ` — All edges of a specific type (calls, references, satisfies, embeds, imports).
-- ` + "`codemap_all_edges`" + ` — Every relationship edge in the index.
+- ` + "`index`" + ` — Force a full re-index. Indexing happens automatically on first tool call.
+- ` + "`overview`" + ` — Architecture summary: packages, exported symbols, import counts.
+- ` + "`search`" + ` — Search symbols by name. Returns qualified names, file paths, line numbers, signatures.
+- ` + "`show`" + ` — Full symbol detail: signature, docs, file:line, incoming/outgoing edges.
+- ` + "`callers_of`" + ` — Who calls this symbol? Returns caller names, file paths, line numbers.
+- ` + "`callees_of`" + ` — What does this symbol call? Returns callee names, file paths, line numbers.
+- ` + "`package`" + ` — All symbols in a package with signatures and docs.
+- ` + "`methods_of`" + ` — All methods on a type (short name like ` + "`Store`" + `).
+- ` + "`list_packages`" + ` — All indexed packages with paths and symbol counts.
+- ` + "`importers_of`" + ` — Packages that import the given package.
+- ` + "`imports_of`" + ` — Packages imported by the given package.
+- ` + "`edges_by_type`" + ` — All edges of a specific type (calls, references, satisfies, embeds, imports).
+- ` + "`all_edges`" + ` — Every relationship edge in the index.
+- ` + "`search_text`" + ` — Full-text search across file contents (FTS5 or regex).
+- ` + "`get_context_bundle`" + ` — Bundle a symbol with callees, callers, and same-file symbols for LLM context.
+- ` + "`get_hotspots`" + ` — Find code hotspots by combining complexity with git churn.
+- ` + "`get_symbol_importance`" + ` — Compute symbol importance using PageRank on the call graph.
 
 ## Tips
 
@@ -59,39 +67,47 @@ Codemap provides Go code analysis via MCP tools. **Use codemap tools instead of 
 
 ## How It Works
 
-Indexing is **automatic** — the first tool call triggers indexing if needed (~50ms). If Go files change, the index refreshes automatically. No manual ` + "`codemap_index`" + ` call required.
+Indexing is **automatic** — the first tool call triggers indexing if needed (~50ms). If Go files change, the index refreshes automatically. No manual ` + "`index`" + ` call required.
 
 ## Decision Guide
 
 | You want... | Use | Instead of |
 |---|---|---|
-| Find a function/type by name | ` + "`codemap_search`" + ` | grep |
-| See a symbol's signature and docs | ` + "`codemap_show`" + ` | reading source files |
-| Who calls this function? | ` + "`codemap_callers_of`" + ` | grep for function name |
-| What does this function call? | ` + "`codemap_callees_of`" + ` | reading code |
-| Get a package's full API | ` + "`codemap_package`" + ` | listing .go files |
-| All methods on a type | ` + "`codemap_methods_of`" + ` | grep for receiver |
-| Project architecture overview | ` + "`codemap_overview`" + ` | guessing from dirs |
-| Where is this package imported? | ` + "`codemap_importers_of`" + ` | grep for import path |
-| What does this package depend on? | ` + "`codemap_imports_of`" + ` | reading import blocks |
+| Find a function/type by name | ` + "`search`" + ` | grep |
+| See a symbol's signature and docs | ` + "`show`" + ` | reading source files |
+| Who calls this function? | ` + "`callers_of`" + ` | grep for function name |
+| What does this function call? | ` + "`callees_of`" + ` | reading code |
+| Get a package's full API | ` + "`package`" + ` | listing .go files |
+| All methods on a type | ` + "`methods_of`" + ` | grep for receiver |
+| Project architecture overview | ` + "`overview`" + ` | guessing from dirs |
+| Where is this package imported? | ` + "`importers_of`" + ` | grep for import path |
+| What does this package depend on? | ` + "`imports_of`" + ` | reading import blocks |
+| Search file contents | ` + "`search_text`" + ` | grep |
+| Get symbol context bundle | ` + "`get_context_bundle`" + ` | manual assembly |
+| Find code hotspots | ` + "`get_hotspots`" + ` | manual review |
+| Rank symbol importance | ` + "`get_symbol_importance`" + ` | guessing |
 
 ## Available Tools
 
 | Tool | Returns | When to use |
 |---|---|---|
-| ` + "`codemap_index`" + ` | Packages, symbols, edges count | Force re-index (automatic otherwise) |
-| ` + "`codemap_overview`" + ` | Each package's exports + signatures | Understanding project structure |
-| ` + "`codemap_search`" + ` | Qualified names, file:line, signatures, docs | Finding symbols by name |
-| ` + "`codemap_show`" + ` | Signature, docs, file:line, incoming+outgoing edges | Understanding a single symbol |
-| ` + "`codemap_callers_of`" + ` | Caller names, file:line, edge types | Tracing who uses a function |
-| ` + "`codemap_callees_of`" + ` | Callee names, file:line, edge types | Tracing dependencies |
-| ` + "`codemap_package`" + ` | All symbols with signatures and docs | Inspecting a package's API |
-| ` + "`codemap_methods_of`" + ` | Method names, signatures, file:line | Finding a type's method set |
-| ` + "`codemap_list_packages`" + ` | Import paths, names, symbol counts | Discovering packages |
-| ` + "`codemap_importers_of`" + ` | Importing packages with file:line | Finding downstream dependents |
-| ` + "`codemap_imports_of`" + ` | Imported packages with file:line | Finding upstream dependencies |
-| ` + "`codemap_edges_by_type`" + ` | All edges of a given type | Bulk relationship analysis |
-| ` + "`codemap_all_edges`" + ` | Every edge in the codebase | Full graph export |
+| ` + "`index`" + ` | Packages, symbols, edges count | Force re-index (automatic otherwise) |
+| ` + "`overview`" + ` | Each package's exports + signatures | Understanding project structure |
+| ` + "`search`" + ` | Qualified names, file:line, signatures, docs | Finding symbols by name |
+| ` + "`show`" + ` | Signature, docs, file:line, incoming+outgoing edges | Understanding a single symbol |
+| ` + "`callers_of`" + ` | Caller names, file:line, edge types | Tracing who uses a function |
+| ` + "`callees_of`" + ` | Callee names, file:line, edge types | Tracing dependencies |
+| ` + "`package`" + ` | All symbols with signatures and docs | Inspecting a package's API |
+| ` + "`methods_of`" + ` | Method names, signatures, file:line | Finding a type's method set |
+| ` + "`list_packages`" + ` | Import paths, names, symbol counts | Discovering packages |
+| ` + "`importers_of`" + ` | Importing packages with file:line | Finding downstream dependents |
+| ` + "`imports_of`" + ` | Imported packages with file:line | Finding upstream dependencies |
+| ` + "`edges_by_type`" + ` | All edges of a given type | Bulk relationship analysis |
+| ` + "`all_edges`" + ` | Every edge in the codebase | Full graph export |
+| ` + "`search_text`" + ` | Matching file paths, line numbers, context | Full-text search across indexed files |
+| ` + "`get_context_bundle`" + ` | Symbol body, callees, callers, same-file symbols | LLM context preparation |
+| ` + "`get_hotspots`" + ` | Symbols ranked by complexity x churn risk | Finding risky code for refactoring |
+| ` + "`get_symbol_importance`" + ` | Symbols ranked by PageRank centrality | Identifying architecturally critical code |
 
 ## Tips
 
@@ -101,6 +117,53 @@ Indexing is **automatic** — the first tool call triggers indexing if needed (~
 - ` + "`include_unexported: true`" + ` — include private symbols (package tool)
 - Search is case-insensitive substring match
 - ` + "`methods_of`" + ` takes a short type name (e.g., ` + "`Store`" + `, not the full path)
+`
+
+const codemapGuardPlugin = `/**
+ * Codemap Guard — OpenCode plugin
+ *
+ * Soft-mode guard that warns agents when they use grep/glob/read on .go files
+ * instead of codemap MCP tools. The warning includes a suggestion to use the
+ * appropriate codemap tool. Calls are NOT blocked — the agent can proceed if
+ * it has a good reason (e.g. reading non-Go files, checking config, etc).
+ *
+ * Installed by ` + "`codemap inject`" + `.
+ */
+
+import type { Plugin } from "@opencode-ai/plugin"
+
+const GO_FILE_RE = /\.go\b/
+
+const TOOL_SUGGESTIONS: Record<string, string> = {
+  grep: "Use ` + "`codemap_search`" + ` (symbol names), ` + "`codemap_search_text`" + ` (file contents), or ` + "`codemap_callers_of`" + `/` + "`codemap_callees_of`" + ` (relationships) instead.",
+  glob: "Use ` + "`codemap_list_packages`" + ` or ` + "`codemap_package`" + ` to discover Go packages and their symbols.",
+  read: "Use ` + "`codemap_show`" + ` (single symbol), ` + "`codemap_package`" + ` (full package API), or ` + "`codemap_get_context_bundle`" + ` (symbol + context) instead.",
+}
+
+function isGoTarget(args: Record<string, any>): boolean {
+  for (const key of ["pattern", "path", "file", "include", "filePath"]) {
+    const val = args[key]
+    if (typeof val === "string" && GO_FILE_RE.test(val)) return true
+  }
+  return false
+}
+
+export const CodemapGuard: Plugin = async () => {
+  return {
+    "tool.execute.before": async (input, output) => {
+      const tool = input.tool.toLowerCase()
+      const suggestion = TOOL_SUGGESTIONS[tool]
+      if (!suggestion) return
+
+      const args = (output?.args ?? {}) as Record<string, any>
+      if (!isGoTarget(args)) return
+
+      console.warn(
+        ` + "`[codemap-guard] \"${input.tool}\" on Go files detected. ${suggestion}`" + `
+      )
+    },
+  }
+}
 `
 
 func Run() error {
@@ -175,6 +238,7 @@ func injectCrush() error {
 }
 
 func injectOpencode() error {
+	// Context file (navigation.md)
 	navDir := filepath.Join(os.Getenv("HOME"), ".config", "opencode", "context", "codemap")
 	if err := os.MkdirAll(navDir, 0755); err != nil {
 		return fmt.Errorf("creating opencode context directory: %w", err)
@@ -184,8 +248,20 @@ func injectOpencode() error {
 	if err := os.WriteFile(navPath, []byte(opencodeNavContent), 0644); err != nil {
 		return fmt.Errorf("writing navigation.md: %w", err)
 	}
-
 	fmt.Printf("opencode: updated %s\n", navPath)
+
+	// Plugin (codemap-guard.ts)
+	pluginDir := filepath.Join(os.Getenv("HOME"), ".config", "opencode", "plugins")
+	if err := os.MkdirAll(pluginDir, 0755); err != nil {
+		return fmt.Errorf("creating opencode plugins directory: %w", err)
+	}
+
+	pluginPath := filepath.Join(pluginDir, "codemap-guard.ts")
+	if err := os.WriteFile(pluginPath, []byte(codemapGuardPlugin), 0644); err != nil {
+		return fmt.Errorf("writing codemap-guard.ts: %w", err)
+	}
+	fmt.Printf("opencode: updated %s\n", pluginPath)
+
 	return nil
 }
 

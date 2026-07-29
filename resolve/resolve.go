@@ -1,13 +1,13 @@
 package resolve
 
 import (
+	"codemap/extract"
+	"codemap/parse"
 	"go/ast"
 	"go/token"
 	"go/types"
 	"slices"
 	"sort"
-	"codemap/extract"
-	"codemap/parse"
 )
 
 type ResolvedSymbol struct {

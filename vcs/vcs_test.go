@@ -163,3 +163,40 @@ func TestRefNotFound(t *testing.T) {
 		t.Fatal("expected error for missing ref")
 	}
 }
+
+func TestGitFileChurn(t *testing.T) {
+	repo := t.TempDir()
+	initGitRepo(t, repo)
+
+	writeFile(t, filepath.Join(repo, "a.go"), "package a\n")
+	writeFile(t, filepath.Join(repo, "b.txt"), "text\n")
+	runGitIn(t, repo, "add", ".")
+	runGitIn(t, repo, "commit", "-q", "-m", "initial")
+
+	writeFile(t, filepath.Join(repo, "a.go"), "package a\n// change1\n")
+	writeFile(t, filepath.Join(repo, "a.go"), "package a\n// change2\n")
+	runGitIn(t, repo, "add", ".")
+	runGitIn(t, repo, "commit", "-q", "-m", "change a")
+
+	churn, err := GitFileChurn(repo, "HEAD")
+	if err != nil {
+		t.Fatalf("GitFileChurn: %v", err)
+	}
+	if churn["a.go"] != 2 {
+		t.Errorf("expected a.go churn=2, got %d", churn["a.go"])
+	}
+	if _, ok := churn["b.txt"]; ok {
+		t.Errorf("b.txt should not be in churn map")
+	}
+}
+
+func TestGitFileChurnNonGit(t *testing.T) {
+	dir := t.TempDir()
+	churn, err := GitFileChurn(dir, "HEAD")
+	if err != nil {
+		t.Fatalf("GitFileChurn should not error for non-git dir: %v", err)
+	}
+	if len(churn) != 0 {
+		t.Errorf("expected empty churn map, got %v", churn)
+	}
+}

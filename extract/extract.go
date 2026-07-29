@@ -21,6 +21,7 @@ type Symbol struct {
 	Pos           Position
 	Exported      bool
 	IsTest        bool
+	Complexity    int
 }
 
 type Edge struct {
@@ -105,8 +106,9 @@ func (e *fileExtractor) extractFuncDecl(fd *ast.FuncDecl) {
 			File: pos.Filename,
 			Line: pos.Line,
 		},
-		Exported: fd.Name.IsExported(),
-		IsTest:   e.isTest,
+		Exported:   fd.Name.IsExported(),
+		IsTest:     e.isTest,
+		Complexity: computeComplexity(fd),
 	})
 }
 
@@ -337,4 +339,27 @@ func docString(doc *ast.CommentGroup) string {
 		return ""
 	}
 	return doc.Text()
+}
+
+func computeComplexity(fn *ast.FuncDecl) int {
+	if fn.Body == nil {
+		return 1
+	}
+	c := 1
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.IfStmt:
+			c++
+		case *ast.ForStmt, *ast.RangeStmt:
+			c++
+		case *ast.CaseClause:
+			c++
+		case *ast.BinaryExpr:
+			if node.Op == token.LAND || node.Op == token.LOR {
+				c++
+			}
+		}
+		return true
+	})
+	return c
 }

@@ -26,7 +26,7 @@ func TestToolsListIncludesNewTools(t *testing.T) {
 		t.Fatalf("store: %v", err)
 	}
 	defer func() { _ = st.Close() }()
-	if err := st.Write(resolveResult); err != nil {
+	if err := st.Write(resolveResult, nil, nil); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
@@ -37,11 +37,15 @@ func TestToolsListIncludesNewTools(t *testing.T) {
 		names[name] = true
 	}
 	required := []string{
-		"codemap_get_symbol_body",
-		"codemap_changed_symbols",
-		"codemap_dependency_layers",
-		"codemap_dependency_flow",
-		"codemap_entry_points",
+		"get_symbol_body",
+		"changed_symbols",
+		"dependency_layers",
+		"dependency_flow",
+		"entry_points",
+		"search_text",
+		"get_context_bundle",
+		"get_hotspots",
+		"get_symbol_importance",
 	}
 	for _, r := range required {
 		if !names[r] {
@@ -66,6 +70,10 @@ func TestSchemaIncludesNewEntries(t *testing.T) {
 		"LayersResult",
 		"FlowResult",
 		"EntryPoint",
+		"FileMatch",
+		"Bundle",
+		"Hotspot",
+		"ImportanceEntry",
 	}
 	for _, r := range required {
 		if _, ok := schema[r]; !ok {

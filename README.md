@@ -69,10 +69,11 @@ codemap serve
 
 ### Init Command
 
-`codemap init` auto-generates context files for:
+`codemap inject` (alias: `codemap init`) installs opencode integration files:
+- **Context file** — writes navigation documentation to `~/.config/opencode/context/codemap/navigation.md`
+- **Plugin** — installs a soft-mode guard to `~/.config/opencode/plugins/codemap-guard.ts` that warns agents when they use grep/glob/read on `.go` files instead of codemap MCP tools
 - **Crush** — injects MCP config into `~/.config/crush/crush.json`
-- **Opencode** — writes navigation documentation to `~/.config/opencode/context/codemap/navigation.md`
-- **AGENTS.md** — creates project-level guidance for AI agents
+- **AGENTS.md** — creates project-level guidance for AI agents (skipped if already exists)
 
 ## Usage
 

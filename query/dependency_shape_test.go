@@ -26,7 +26,7 @@ func setupQueryStoreAt(t *testing.T, root string) *store.Store {
 		t.Fatalf("store create: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	if err := s.Write(resolveResult); err != nil {
+	if err := s.Write(resolveResult, nil, nil); err != nil {
 		t.Fatalf("store write: %v", err)
 	}
 	return s

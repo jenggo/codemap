@@ -250,3 +250,30 @@ func GitShowFile(repoDir, ref, file string) ([]byte, error) {
 	}
 	return []byte(out), nil
 }
+
+func GitFileChurn(repoDir, ref string) (map[string]int, error) {
+	if err := IsGitRepo(repoDir); err != nil {
+		return map[string]int{}, nil
+	}
+	args := []string{"log", "--format=format:", "--name-only"}
+	if ref != "" {
+		args = append(args, ref)
+	}
+	args = append(args, "--", "*.go")
+	out, err := runGit(repoDir, args...)
+	if err != nil {
+		return map[string]int{}, nil
+	}
+	churn := make(map[string]int)
+	for line := range strings.SplitSeq(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if !strings.HasSuffix(line, ".go") {
+			continue
+		}
+		churn[line]++
+	}
+	return churn, nil
+}

@@ -59,7 +59,7 @@ func indexRepo(t *testing.T, root string) *store.Store {
 		t.Fatalf("store: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	if err := s.Write(resolveResult); err != nil {
+	if err := s.Write(resolveResult, nil, nil); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	return s

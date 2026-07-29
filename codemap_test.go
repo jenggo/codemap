@@ -35,7 +35,7 @@ func TestGoldenMultipackage(t *testing.T) {
 	runGoldenTest(t, "testdata/multipackage", "multipackage")
 }
 
-func runGoldenTest(t *testing.T, fixturePath string, name string) {
+func runGoldenTest(t *testing.T, fixturePath, name string) {
 	t.Helper()
 
 	absPath, err := filepath.Abs(fixturePath)
@@ -65,7 +65,7 @@ func runGoldenTest(t *testing.T, fixturePath string, name string) {
 	}
 	defer func() { _ = s.Close() }()
 
-	if err := s.Write(resolveResult); err != nil {
+	if err := s.Write(resolveResult, nil, nil); err != nil {
 		t.Fatalf("store write error: %v", err)
 	}
 
@@ -153,6 +153,14 @@ func setupTestStore(t *testing.T, fixturePath string) *store.Store {
 
 	resolveResult := resolve.Run(parseResult)
 
+	files := make(map[string]string)
+	for path := range parseResult.Files {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			files[filepath.Base(path)] = string(data)
+		}
+	}
+
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test.db")
 
@@ -162,7 +170,7 @@ func setupTestStore(t *testing.T, fixturePath string) *store.Store {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	if err := s.Write(resolveResult); err != nil {
+	if err := s.Write(resolveResult, files, nil); err != nil {
 		t.Fatalf("store write error: %v", err)
 	}
 
@@ -247,7 +255,7 @@ func TestSearchResultHasNewFields(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 
-	if err := s.Write(resolveResult); err != nil {
+	if err := s.Write(resolveResult, nil, nil); err != nil {
 		t.Fatalf("store write error: %v", err)
 	}
 
@@ -301,7 +309,7 @@ func TestSearchKindFilter(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 
-	if err := s.Write(resolveResult); err != nil {
+	if err := s.Write(resolveResult, nil, nil); err != nil {
 		t.Fatalf("store write error: %v", err)
 	}
 
@@ -339,7 +347,7 @@ func TestSearchExportedFilter(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 
-	if err := s.Write(resolveResult); err != nil {
+	if err := s.Write(resolveResult, nil, nil); err != nil {
 		t.Fatalf("store write error: %v", err)
 	}
 
@@ -377,7 +385,7 @@ func TestSearchRelevanceOrdering(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 
-	if err := s.Write(resolveResult); err != nil {
+	if err := s.Write(resolveResult, nil, nil); err != nil {
 		t.Fatalf("store write error: %v", err)
 	}
 
@@ -431,7 +439,7 @@ func TestPackageQuery(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 
-	if err := s.Write(resolveResult); err != nil {
+	if err := s.Write(resolveResult, nil, nil); err != nil {
 		t.Fatalf("store write error: %v", err)
 	}
 
@@ -482,7 +490,7 @@ func TestPackageQueryNotFound(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 
-	if err := s.Write(resolveResult); err != nil {
+	if err := s.Write(resolveResult, nil, nil); err != nil {
 		t.Fatalf("store write error: %v", err)
 	}
 
@@ -514,7 +522,7 @@ func TestMethodQuery(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 
-	if err := s.Write(resolveResult); err != nil {
+	if err := s.Write(resolveResult, nil, nil); err != nil {
 		t.Fatalf("store write error: %v", err)
 	}
 
@@ -559,7 +567,7 @@ func TestMethodQueryNotFound(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 
-	if err := s.Write(resolveResult); err != nil {
+	if err := s.Write(resolveResult, nil, nil); err != nil {
 		t.Fatalf("store write error: %v", err)
 	}
 
@@ -591,7 +599,7 @@ func TestEdgeTypeFiltering(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 
-	if err := s.Write(resolveResult); err != nil {
+	if err := s.Write(resolveResult, nil, nil); err != nil {
 		t.Fatalf("store write error: %v", err)
 	}
 
@@ -690,7 +698,7 @@ func TestNullToEmptySlice(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 
-	if err := s.Write(resolveResult); err != nil {
+	if err := s.Write(resolveResult, nil, nil); err != nil {
 		t.Fatalf("store write error: %v", err)
 	}
 
@@ -753,7 +761,7 @@ func TestEdgesByTypeQuery(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 
-	if err := s.Write(resolveResult); err != nil {
+	if err := s.Write(resolveResult, nil, nil); err != nil {
 		t.Fatalf("store write error: %v", err)
 	}
 
@@ -816,7 +824,7 @@ func TestImportQueries(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 
-	if err := s.Write(resolveResult); err != nil {
+	if err := s.Write(resolveResult, nil, nil); err != nil {
 		t.Fatalf("store write error: %v", err)
 	}
 
@@ -877,7 +885,7 @@ func TestPackageWithUnexported(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 
-	if err := s.Write(resolveResult); err != nil {
+	if err := s.Write(resolveResult, nil, nil); err != nil {
 		t.Fatalf("store write error: %v", err)
 	}
 
@@ -979,7 +987,7 @@ func TestEdgeRenderersIncludePositions(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 
-	if err := s.Write(resolveResult); err != nil {
+	if err := s.Write(resolveResult, nil, nil); err != nil {
 		t.Fatalf("store write error: %v", err)
 	}
 
@@ -1026,7 +1034,7 @@ func TestNoSyntacticEdges(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 
-	if err := s.Write(resolveResult); err != nil {
+	if err := s.Write(resolveResult, nil, nil); err != nil {
 		t.Fatalf("store write error: %v", err)
 	}
 
@@ -1063,7 +1071,7 @@ func TestSatisfiesCountRemoved(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 
-	if err := s.Write(resolveResult); err != nil {
+	if err := s.Write(resolveResult, nil, nil); err != nil {
 		t.Fatalf("store write error: %v", err)
 	}
 
@@ -1103,7 +1111,7 @@ func TestRenderFormats(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 
-	if err := s.Write(resolveResult); err != nil {
+	if err := s.Write(resolveResult, nil, nil); err != nil {
 		t.Fatalf("store write error: %v", err)
 	}
 
@@ -1130,5 +1138,115 @@ func TestRenderFormats(t *testing.T) {
 	toon := render.RenderOverview(overview, render.WithFormat(render.FormatTOON))
 	if toon == "" {
 		t.Error("expected non-empty TOON output")
+	}
+}
+
+func TestSearchTextGolden(t *testing.T) {
+	s := setupTestStore(t, "testdata/simple")
+
+	matches, err := query.SearchText(s, "Parser", "", false, 0)
+	if err != nil {
+		t.Fatalf("SearchText: %v", err)
+	}
+
+	if len(matches) == 0 {
+		t.Fatal("expected at least one match for 'Parser'")
+	}
+
+	for _, m := range matches {
+		if m.FilePath == "" {
+			t.Error("expected non-empty FilePath")
+		}
+		if m.LineNumber == 0 {
+			t.Error("expected non-zero LineNumber")
+		}
+		if m.Line == "" {
+			t.Error("expected non-empty Line")
+		}
+	}
+
+	out := render.RenderTextMatches(matches)
+	if out == "" {
+		t.Error("expected non-empty render output")
+	}
+}
+
+func TestContextBundleGolden(t *testing.T) {
+	s := setupTestStore(t, "testdata/simple")
+
+	bundle, err := query.ContextBundle(s, "codemap/testdata/simple.NewParser", 0)
+	if err != nil {
+		t.Fatalf("ContextBundle: %v", err)
+	}
+
+	if bundle.QualifiedName != "codemap/testdata/simple.NewParser" {
+		t.Errorf("expected qualified name 'codemap/testdata/simple.NewParser', got %q", bundle.QualifiedName)
+	}
+	if bundle.Body == "" {
+		t.Error("expected non-empty body")
+	}
+	if bundle.Symbol == nil {
+		t.Error("expected non-nil symbol")
+	}
+	if bundle.TokenEstimate == 0 {
+		t.Error("expected non-zero token estimate")
+	}
+
+	out := render.RenderBundle(bundle)
+	if out == "" {
+		t.Error("expected non-empty render output")
+	}
+}
+
+func TestHotspotsGolden(t *testing.T) {
+	s := setupTestStore(t, "testdata/simple")
+
+	hotspots, err := query.Hotspots(s, 0, 0, 0)
+	if err != nil {
+		t.Fatalf("Hotspots: %v", err)
+	}
+
+	// testdata/simple has no git churn, so all hotspots have risk=0
+	for _, h := range hotspots {
+		if h.QualifiedName == "" {
+			t.Error("expected non-empty QualifiedName")
+		}
+		if h.Kind == "" {
+			t.Error("expected non-empty Kind")
+		}
+		if h.RiskScore < 0 {
+			t.Error("expected non-negative risk score")
+		}
+	}
+
+	out := render.RenderHotspots(hotspots)
+	if out == "" {
+		t.Error("expected non-empty render output")
+	}
+}
+
+func TestSymbolImportanceGolden(t *testing.T) {
+	s := setupTestStore(t, "testdata/simple")
+
+	entries, err := query.SymbolImportance(s, 0, 0)
+	if err != nil {
+		t.Fatalf("SymbolImportance: %v", err)
+	}
+
+	for _, e := range entries {
+		if e.QualifiedName == "" {
+			t.Error("expected non-empty QualifiedName")
+		}
+		if e.Kind == "" {
+			t.Error("expected non-empty Kind")
+		}
+		if e.Importance < 0 {
+			t.Error("expected non-negative importance score")
+		}
+	}
+
+	out := render.RenderImportance(entries)
+	if out == "" {
+		t.Error("expected non-empty render output")
 	}
 }

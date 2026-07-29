@@ -5,6 +5,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1261,7 +1262,7 @@ func matchGenDecl(d *ast.GenDecl, fset *token.FileSet, posLine int, name, kind s
 	return nil
 }
 
-func symbolSpan(filePath string, posLine int, name string, kind string) (startOff, endOff, docStartOff int, partOfGroup bool, groupMembers int, err error) {
+func symbolSpan(filePath string, posLine int, name, kind string) (startOff, endOff, docStartOff int, partOfGroup bool, groupMembers int, err error) {
 	data, readErr := os.ReadFile(filePath)
 	if readErr != nil {
 		return 0, 0, 0, false, 0, fmt.Errorf("read source file %s: %w", filePath, readErr)
@@ -1289,7 +1290,7 @@ func symbolSpan(filePath string, posLine int, name string, kind string) (startOf
 	return 0, 0, 0, false, 0, fmt.Errorf("declaration not found: %s (kind=%s) at line %d in %s", name, kind, posLine, filePath)
 }
 
-func symbolEndLine(filePath string, posLine int, name string, kind string) (int, error) {
+func symbolEndLine(filePath string, posLine int, name, kind string) (int, error) {
 	startOff, endOff, _, _, _, err := symbolSpan(filePath, posLine, name, kind)
 	if err != nil {
 		return 0, err
@@ -1744,7 +1745,7 @@ type EntryPoint struct {
 var defaultEntryHeuristics = []string{kindMain, "test", "uncalled_exported"}
 
 var entryPointHeuristics = map[string]bool{
-	kindMain:             true,
+	kindMain:            true,
 	"test":              true,
 	"uncalled_exported": true,
 	"handler_sig":       true,
@@ -1775,7 +1776,7 @@ func addEntryPoint(out []EntryPoint, seen map[string]bool, sym store.Symbol, rea
 	})
 }
 
-func checkEntryHeuristics(out []EntryPoint, seen map[string]bool, sym store.Symbol, allowed map[string]bool, pkgMain, pkgIsTest, incoming map[string]bool) []EntryPoint {
+func checkEntryHeuristics(out []EntryPoint, seen map[string]bool, sym store.Symbol, allowed, pkgMain, pkgIsTest, incoming map[string]bool) []EntryPoint {
 	pkgPath := sym.PackagePath
 	if pkgPath == "" {
 		pkgPath = extractPkgPath(sym.QualifiedName)
@@ -2135,4 +2136,253 @@ func resolveRepoDir(repoDir string) (string, error) {
 		return "", fmt.Errorf("resolve repo dir: %w", err)
 	}
 	return abs, nil
+}
+
+func SearchText(s *store.Store, pattern, filePattern string, isRegex bool, contextLines int) ([]store.FileMatch, error) {
+	return s.SearchFileContent(pattern, filePattern, isRegex, contextLines)
+}
+
+type Bundle struct {
+	QualifiedName string         `json:"qualified_name"`
+	Symbol        *SymbolDetail  `json:"symbol,omitempty"`
+	Body          string         `json:"body"`
+	Callees       []EdgeDetail   `json:"callees"`
+	Callers       []EdgeDetail   `json:"callers"`
+	SameFile      []SearchResult `json:"same_file"`
+	TokenEstimate int            `json:"token_estimate"`
+}
+
+func ContextBundle(s *store.Store, qualifiedName string, tokenBudget int) (*Bundle, error) {
+	if tokenBudget <= 0 {
+		tokenBudget = 8000
+	}
+
+	showResult, err := Show(s, qualifiedName)
+	if err != nil {
+		return nil, err
+	}
+
+	bodyResult, err := GetSymbolBody(s, qualifiedName, 0, true)
+	if err != nil {
+		return nil, err
+	}
+
+	callees, err := CalleesOf(s, qualifiedName, WithDepth(1))
+	if err != nil {
+		callees = nil
+	}
+
+	callers, err := CallersOf(s, qualifiedName, WithDepth(1))
+	if err != nil {
+		callers = nil
+	}
+
+	var sameFile []SearchResult
+	if bodyResult.PosFile != "" {
+		sameFile, _ = SymbolsInFile(s, bodyResult.PosFile)
+	}
+
+	bundle := &Bundle{
+		QualifiedName: qualifiedName,
+		Symbol:        &showResult.Symbol,
+		Body:          bodyResult.Body,
+		Callees:       callees,
+		Callers:       callers,
+		SameFile:      sameFile,
+	}
+
+	bundle.TokenEstimate = estimateTokens(bundle)
+	if bundle.TokenEstimate > tokenBudget {
+		trimBundle(bundle, tokenBudget)
+	}
+
+	return bundle, nil
+}
+
+func estimateTokens(b *Bundle) int {
+	tokens := len(b.Body) / 4
+	for _, c := range b.Callees {
+		tokens += len(c.FromRef) + len(c.ToRef) + 10
+	}
+	for _, c := range b.Callers {
+		tokens += len(c.FromRef) + len(c.ToRef) + 10
+	}
+	for _, s := range b.SameFile {
+		tokens += len(s.QualifiedName) + len(s.Signature) + 10
+	}
+	return tokens
+}
+
+func trimBundle(b *Bundle, budget int) {
+	for len(b.SameFile) > 0 && estimateTokens(b) > budget {
+		b.SameFile = b.SameFile[:len(b.SameFile)-1]
+	}
+	for len(b.Callers) > 0 && estimateTokens(b) > budget {
+		b.Callers = b.Callers[:len(b.Callers)-1]
+	}
+	for len(b.Callees) > 0 && estimateTokens(b) > budget {
+		b.Callees = b.Callees[:len(b.Callees)-1]
+	}
+}
+
+type Hotspot struct {
+	QualifiedName string  `json:"qualified_name"`
+	Kind          string  `json:"kind"`
+	PosFile       string  `json:"pos_file"`
+	PosLine       int     `json:"pos_line"`
+	Complexity    int     `json:"complexity"`
+	ChurnCount    int     `json:"churn_count"`
+	RiskScore     float64 `json:"risk_score"`
+}
+
+func Hotspots(s *store.Store, topN, minComplexity, minChurn int) ([]Hotspot, error) {
+	if topN <= 0 {
+		topN = 10
+	}
+
+	allSyms, err := s.AllSymbols(false)
+	if err != nil {
+		return nil, err
+	}
+
+	var hotspots []Hotspot
+	for _, sym := range allSyms {
+		if sym.Complexity < minComplexity || sym.ChurnCount < minChurn {
+			continue
+		}
+		risk := float64(sym.Complexity) * math.Log(float64(sym.ChurnCount)+1)
+		hotspots = append(hotspots, Hotspot{
+			QualifiedName: sym.QualifiedName,
+			Kind:          sym.Kind,
+			PosFile:       sym.PosFile,
+			PosLine:       sym.PosLine,
+			Complexity:    sym.Complexity,
+			ChurnCount:    sym.ChurnCount,
+			RiskScore:     risk,
+		})
+	}
+
+	sort.Slice(hotspots, func(i, j int) bool {
+		return hotspots[i].RiskScore > hotspots[j].RiskScore
+	})
+
+	if len(hotspots) > topN {
+		hotspots = hotspots[:topN]
+	}
+
+	return hotspots, nil
+}
+
+type ImportanceEntry struct {
+	QualifiedName string  `json:"qualified_name"`
+	Kind          string  `json:"kind"`
+	PosFile       string  `json:"pos_file"`
+	PosLine       int     `json:"pos_line"`
+	Importance    float64 `json:"importance"`
+}
+
+func SymbolImportance(s *store.Store, topN, scope int) ([]ImportanceEntry, error) {
+	if topN <= 0 {
+		topN = 10
+	}
+
+	allSyms, err := s.AllSymbols(false)
+	if err != nil {
+		return nil, err
+	}
+
+	allEdges, err := s.AllEdges()
+	if err != nil {
+		return nil, err
+	}
+
+	nodeIdx, nodes := buildNodeIndex(allSyms)
+	n := len(nodes)
+	if n == 0 {
+		return nil, nil
+	}
+
+	adj := buildImportAdjacency(allEdges, nodeIdx)
+	rank := pagerank(n, adj)
+
+	symMap := make(map[string]store.Symbol)
+	for _, sym := range allSyms {
+		symMap[sym.QualifiedName] = sym
+	}
+
+	entries := buildImportanceEntries(nodes, symMap, rank)
+	if len(entries) > topN {
+		entries = entries[:topN]
+	}
+
+	return entries, nil
+}
+
+func buildNodeIndex(allSyms []store.Symbol) (map[string]int, []string) {
+	nodeIdx := make(map[string]int)
+	var nodes []string
+	for _, sym := range allSyms {
+		if _, ok := nodeIdx[sym.QualifiedName]; !ok {
+			nodeIdx[sym.QualifiedName] = len(nodes)
+			nodes = append(nodes, sym.QualifiedName)
+		}
+	}
+	return nodeIdx, nodes
+}
+
+func buildImportAdjacency(allEdges []store.Edge, nodeIdx map[string]int) map[int][]int {
+	adj := make(map[int][]int)
+	for _, e := range allEdges {
+		if e.EdgeType != edgeTypeImports {
+			continue
+		}
+		fromIdx, ok1 := nodeIdx[e.FromRef]
+		toIdx, ok2 := nodeIdx[e.ToRef]
+		if ok1 && ok2 {
+			adj[toIdx] = append(adj[toIdx], fromIdx)
+		}
+	}
+	return adj
+}
+
+func pagerank(n int, adj map[int][]int) []float64 {
+	damping := 0.85
+	iterations := 20
+	initVal := 1.0 / float64(n)
+	rank := make([]float64, n)
+	for i := range rank {
+		rank[i] = initVal
+	}
+	for range iterations {
+		newRank := make([]float64, n)
+		for i := range n {
+			sum := 0.0
+			for _, from := range adj[i] {
+				if outDeg := len(adj[from]); outDeg > 0 {
+					sum += rank[from] / float64(outDeg)
+				}
+			}
+			newRank[i] = (1-damping)/float64(n) + damping*sum
+		}
+		rank = newRank
+	}
+	return rank
+}
+
+func buildImportanceEntries(nodes []string, symMap map[string]store.Symbol, rank []float64) []ImportanceEntry {
+	entries := make([]ImportanceEntry, 0, len(nodes))
+	for i, name := range nodes {
+		sym := symMap[name]
+		entries = append(entries, ImportanceEntry{
+			QualifiedName: name,
+			Kind:          sym.Kind,
+			PosFile:       sym.PosFile,
+			PosLine:       sym.PosLine,
+			Importance:    rank[i],
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Importance > entries[j].Importance
+	})
+	return entries
 }

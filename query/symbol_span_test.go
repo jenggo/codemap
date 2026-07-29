@@ -95,9 +95,9 @@ func TestSymbolSpan(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			start, end, docOff, grouped, members, err := symbolSpan(file, tc.posLine, tc.qn, tc.kind)
-		if err != nil {
-			t.Fatalf("symbolSpan: %v", err)
-		}
+			if err != nil {
+				t.Fatalf("symbolSpan: %v", err)
+			}
 			if start < 0 || end <= start || end > len(data) {
 				t.Fatalf("offsets out of range: start=%d end=%d len=%d", start, end, len(data))
 			}

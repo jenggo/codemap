@@ -77,7 +77,7 @@ func TestEntryPointsHandlerSigOptIn(t *testing.T) {
 		t.Fatalf("store: %v", err)
 	}
 	defer func() { _ = st.Close() }()
-	if err := st.Write(resolveResult); err != nil {
+	if err := st.Write(resolveResult, nil, nil); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	defaults, _ := EntryPoints(st, nil, false)

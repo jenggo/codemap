@@ -524,8 +524,8 @@ func renderOverviewTOON(result *query.OverviewResult) string {
 	data := map[string]any{
 		"summary": map[string]any{
 			keyPackages: result.TotalPackages,
-			"symbols":  result.TotalSymbols,
-			"edges":    result.TotalEdges,
+			"symbols":   result.TotalSymbols,
+			"edges":     result.TotalEdges,
 		},
 		keyPackages: result.Packages,
 	}
@@ -980,4 +980,224 @@ func indentEach(s, prefix string) string {
 		b.WriteString(line)
 	}
 	return b.String()
+}
+
+func RenderTextMatches(matches []store.FileMatch, opts ...Option) string {
+	options := &Options{}
+	for _, o := range opts {
+		o(options)
+	}
+
+	switch options.Format {
+	case FormatJSON:
+		return marshalJSON(matches)
+	case FormatCompact:
+		var b strings.Builder
+		for _, m := range matches {
+			fmt.Fprintf(&b, "%s:%d\n", m.FilePath, m.LineNumber)
+		}
+		return b.String()
+	case FormatTOON, FormatText:
+		var b strings.Builder
+		for _, m := range matches {
+			fmt.Fprintf(&b, "%s:%d\n", m.FilePath, m.LineNumber)
+			if m.Line != "" {
+				fmt.Fprintf(&b, "  %s\n", m.Line)
+			}
+			if m.ContextBefore != "" {
+				b.WriteString(indentEach(m.ContextBefore, "  "))
+				b.WriteString("\n")
+			}
+			if m.ContextAfter != "" {
+				b.WriteString(indentEach(m.ContextAfter, "  "))
+				b.WriteString("\n")
+			}
+		}
+		return b.String()
+	default:
+		var b strings.Builder
+		for _, m := range matches {
+			fmt.Fprintf(&b, "%s:%d\n", m.FilePath, m.LineNumber)
+			if m.Line != "" {
+				fmt.Fprintf(&b, "  %s\n", m.Line)
+			}
+		}
+		return b.String()
+	}
+}
+
+func RenderBundle(bundle *query.Bundle, opts ...Option) string {
+	options := &Options{}
+	for _, o := range opts {
+		o(options)
+	}
+
+	switch options.Format {
+	case FormatJSON:
+		return marshalJSON(bundle)
+	case FormatCompact:
+		return fmt.Sprintf("%s (tokens=%d)", bundle.QualifiedName, bundle.TokenEstimate)
+	case FormatTOON, FormatText:
+		return renderBundleText(bundle)
+	default:
+		return renderBundleTOON(bundle)
+	}
+}
+
+func renderBundleText(bundle *query.Bundle) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Bundle: %s (est. %d tokens)\n\n", bundle.QualifiedName, bundle.TokenEstimate)
+	if bundle.Symbol != nil {
+		writeBundleSymbol(&b, bundle.Symbol)
+	}
+	if bundle.Body != "" {
+		writeBundleBody(&b, bundle.Body)
+	}
+	writeBundleCallees(&b, bundle.Callees)
+	writeBundleCallers(&b, bundle.Callers)
+	writeBundleSameFile(&b, bundle.SameFile)
+	return b.String()
+}
+
+func writeBundleSymbol(b *strings.Builder, sym *query.SymbolDetail) {
+	fmt.Fprintf(b, "Symbol: %s (%s)\n", sym.QualifiedName, sym.Kind)
+	fmt.Fprintf(b, "  signature: %s\n", sym.Signature)
+	if sym.Doc != "" {
+		fmt.Fprintf(b, "  doc: %s\n", firstSentence(sym.Doc))
+	}
+	fmt.Fprintf(b, "  pos: %s:%d\n\n", sym.PosFile, sym.PosLine)
+}
+
+func writeBundleBody(b *strings.Builder, body string) {
+	b.WriteString("```go\n")
+	b.WriteString(body)
+	if !strings.HasSuffix(body, "\n") {
+		b.WriteString("\n")
+	}
+	b.WriteString("```\n\n")
+}
+
+func writeBundleCallees(b *strings.Builder, callees []query.EdgeDetail) {
+	if len(callees) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "Callees (%d):\n", len(callees))
+	for _, e := range callees {
+		fmt.Fprintf(b, "  -> %s (%s)\n", e.ToRef, e.EdgeType)
+	}
+	b.WriteString("\n")
+}
+
+func writeBundleCallers(b *strings.Builder, callers []query.EdgeDetail) {
+	if len(callers) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "Callers (%d):\n", len(callers))
+	for _, e := range callers {
+		fmt.Fprintf(b, "  <- %s (%s)\n", e.FromRef, e.EdgeType)
+	}
+	b.WriteString("\n")
+}
+
+func writeBundleSameFile(b *strings.Builder, sameFile []query.SearchResult) {
+	if len(sameFile) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "Same-file symbols (%d):\n", len(sameFile))
+	for _, s := range sameFile {
+		fmt.Fprintf(b, "  - %s (%s)\n", s.QualifiedName, s.Kind)
+	}
+}
+
+func renderBundleTOON(b *query.Bundle) string {
+	data := map[string]any{
+		"qualified_name": b.QualifiedName,
+		"symbol":         b.Symbol,
+		"body":           b.Body,
+		"callees":        b.Callees,
+		"callers":        b.Callers,
+		"same_file":      b.SameFile,
+		"token_estimate": b.TokenEstimate,
+	}
+	out, err := gotoon.Encode(data)
+	if err != nil {
+		return marshalJSON(b)
+	}
+	return out
+}
+
+func RenderHotspots(hotspots []query.Hotspot, opts ...Option) string {
+	options := &Options{}
+	for _, o := range opts {
+		o(options)
+	}
+
+	switch options.Format {
+	case FormatJSON:
+		return marshalJSON(hotspots)
+	case FormatCompact:
+		var b strings.Builder
+		for _, h := range hotspots {
+			fmt.Fprintf(&b, "%.2f %s C=%d Ch=%d\n", h.RiskScore, h.QualifiedName, h.Complexity, h.ChurnCount)
+		}
+		return b.String()
+	case FormatTOON, FormatText:
+		var b strings.Builder
+		fmt.Fprintf(&b, "Hotspots (%d):\n\n", len(hotspots))
+		for i, h := range hotspots {
+			fmt.Fprintf(&b, "%d. %s (%s)\n", i+1, h.QualifiedName, h.Kind)
+			fmt.Fprintf(&b, "   risk: %.2f  complexity: %d  churn: %d\n", h.RiskScore, h.Complexity, h.ChurnCount)
+			fmt.Fprintf(&b, "   pos: %s:%d\n\n", h.PosFile, h.PosLine)
+		}
+		return b.String()
+	default:
+		return renderHotspotsTOON(hotspots)
+	}
+}
+
+func renderHotspotsTOON(hotspots []query.Hotspot) string {
+	data := map[string]any{"hotspots": hotspots}
+	out, err := gotoon.Encode(data)
+	if err != nil {
+		return marshalJSON(hotspots)
+	}
+	return out
+}
+
+func RenderImportance(entries []query.ImportanceEntry, opts ...Option) string {
+	options := &Options{}
+	for _, o := range opts {
+		o(options)
+	}
+
+	switch options.Format {
+	case FormatJSON:
+		return marshalJSON(entries)
+	case FormatCompact:
+		var b strings.Builder
+		for _, e := range entries {
+			fmt.Fprintf(&b, "%.4f %s (%s)\n", e.Importance, e.QualifiedName, e.Kind)
+		}
+		return b.String()
+	case FormatTOON, FormatText:
+		var b strings.Builder
+		fmt.Fprintf(&b, "Symbol Importance (%d):\n\n", len(entries))
+		for i, e := range entries {
+			fmt.Fprintf(&b, "%d. %s (%s)\n", i+1, e.QualifiedName, e.Kind)
+			fmt.Fprintf(&b, "   importance: %.4f\n", e.Importance)
+			fmt.Fprintf(&b, "   pos: %s:%d\n\n", e.PosFile, e.PosLine)
+		}
+		return b.String()
+	default:
+		return renderImportanceTOON(entries)
+	}
+}
+
+func renderImportanceTOON(entries []query.ImportanceEntry) string {
+	data := map[string]any{"importance": entries}
+	out, err := gotoon.Encode(data)
+	if err != nil {
+		return marshalJSON(entries)
+	}
+	return out
 }

@@ -15,6 +15,7 @@ import (
 	"codemap/render"
 	"codemap/resolve"
 	"codemap/store"
+	"codemap/vcs"
 )
 
 func main() {
@@ -34,6 +35,11 @@ type parsedFlags struct {
 	includeTests      bool
 	fullDocs          bool
 	includeUnexported bool
+	regex             bool
+	contextLines      int
+	topN              int
+	minComplexity     int
+	minChurn          int
 }
 
 func parseArgs(args []string, defaultDBPath string) (parsedFlags, []string) {
@@ -77,25 +83,52 @@ func handleFlag(arg string, args []string, i int, flags *parsedFlags) (bool, int
 			return true, i + 1
 		}
 	case "--kind":
-		if i+1 < len(args) {
-			flags.kindFilter = args[i+1]
-			return true, i + 1
-		}
+		return consumeStringArg(args, i, &flags.kindFilter)
 	case "--exported":
-		if i+1 < len(args) {
-			flags.exportedFilter = parseBool(args[i+1])
-			return true, i + 1
-		}
-		flags.exportedFilter = new(bool)
-		*flags.exportedFilter = true
+		return handleExportedFlag(args, i, flags)
 	case "--package":
-		if i+1 < len(args) {
-			flags.packageFilter = args[i+1]
-			return true, i + 1
-		}
+		return consumeStringArg(args, i, &flags.packageFilter)
+	case "--regex":
+		flags.regex = true
+	case "--context-lines":
+		return consumeIntArg(args, i, &flags.contextLines)
+	case "--top-n":
+		return consumeIntArg(args, i, &flags.topN)
+	case "--min-complexity":
+		return consumeIntArg(args, i, &flags.minComplexity)
+	case "--min-churn":
+		return consumeIntArg(args, i, &flags.minChurn)
 	default:
 		return false, i
 	}
+	return false, i
+}
+
+func consumeStringArg(args []string, i int, target *string) (bool, int) {
+	if i+1 < len(args) {
+		*target = args[i+1]
+		return true, i + 1
+	}
+	return false, i
+}
+
+func consumeIntArg(args []string, i int, target *int) (bool, int) {
+	if i+1 < len(args) {
+		if v, err := strconv.Atoi(args[i+1]); err == nil {
+			*target = v
+		}
+		return true, i + 1
+	}
+	return false, i
+}
+
+func handleExportedFlag(args []string, i int, flags *parsedFlags) (bool, int) {
+	if i+1 < len(args) {
+		flags.exportedFilter = parseBool(args[i+1])
+		return true, i + 1
+	}
+	flags.exportedFilter = new(bool)
+	*flags.exportedFilter = true
 	return false, i
 }
 
@@ -164,6 +197,18 @@ func dispatchCommand(cmd string, args []string, dbPath string, queryOpts []query
 			path = args[0]
 		}
 		cmdIndex(path, dbPath)
+	case "init", "inject":
+		cmdInit()
+	case "serve":
+		cmdServe(dbPath)
+	default:
+		return dispatchQueryCommand(cmd, args, dbPath, queryOpts, renderOpts)
+	}
+	return nil
+}
+
+func dispatchQueryCommand(cmd string, args []string, dbPath string, queryOpts []query.Option, renderOpts []render.Option) error {
+	switch cmd {
 	case "overview":
 		cmdOverview(dbPath, queryOpts, renderOpts)
 	case "show":
@@ -188,10 +233,12 @@ func dispatchCommand(cmd string, args []string, dbPath string, queryOpts []query
 		cmdAllEdges(dbPath, queryOpts, renderOpts)
 	case "list-packages":
 		cmdListPackages(dbPath, queryOpts, renderOpts)
-	case "init":
-		cmdInit()
-	case "serve":
-		cmdServe(dbPath)
+	case "search-text":
+		return withRequiredArg(args, "search-text", func(arg string) { cmdSearchText(arg, dbPath, renderOpts) })
+	case "hotspots":
+		cmdHotspots(dbPath, renderOpts)
+	case "importance":
+		cmdImportance(dbPath, renderOpts)
 	default:
 		printUsage()
 		return fmt.Errorf("unknown command: %s", cmd)
@@ -207,7 +254,7 @@ func withRequiredArg(args []string, name string, fn func(string)) error {
 	return nil
 }
 
-func cmdIndex(path string, dbPath string) {
+func cmdIndex(path, dbPath string) {
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -236,7 +283,9 @@ func cmdIndex(path string, dbPath string) {
 	}
 	defer func() { _ = s.Close() }()
 
-	if err := s.Write(resolveResult); err != nil {
+	churn, _ := vcs.GitFileChurn(absPath, "HEAD")
+
+	if err := s.Write(resolveResult, nil, churn); err != nil {
 		fmt.Fprintf(os.Stderr, "Write error: %v\n", err)
 		return
 	}
@@ -269,7 +318,7 @@ func cmdOverview(dbPath string, qOpts []query.Option, rOpts []render.Option) {
 	fmt.Print(render.RenderOverview(result, rOpts...))
 }
 
-func cmdShow(qn string, dbPath string, qOpts []query.Option, rOpts []render.Option) {
+func cmdShow(qn, dbPath string, qOpts []query.Option, rOpts []render.Option) {
 	s, err := store.Open(dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -286,7 +335,7 @@ func cmdShow(qn string, dbPath string, qOpts []query.Option, rOpts []render.Opti
 	fmt.Print(render.RenderShow(result, rOpts...))
 }
 
-func cmdCallersOf(qn string, dbPath string, qOpts []query.Option, rOpts []render.Option) {
+func cmdCallersOf(qn, dbPath string, qOpts []query.Option, rOpts []render.Option) {
 	s, err := store.Open(dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -303,7 +352,7 @@ func cmdCallersOf(qn string, dbPath string, qOpts []query.Option, rOpts []render
 	fmt.Print(render.RenderCallers(edges, rOpts...))
 }
 
-func cmdCalleesOf(qn string, dbPath string, qOpts []query.Option, rOpts []render.Option) {
+func cmdCalleesOf(qn, dbPath string, qOpts []query.Option, rOpts []render.Option) {
 	s, err := store.Open(dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -320,7 +369,7 @@ func cmdCalleesOf(qn string, dbPath string, qOpts []query.Option, rOpts []render
 	fmt.Print(render.RenderCallees(edges, rOpts...))
 }
 
-func cmdPackage(pkgPath string, dbPath string, qOpts []query.Option, rOpts []render.Option) {
+func cmdPackage(pkgPath, dbPath string, qOpts []query.Option, rOpts []render.Option) {
 	s, err := store.Open(dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -337,7 +386,7 @@ func cmdPackage(pkgPath string, dbPath string, qOpts []query.Option, rOpts []ren
 	fmt.Print(render.RenderPackage(result, rOpts...))
 }
 
-func cmdMethodsOf(typeName string, dbPath string, qOpts []query.Option, rOpts []render.Option) {
+func cmdMethodsOf(typeName, dbPath string, qOpts []query.Option, rOpts []render.Option) {
 	s, err := store.Open(dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -354,7 +403,7 @@ func cmdMethodsOf(typeName string, dbPath string, qOpts []query.Option, rOpts []
 	fmt.Print(render.RenderMethodsOf(methods, rOpts...))
 }
 
-func cmdImportersOf(pkgPath string, dbPath string, qOpts []query.Option, rOpts []render.Option) {
+func cmdImportersOf(pkgPath, dbPath string, qOpts []query.Option, rOpts []render.Option) {
 	s, err := store.Open(dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -371,7 +420,7 @@ func cmdImportersOf(pkgPath string, dbPath string, qOpts []query.Option, rOpts [
 	fmt.Print(render.RenderEdges(edges, rOpts...))
 }
 
-func cmdImportsOf(pkgPath string, dbPath string, qOpts []query.Option, rOpts []render.Option) {
+func cmdImportsOf(pkgPath, dbPath string, qOpts []query.Option, rOpts []render.Option) {
 	s, err := store.Open(dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -388,7 +437,7 @@ func cmdImportsOf(pkgPath string, dbPath string, qOpts []query.Option, rOpts []r
 	fmt.Print(render.RenderEdges(edges, rOpts...))
 }
 
-func cmdEdgesByType(edgeType string, dbPath string, qOpts []query.Option, rOpts []render.Option) {
+func cmdEdgesByType(edgeType, dbPath string, qOpts []query.Option, rOpts []render.Option) {
 	s, err := store.Open(dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -422,7 +471,7 @@ func cmdAllEdges(dbPath string, qOpts []query.Option, rOpts []render.Option) {
 	fmt.Print(render.RenderEdges(edges, rOpts...))
 }
 
-func cmdSearch(pattern string, dbPath string, qOpts []query.Option, rOpts []render.Option) {
+func cmdSearch(pattern, dbPath string, qOpts []query.Option, rOpts []render.Option) {
 	s, err := store.Open(dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -470,11 +519,74 @@ func cmdServe(dbPath string) {
 	}
 }
 
+func cmdSearchText(pattern, dbPath string, rOpts []render.Option) {
+	s, err := store.Open(dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	defer func() { _ = s.Close() }()
+
+	flags, _ := parseArgs(os.Args[2:], store.DefaultPath())
+	filePattern := ""
+	if len(os.Args) > 3 {
+		filePattern = os.Args[3]
+	}
+	matches, err := query.SearchText(s, pattern, filePattern, flags.regex, flags.contextLines)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	fmt.Print(render.RenderTextMatches(matches, rOpts...))
+}
+
+func cmdHotspots(dbPath string, rOpts []render.Option) {
+	s, err := store.Open(dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	defer func() { _ = s.Close() }()
+
+	flags, _ := parseArgs(os.Args[2:], store.DefaultPath())
+	topN := flags.topN
+	if topN <= 0 {
+		topN = 10
+	}
+	hotspots, err := query.Hotspots(s, topN, flags.minComplexity, flags.minChurn)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	fmt.Print(render.RenderHotspots(hotspots, rOpts...))
+}
+
+func cmdImportance(dbPath string, rOpts []render.Option) {
+	s, err := store.Open(dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	defer func() { _ = s.Close() }()
+
+	flags, _ := parseArgs(os.Args[2:], store.DefaultPath())
+	topN := flags.topN
+	if topN <= 0 {
+		topN = 10
+	}
+	entries, err := query.SymbolImportance(s, topN, 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	fmt.Print(render.RenderImportance(entries, rOpts...))
+}
+
 func printUsage() {
 	fmt.Println("Usage: codemap <command> [args]")
 	fmt.Println()
 	fmt.Println("Commands:")
-	fmt.Println("  init                      Inject context files for opencode and Crush")
+	fmt.Println("  inject (or init)          Install opencode plugin + context files for codemap integration")
 	fmt.Println("  index [path]              Index a Go repository")
 	fmt.Println("  overview                  Show package overview")
 	fmt.Println("  show <qualified_name>     Show symbol details")
@@ -488,6 +600,9 @@ func printUsage() {
 	fmt.Println("  list-packages             List all packages")
 	fmt.Println("  package <path>            Show package details")
 	fmt.Println("  methods-of <type_name>    Show methods of a type")
+	fmt.Println("  search-text <pattern>     Search file contents (FTS5 or regex)")
+	fmt.Println("  hotspots                  Show code hotspots (complexity x churn)")
+	fmt.Println("  importance                Show symbol importance (PageRank)")
 	fmt.Println("  serve                     Start MCP server")
 	fmt.Println()
 	fmt.Println("Flags:")
@@ -502,6 +617,11 @@ func printUsage() {
 	fmt.Println("  --kind <kind>             Filter by symbol kind (for search)")
 	fmt.Println("  --exported [bool]         Filter by exported status (for search)")
 	fmt.Println("  --package <pkg>           Filter by package path (for search)")
+	fmt.Println("  --regex                   Use regex mode (for search-text)")
+	fmt.Println("  --context-lines <n>       Context lines around matches (for search-text)")
+	fmt.Println("  --top-n <n>               Number of results (for hotspots/importance)")
+	fmt.Println("  --min-complexity <n>      Minimum complexity (for hotspots)")
+	fmt.Println("  --min-churn <n>           Minimum churn (for hotspots)")
 }
 
 func parseBool(s string) *bool {
