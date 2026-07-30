@@ -72,7 +72,6 @@ func TestSearchTextLiteral(t *testing.T) {
 }
 
 func TestSearchTextRegex(t *testing.T) {
-	t.Skip("REGEXP function not available in this SQLite build")
 	s := setupStore(t)
 	matches, err := query.SearchText(s, `func\s+\w+`, "", true, 0)
 	if err != nil {

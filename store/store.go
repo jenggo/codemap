@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,11 +11,36 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	sqlite "modernc.org/sqlite"
 
 	"codemap/parse"
 	"codemap/resolve"
 )
+
+func init() {
+	_ = sqlite.RegisterDeterministicScalarFunction(
+		"regexp",
+		2,
+		func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			pattern, ok := args[0].(string)
+			if !ok {
+				return nil, fmt.Errorf("regexp: pattern must be a string, got %T", args[0])
+			}
+			s, ok := args[1].(string)
+			if !ok {
+				return nil, fmt.Errorf("regexp: value must be a string, got %T", args[1])
+			}
+			matched, err := regexp.MatchString(pattern, s)
+			if err != nil {
+				return nil, err
+			}
+			if matched {
+				return int64(1), nil
+			}
+			return int64(0), nil
+		},
+	)
+}
 
 const schemaSQL = `
 CREATE TABLE IF NOT EXISTS packages (
