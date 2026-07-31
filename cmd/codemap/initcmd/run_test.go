@@ -33,7 +33,7 @@ func TestInjectOpencode_WritesNavigationAndPlugin(t *testing.T) {
 		t.Fatalf("codemap-guard.ts not written: %v", err)
 	}
 	content := string(plugin)
-	for _, want := range []string{"CodemapGuard", "tool.execute.before", "codemap_search", "codemap_show"} {
+	for _, want := range []string{"CodemapGuard", "tool.execute.after", "codemap_search", "codemap_show"} {
 		if !strings.Contains(content, want) {
 			t.Errorf("codemap-guard.ts missing %q", want)
 		}

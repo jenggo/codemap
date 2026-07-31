@@ -150,17 +150,16 @@ function isGoTarget(args: Record<string, any>): boolean {
 
 export const CodemapGuard: Plugin = async () => {
   return {
-    "tool.execute.before": async (input, output) => {
+    "tool.execute.after": async (input, output) => {
       const tool = input.tool.toLowerCase()
       const suggestion = TOOL_SUGGESTIONS[tool]
       if (!suggestion) return
 
-      const args = (output?.args ?? {}) as Record<string, any>
+      const args = (input.args ?? {}) as Record<string, any>
       if (!isGoTarget(args)) return
 
-      console.warn(
-        ` + "`[codemap-guard] \"${input.tool}\" on Go files detected. ${suggestion}`" + `
-      )
+      const warning = ` + "`[codemap-guard] \"${input.tool}\" tool output references Go files (${input.args?.pattern || input.args?.filePath || input.args?.file || \"\"}). ${suggestion}\\n\\n`" + `
+      output.output = warning + (output.output ?? "")
     },
   }
 }
