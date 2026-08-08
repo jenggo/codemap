@@ -131,7 +131,7 @@ func TestDependencyFlowFixture(t *testing.T) {
 	hasTopImporter := false
 	for _, e := range result.Importers {
 		t.Logf("importer: %s -> %s", e.FromRef, e.ToRef)
-		if e.FromRef == "top" {
+		if e.FromRef == "codemap/testdata/depfixture/top" {
 			hasTopImporter = true
 		}
 	}

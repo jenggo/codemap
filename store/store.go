@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 
 	"codemap/parse"
 	"codemap/resolve"
+	"codemap/vcs"
 )
 
 func init() {
@@ -784,6 +786,66 @@ func (s *Store) SetIndexedAt(t time.Time) error {
 	return err
 }
 
+// SetRepoMeta records which repo and git revision an index was built from so
+// staleness checks can detect when a DB was built elsewhere or on another HEAD.
+func (s *Store) SetRepoMeta(repoPath, gitHead string, packageCount, symbolCount int) error {
+	ctx := context.Background()
+	meta := map[string]string{
+		"repo_path":     repoPath,
+		"git_head":      gitHead,
+		"package_count": strconv.Itoa(packageCount),
+		"symbol_count":  strconv.Itoa(symbolCount),
+	}
+	for k, v := range meta {
+		if _, err := s.db.ExecContext(ctx, `INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`, k, v); err != nil {
+			return fmt.Errorf("setting meta %s: %w", k, err)
+		}
+	}
+	return nil
+}
+
+// HealthInfo describes the current index so callers can report why a query
+// missed even though a symbol may exist on disk.
+type HealthInfo struct {
+	IndexedAt    string
+	RepoPath     string
+	GitHead      string
+	PackageCount int
+	SymbolCount  int
+}
+
+func (s *Store) Health() HealthInfo {
+	var h HealthInfo
+	rows, err := s.db.QueryContext(context.Background(),
+		`SELECT key, value FROM meta WHERE key IN ('indexed_at','repo_path','git_head','package_count','symbol_count')`)
+	if err != nil {
+		return h
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			continue
+		}
+		switch k {
+		case "indexed_at":
+			h.IndexedAt = v
+		case "repo_path":
+			h.RepoPath = v
+		case "git_head":
+			h.GitHead = v
+		case "package_count":
+			h.PackageCount, _ = strconv.Atoi(v)
+		case "symbol_count":
+			h.SymbolCount, _ = strconv.Atoi(v)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return h
+	}
+	return h
+}
+
 func (s *Store) WriteFiles(files map[string]string) error {
 	ctx := context.Background()
 	for path, content := range files {
@@ -927,7 +989,51 @@ func IsStale(dbPath, repoPath string) (bool, error) {
 		return true, nil
 	}
 
+	if mismatch, known := repoIdentityMismatch(dbPath, repoPath); known && mismatch {
+		return true, nil
+	}
+
 	return hasNewerGoFiles(repoPath, indexedAt), nil
+}
+
+// repoIdentityMismatch reports whether the DB was indexed for a different repo
+// path or git HEAD than repoPath. known is false for legacy DBs (no meta) or
+// when git is unavailable, so callers fall back to mtime-only staleness.
+func repoIdentityMismatch(dbPath, repoPath string) (mismatch, known bool) {
+	metaRepo, ok := readMeta(dbPath, "repo_path")
+	if !ok {
+		return false, false
+	}
+	absRepo, err := filepath.Abs(repoPath)
+	if err != nil {
+		return true, true
+	}
+	if filepath.Clean(metaRepo) != filepath.Clean(absRepo) {
+		return true, true
+	}
+	metaHead, ok := readMeta(dbPath, "git_head")
+	if !ok {
+		return false, false
+	}
+	head, err := vcs.GitHead(absRepo)
+	if err != nil {
+		return false, false
+	}
+	return metaHead != head, true
+}
+
+func readMeta(dbPath, key string) (string, bool) {
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return "", false
+	}
+	defer func() { _ = db.Close() }()
+
+	var val string
+	if err := db.QueryRowContext(context.Background(), `SELECT value FROM meta WHERE key = ?`, key).Scan(&val); err != nil {
+		return "", false
+	}
+	return val, true
 }
 
 func readIndexedAt(dbPath string) (time.Time, bool) {

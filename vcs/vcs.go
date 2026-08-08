@@ -61,6 +61,15 @@ func runGit(repoDir string, args ...string) (string, error) {
 	return stdout.String(), nil
 }
 
+// GitHead returns the current HEAD commit hash of the repo at repoDir.
+func GitHead(repoDir string) (string, error) {
+	out, err := runGit(repoDir, "rev-parse", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
 func GitChangedFiles(repoDir, ref string) ([]string, error) {
 	if err := IsGitRepo(repoDir); err != nil {
 		return nil, err

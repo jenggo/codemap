@@ -37,10 +37,10 @@ func TestEntryPointsUncalledExported(t *testing.T) {
 	hasCalled := false
 	for _, e := range entries {
 		t.Logf("uncalled_exported: %s", e.QualifiedName)
-		if e.QualifiedName == "util.StrayExported" {
+		if e.QualifiedName == "codemap/testdata/entrypoints/util.StrayExported" {
 			hasStray = true
 		}
-		if e.QualifiedName == "cmd.ThisExportedIsCalled" {
+		if e.QualifiedName == "codemap/testdata/entrypoints/cmd.ThisExportedIsCalled" {
 			hasCalled = true
 		}
 	}

@@ -841,7 +841,7 @@ func TestImportQueries(t *testing.T) {
 		}
 	}
 
-	imports, err := query.ImportsOf(s, "pkgA")
+	imports, err := query.ImportsOf(s, "codemap/testdata/multipackage/pkgA")
 	if err != nil {
 		t.Fatalf("imports of error: %v", err)
 	}

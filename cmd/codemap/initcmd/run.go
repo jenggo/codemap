@@ -152,6 +152,16 @@ export const CodemapGuard: Plugin = async () => {
   return {
     "tool.execute.after": async (input, output) => {
       const tool = input.tool.toLowerCase()
+
+      const CODEMAP_SEARCH = ["search", "search_text", "search_prefix", "methods_of", "method_search"]
+      if (CODEMAP_SEARCH.includes(tool)) {
+        const rendered = output.output ?? ""
+        if (!rendered.trim()) {
+          output.output = ` + "`[codemap-guard] \"${input.tool}\" returned no results. The index may be stale or incomplete — run the 'index' tool to rebuild it, then retry.\\n\\n`" + ` + rendered
+        }
+        return
+      }
+
       const suggestion = TOOL_SUGGESTIONS[tool]
       if (!suggestion) return
 

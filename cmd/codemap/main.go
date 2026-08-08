@@ -295,6 +295,12 @@ func cmdIndex(path, dbPath string) {
 		return
 	}
 
+	head, _ := vcs.GitHead(absPath)
+	if err := s.SetRepoMeta(absPath, head, len(resolveResult.Packages), len(resolveResult.Symbols)); err != nil {
+		fmt.Fprintf(os.Stderr, "Set repo meta error: %v\n", err)
+		return
+	}
+
 	fmt.Printf("Indexed %d packages, %d symbols, %d edges\n",
 		len(resolveResult.Packages),
 		len(resolveResult.Symbols),

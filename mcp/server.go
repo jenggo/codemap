@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"codemap/parse"
@@ -20,6 +21,7 @@ type Server struct {
 	store    *store.Store
 	dbPath   string
 	repoPath string
+	warnings []string
 }
 
 func New(s *store.Store) *Server {
@@ -84,6 +86,10 @@ func (s *Server) autoIndex(path string) error {
 	if err != nil {
 		return fmt.Errorf("parse error: %w", err)
 	}
+	if len(parseResult.Errors) > 0 {
+		s.warnings = append(s.warnings,
+			fmt.Sprintf("%d package(s) failed to load during index; the index may be incomplete. Run 'index' to see details", len(parseResult.Errors)))
+	}
 
 	resolveResult := resolve.Run(parseResult)
 	newStore, err := store.Create(s.resolveDBPath())
@@ -101,11 +107,21 @@ func (s *Server) autoIndex(path string) error {
 		return fmt.Errorf("set indexed_at error: %w", err)
 	}
 
+	if err := newStore.SetRepoMeta(absPath, gitHead(absPath), len(resolveResult.Packages), len(resolveResult.Symbols)); err != nil {
+		_ = newStore.Close()
+		return fmt.Errorf("set repo meta error: %w", err)
+	}
+
 	if s.store != nil {
 		_ = s.store.Close()
 	}
 	s.store = newStore
 	return nil
+}
+
+func gitHead(path string) string {
+	head, _ := vcs.GitHead(path)
+	return head
 }
 
 func (s *Server) Run() error {
@@ -174,6 +190,10 @@ func (s *Server) handleToolsCall(id json.RawMessage, msg map[string]json.RawMess
 	}
 
 	result := s.handleTool(toolCall.Name, toolCall.Arguments)
+	if len(s.warnings) > 0 {
+		result = strings.Join(s.warnings, "\n") + "\n\n" + result
+		s.warnings = nil
+	}
 	s.sendResponse(id, map[string]any{
 		"content": []map[string]any{{keyType: "text", "text": result}},
 	})
@@ -304,6 +324,12 @@ func handleCalleesOf(st *store.Store, opts []query.Option, renderOpts []render.O
 	return render.RenderCallees(edges, renderOpts...)
 }
 
+func healthNotice(st *store.Store) string {
+	h := st.Health()
+	return fmt.Sprintf("No results. Index health: indexed_at=%s repo=%s head=%s %d packages, %d symbols",
+		h.IndexedAt, h.RepoPath, h.GitHead, h.PackageCount, h.SymbolCount)
+}
+
 func handleSearch(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) string {
 	pattern := requiredString(args, "pattern")
 	if pattern == "" {
@@ -321,6 +347,9 @@ func handleSearch(st *store.Store, opts []query.Option, renderOpts []render.Opti
 	results, err := query.Search(st, pattern, opts...)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err)
+	}
+	if len(results) == 0 {
+		return healthNotice(st)
 	}
 	return render.RenderSearch(results, renderOpts...)
 }
@@ -348,6 +377,9 @@ func handleMethodsOf(st *store.Store, opts []query.Option, renderOpts []render.O
 	methods, err := query.MethodsOf(st, typeName, opts...)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err)
+	}
+	if len(methods) == 0 {
+		return healthNotice(st)
 	}
 	return render.RenderMethodsOf(methods, renderOpts...)
 }
@@ -413,6 +445,9 @@ func handleTypeUsage(st *store.Store, opts []query.Option, renderOpts []render.O
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err)
 	}
+	if len(results) == 0 {
+		return healthNotice(st)
+	}
 	return render.RenderSearch(results, renderOpts...)
 }
 
@@ -436,6 +471,9 @@ func handleSearchPrefix(st *store.Store, opts []query.Option, renderOpts []rende
 	results, err := query.SearchByPrefix(st, prefix, opts...)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err)
+	}
+	if len(results) == 0 {
+		return healthNotice(st)
 	}
 	return render.RenderSearch(results, renderOpts...)
 }
@@ -472,6 +510,9 @@ func handleMethodSearch(st *store.Store, opts []query.Option, renderOpts []rende
 	results, err := query.MethodSearch(st, methodName, opts...)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err)
+	}
+	if len(results) == 0 {
+		return healthNotice(st)
 	}
 	return render.RenderSearch(results, renderOpts...)
 }
@@ -684,6 +725,11 @@ func (s *Server) handleIndex(args map[string]any) string {
 		return fmt.Sprintf("Error: set indexed_at error: %v", err)
 	}
 
+	if err := newStore.SetRepoMeta(absPath, gitHead(absPath), len(resolveResult.Packages), len(resolveResult.Symbols)); err != nil {
+		_ = newStore.Close()
+		return fmt.Sprintf("Error: set repo meta error: %v", err)
+	}
+
 	if s.store != nil {
 		_ = s.store.Close()
 	}
@@ -691,10 +737,14 @@ func (s *Server) handleIndex(args map[string]any) string {
 	s.dbPath = dbPath
 	s.repoPath = absPath
 
-	return fmt.Sprintf("Indexed %d packages, %d symbols, %d edges",
+	msg := fmt.Sprintf("Indexed %d packages, %d symbols, %d edges",
 		len(resolveResult.Packages),
 		len(resolveResult.Symbols),
 		len(resolveResult.Edges))
+	if len(parseResult.Errors) > 0 {
+		msg += fmt.Sprintf("; %d package(s) failed to load", len(parseResult.Errors))
+	}
+	return msg
 }
 
 func requiredString(args map[string]any, key string) string {
@@ -957,6 +1007,9 @@ func handleSearchText(st *store.Store, qOpts []query.Option, rOpts []render.Opti
 	matches, err := query.SearchText(st, pattern, filePattern, isRegex, contextLines)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err)
+	}
+	if len(matches) == 0 {
+		return healthNotice(st)
 	}
 	return render.RenderTextMatches(matches, rOpts...)
 }
