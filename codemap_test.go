@@ -153,13 +153,7 @@ func setupTestStore(t *testing.T, fixturePath string) *store.Store {
 
 	resolveResult := resolve.Run(parseResult)
 
-	files := make(map[string]string)
-	for path := range parseResult.Files {
-		data, err := os.ReadFile(path)
-		if err == nil {
-			files[filepath.Base(path)] = string(data)
-		}
-	}
+	files := parse.FileContents(parseResult)
 
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test.db")

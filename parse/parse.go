@@ -52,6 +52,19 @@ func Run(pattern string) (*Result, error) {
 	return runDirWalk(absPattern)
 }
 
+// FileContents reads the source of every parsed file, keyed by absolute path.
+// It feeds the file-content search index (search_text / file_content_fts).
+func FileContents(pr *Result) map[string]string {
+	files := make(map[string]string, len(pr.Files))
+	for path := range pr.Files {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			files[path] = string(data)
+		}
+	}
+	return files
+}
+
 type goListPkg struct {
 	Dir          string
 	ImportPath   string

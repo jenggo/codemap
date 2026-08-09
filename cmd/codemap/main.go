@@ -285,7 +285,7 @@ func cmdIndex(path, dbPath string) {
 
 	churn, _ := vcs.GitFileChurn(absPath, "HEAD")
 
-	if err := s.Write(resolveResult, nil, churn); err != nil {
+	if err := s.Write(resolveResult, parse.FileContents(parseResult), churn); err != nil {
 		fmt.Fprintf(os.Stderr, "Write error: %v\n", err)
 		return
 	}

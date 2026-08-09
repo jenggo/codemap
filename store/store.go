@@ -885,7 +885,7 @@ func (s *Store) SearchFileContent(pattern, filePattern string, isRegex bool, con
 		if isRegex {
 			query += " AND path REGEXP ?"
 		} else {
-			query += " AND path LIKE ?"
+			query += " AND f.path LIKE ?"
 			args = append(args, "%"+filePattern+"%")
 		}
 	}

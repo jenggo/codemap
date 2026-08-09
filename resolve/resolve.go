@@ -3,11 +3,14 @@ package resolve
 import (
 	"codemap/extract"
 	"codemap/parse"
+	"fmt"
 	"go/ast"
+	goimporter "go/importer"
 	"go/token"
 	"go/types"
 	"slices"
 	"sort"
+	"sync"
 )
 
 type ResolvedSymbol struct {
@@ -30,8 +33,10 @@ func Run(parseResult *parse.Result) *Result {
 		Packages: parseResult.Packages,
 	}
 
+	imp := newImporter(parseResult)
+
 	conf := &types.Config{
-		Importer: importer{},
+		Importer: imp,
 		Error: func(err error) {
 			result.Warnings = append(result.Warnings, err.Error())
 		},
@@ -529,11 +534,100 @@ func resolveStructEmbedding(pkg *types.Package, pkgPath string, result *Result) 
 	}
 }
 
-type importer struct{}
+// importer resolves import paths to *types.Package. Project packages are
+// type-checked from the source files collected by parse (memoized per import
+// path), so cross-package calls and references resolve to real objects instead
+// of being dropped as unresolvable imports. Any other import (standard library,
+// third-party module) is loaded through the gc importer's compiled export data.
+type importer struct {
+	gc       types.Importer
+	pkgFiles map[string][]*ast.File
+	fset     *token.FileSet
+	memo     map[string]*types.Package
 
-func (i importer) Import(path string) (*types.Package, error) {
+	inProgress map[string]bool
+
+	mu sync.Mutex
+}
+
+func newImporter(pr *parse.Result) *importer {
+	imp := &importer{
+		pkgFiles:   make(map[string][]*ast.File),
+		fset:       pr.Fset,
+		memo:       make(map[string]*types.Package),
+		inProgress: make(map[string]bool),
+	}
+	for _, pi := range pr.Packages {
+		files := make([]*ast.File, 0, len(pi.Files))
+		for _, f := range pi.Files {
+			if af, ok := pr.Files[f]; ok {
+				files = append(files, af)
+			}
+		}
+		if len(files) > 0 {
+			imp.pkgFiles[pi.ImportPath] = files
+		}
+	}
+	return imp
+}
+
+func (i *importer) Import(path string) (*types.Package, error) {
 	if path == "unsafe" {
 		return types.Unsafe, nil
 	}
-	return nil, nil
+
+	i.mu.Lock()
+	if pkg, ok := i.memo[path]; ok {
+		i.mu.Unlock()
+		return pkg, nil
+	}
+	if i.inProgress[path] {
+		i.mu.Unlock()
+		return nil, fmt.Errorf("import cycle: %s", path)
+	}
+	files, isProject := i.pkgFiles[path]
+	if isProject {
+		i.inProgress[path] = true
+	}
+	i.mu.Unlock()
+
+	if !isProject {
+		return i.importExternal(path)
+	}
+
+	conf := &types.Config{
+		Importer: i,
+		Error:    func(error) {},
+	}
+	pkg, _ := conf.Check(path, i.fset, files, nil)
+
+	i.mu.Lock()
+	delete(i.inProgress, path)
+	if pkg != nil {
+		i.memo[path] = pkg
+	}
+	i.mu.Unlock()
+
+	if pkg == nil {
+		return nil, fmt.Errorf("could not type-check package %s", path)
+	}
+	return pkg, nil
+}
+
+func (i *importer) importExternal(path string) (*types.Package, error) {
+	i.mu.Lock()
+	if i.gc == nil {
+		i.gc = goimporter.ForCompiler(i.fset, "gc", nil)
+	}
+	i.mu.Unlock()
+
+	pkg, err := i.gc.Import(path)
+	if err != nil {
+		return nil, err
+	}
+
+	i.mu.Lock()
+	i.memo[path] = pkg
+	i.mu.Unlock()
+	return pkg, nil
 }

@@ -234,3 +234,30 @@ func TestChangedSymbolsRefNotFound(t *testing.T) {
 		t.Fatal("expected error for missing ref")
 	}
 }
+
+func TestChangedSymbolsDefaultBranch(t *testing.T) {
+	repo := setupGitRepo(t)
+	writeFile0644(t, filepath.Join(repo, "go.mod"), "module example.com/changed\n\ngo 1.26.2\n")
+	writeFile0644(t, filepath.Join(repo, "a.go"), "package main\n\nfunc alpha() {}\n")
+	runGitIn(t, repo, "add", ".")
+	runGitIn(t, repo, "commit", "-q", "-m", "initial")
+
+	// git init in this environment may default to master, not main. An empty
+	// ref must resolve to the repository's default branch instead of failing.
+	branchOut, err := exec.CommandContext(context.Background(), "git", "rev-parse", "--abbrev-ref", "HEAD").Output()
+	if err == nil && strings.TrimSpace(string(branchOut)) == "main" {
+		t.Skip("default branch is main; not exercising the fallback")
+	}
+
+	writeFile0644(t, filepath.Join(repo, "a.go"), "package main\n\nfunc alpha() { return }\n")
+	runGitIn(t, repo, "add", ".")
+
+	s := indexRepo(t, repo)
+	result, err := ChangedSymbols(s, repo, "", false, false, false)
+	if err != nil {
+		t.Fatalf("ChangedSymbols with default ref failed: %v", err)
+	}
+	if result.Summary.Modified == 0 {
+		t.Errorf("expected at least one modified symbol with default ref, got %+v", result.Summary)
+	}
+}

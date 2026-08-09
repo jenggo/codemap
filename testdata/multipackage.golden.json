@@ -1,7 +1,7 @@
 {
   "packages": 2,
   "symbols": 8,
-  "edges": 8,
+  "edges": 13,
   "overview": [
     {
       "Path": "codemap/testdata/multipackage/pkgA",

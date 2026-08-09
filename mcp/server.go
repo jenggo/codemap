@@ -97,7 +97,7 @@ func (s *Server) autoIndex(path string) error {
 		return fmt.Errorf("store error: %w", err)
 	}
 
-	if err := newStore.Write(resolveResult, nil, nil); err != nil {
+	if err := newStore.Write(resolveResult, parse.FileContents(parseResult), nil); err != nil {
 		_ = newStore.Close()
 		return fmt.Errorf("write error: %w", err)
 	}
@@ -126,6 +126,7 @@ func gitHead(path string) string {
 
 func (s *Server) Run() error {
 	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
@@ -154,6 +155,8 @@ func (s *Server) dispatchLine(line string) {
 	switch methodStr {
 	case "initialize":
 		s.handleInitialize(id)
+	case "ping":
+		s.handlePing(id)
 	case "notifications/initialized":
 	case "tools/list":
 		s.handleToolsList(id)
@@ -174,6 +177,10 @@ func (s *Server) handleInitialize(id json.RawMessage) {
 	})
 }
 
+func (s *Server) handlePing(id json.RawMessage) {
+	s.sendResponse(id, map[string]any{})
+}
+
 func (s *Server) handleToolsCall(id json.RawMessage, msg map[string]json.RawMessage) {
 	params, ok := msg["params"]
 	if !ok {
@@ -189,29 +196,33 @@ func (s *Server) handleToolsCall(id json.RawMessage, msg map[string]json.RawMess
 		return
 	}
 
-	result := s.handleTool(toolCall.Name, toolCall.Arguments)
+	result, isErr := s.handleTool(toolCall.Name, toolCall.Arguments)
 	if len(s.warnings) > 0 {
 		result = strings.Join(s.warnings, "\n") + "\n\n" + result
 		s.warnings = nil
 	}
-	s.sendResponse(id, map[string]any{
+	res := map[string]any{
 		"content": []map[string]any{{keyType: "text", "text": result}},
-	})
+	}
+	if isErr {
+		res["isError"] = true
+	}
+	s.sendResponse(id, res)
 }
 
-type toolHandler func(*store.Store, []query.Option, []render.Option, map[string]any) string
+type toolHandler func(*store.Store, []query.Option, []render.Option, map[string]any) (string, bool)
 
-func (s *Server) handleTool(name string, args map[string]any) string {
+func (s *Server) handleTool(name string, args map[string]any) (string, bool) {
 	if name == "index" {
 		return s.handleIndex(args)
 	}
 	if name == "schema" {
-		return handleSchema()
+		return handleSchema(), false
 	}
 
 	st, err := s.getStore()
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
 
 	opts, renderOpts := s.buildOptions(args)
@@ -252,7 +263,7 @@ func (s *Server) handleTool(name string, args map[string]any) string {
 
 	handler, ok := handlers[name]
 	if !ok {
-		return fmt.Sprintf("Error: unknown tool %s", name)
+		return fmt.Sprintf("Error: unknown tool %s", name), true
 	}
 	return handler(st, opts, renderOpts, args)
 }
@@ -272,30 +283,30 @@ func (s *Server) buildOptions(args map[string]any) ([]query.Option, []render.Opt
 	return opts, renderOpts
 }
 
-func handleOverview(st *store.Store, opts []query.Option, renderOpts []render.Option, _ map[string]any) string {
+func handleOverview(st *store.Store, opts []query.Option, renderOpts []render.Option, _ map[string]any) (string, bool) {
 	result, err := query.Overview(st, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
-	return render.RenderOverview(result, renderOpts...)
+	return render.RenderOverview(result, renderOpts...), false
 }
 
-func handleShow(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) string {
+func handleShow(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
 	qn := requiredString(args, "qualified_name")
 	if qn == "" {
-		return errQualifiedNameRequired
+		return errQualifiedNameRequired, true
 	}
 	result, err := query.Show(st, qn, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
-	return render.RenderShow(result, renderOpts...)
+	return render.RenderShow(result, renderOpts...), false
 }
 
-func handleCallersOf(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) string {
+func handleCallersOf(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
 	qn := requiredString(args, "qualified_name")
 	if qn == "" {
-		return errQualifiedNameRequired
+		return errQualifiedNameRequired, true
 	}
 	opts = appendEdgeTypeFilter(args, opts)
 	if v, ok := args["depth"].(float64); ok && v > 0 {
@@ -303,15 +314,15 @@ func handleCallersOf(st *store.Store, opts []query.Option, renderOpts []render.O
 	}
 	edges, err := query.CallersOf(st, qn, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
-	return render.RenderCallers(edges, renderOpts...)
+	return render.RenderCallers(edges, renderOpts...), false
 }
 
-func handleCalleesOf(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) string {
+func handleCalleesOf(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
 	qn := requiredString(args, "qualified_name")
 	if qn == "" {
-		return errQualifiedNameRequired
+		return errQualifiedNameRequired, true
 	}
 	opts = appendEdgeTypeFilter(args, opts)
 	if v, ok := args["depth"].(float64); ok && v > 0 {
@@ -319,9 +330,9 @@ func handleCalleesOf(st *store.Store, opts []query.Option, renderOpts []render.O
 	}
 	edges, err := query.CalleesOf(st, qn, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
-	return render.RenderCallees(edges, renderOpts...)
+	return render.RenderCallees(edges, renderOpts...), false
 }
 
 func healthNotice(st *store.Store) string {
@@ -330,10 +341,10 @@ func healthNotice(st *store.Store) string {
 		h.IndexedAt, h.RepoPath, h.GitHead, h.PackageCount, h.SymbolCount)
 }
 
-func handleSearch(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) string {
+func handleSearch(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
 	pattern := requiredString(args, "pattern")
 	if pattern == "" {
-		return errPatternRequired
+		return errPatternRequired, true
 	}
 	if v, ok := args["kind"].(string); ok && v != "" {
 		opts = append(opts, query.WithKind(v))
@@ -346,146 +357,146 @@ func handleSearch(st *store.Store, opts []query.Option, renderOpts []render.Opti
 	}
 	results, err := query.Search(st, pattern, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
 	if len(results) == 0 {
-		return healthNotice(st)
+		return healthNotice(st), false
 	}
-	return render.RenderSearch(results, renderOpts...)
+	return render.RenderSearch(results, renderOpts...), false
 }
 
-func handlePackage(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) string {
+func handlePackage(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
 	pkgPath := requiredString(args, "path")
 	if pkgPath == "" {
-		return "Error: path is required"
+		return "Error: path is required", true
 	}
 	if b, ok := args["include_unexported"].(bool); ok && b {
 		opts = append(opts, query.WithUnexported())
 	}
 	result, err := query.Package(st, pkgPath, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
-	return render.RenderPackage(result, renderOpts...)
+	return render.RenderPackage(result, renderOpts...), false
 }
 
-func handleMethodsOf(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) string {
+func handleMethodsOf(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
 	typeName := requiredString(args, "type_name")
 	if typeName == "" {
-		return "Error: type_name is required"
+		return "Error: type_name is required", true
 	}
 	methods, err := query.MethodsOf(st, typeName, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
 	if len(methods) == 0 {
-		return healthNotice(st)
+		return healthNotice(st), false
 	}
-	return render.RenderMethodsOf(methods, renderOpts...)
+	return render.RenderMethodsOf(methods, renderOpts...), false
 }
 
-func handleImportersOf(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) string {
+func handleImportersOf(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
 	pkgPath := requiredString(args, "package_path")
 	if pkgPath == "" {
-		return errPackagePathRequired
+		return errPackagePathRequired, true
 	}
 	edges, err := query.ImportersOf(st, pkgPath, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
-	return render.RenderEdges(edges, renderOpts...)
+	return render.RenderEdges(edges, renderOpts...), false
 }
 
-func handleImportsOf(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) string {
+func handleImportsOf(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
 	pkgPath := requiredString(args, "package_path")
 	if pkgPath == "" {
-		return errPackagePathRequired
+		return errPackagePathRequired, true
 	}
 	edges, err := query.ImportsOf(st, pkgPath, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
-	return render.RenderEdges(edges, renderOpts...)
+	return render.RenderEdges(edges, renderOpts...), false
 }
 
-func handleEdgesByType(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) string {
+func handleEdgesByType(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
 	edgeType := requiredString(args, "edge_type")
 	if edgeType == "" {
-		return errEdgeTypeRequired
+		return errEdgeTypeRequired, true
 	}
 	edges, err := query.EdgesByType(st, edgeType, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
-	return render.RenderEdges(edges, renderOpts...)
+	return render.RenderEdges(edges, renderOpts...), false
 }
 
-func handleAllEdges(st *store.Store, opts []query.Option, renderOpts []render.Option, _ map[string]any) string {
+func handleAllEdges(st *store.Store, opts []query.Option, renderOpts []render.Option, _ map[string]any) (string, bool) {
 	edges, err := query.AllEdges(st, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
-	return render.RenderEdges(edges, renderOpts...)
+	return render.RenderEdges(edges, renderOpts...), false
 }
 
-func handleListPackages(st *store.Store, opts []query.Option, renderOpts []render.Option, _ map[string]any) string {
+func handleListPackages(st *store.Store, opts []query.Option, renderOpts []render.Option, _ map[string]any) (string, bool) {
 	pkgs, err := query.ListPackages(st, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
-	return render.RenderListPackages(pkgs, renderOpts...)
+	return render.RenderListPackages(pkgs, renderOpts...), false
 }
 
-func handleTypeUsage(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) string {
+func handleTypeUsage(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
 	typeName := requiredString(args, "type_name")
 	if typeName == "" {
-		return errTypeNameRequired
+		return errTypeNameRequired, true
 	}
 	results, err := query.TypeUsage(st, typeName, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
 	if len(results) == 0 {
-		return healthNotice(st)
+		return healthNotice(st), false
 	}
-	return render.RenderSearch(results, renderOpts...)
+	return render.RenderSearch(results, renderOpts...), false
 }
 
-func handleTransitiveImports(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) string {
+func handleTransitiveImports(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
 	pkgPath := requiredString(args, "package_path")
 	if pkgPath == "" {
-		return errPackagePathRequired
+		return errPackagePathRequired, true
 	}
 	edges, err := query.TransitiveImports(st, pkgPath, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
-	return render.RenderEdges(edges, renderOpts...)
+	return render.RenderEdges(edges, renderOpts...), false
 }
 
-func handleSearchPrefix(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) string {
+func handleSearchPrefix(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
 	prefix := requiredString(args, "prefix")
 	if prefix == "" {
-		return errPrefixRequired
+		return errPrefixRequired, true
 	}
 	results, err := query.SearchByPrefix(st, prefix, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
 	if len(results) == 0 {
-		return healthNotice(st)
+		return healthNotice(st), false
 	}
-	return render.RenderSearch(results, renderOpts...)
+	return render.RenderSearch(results, renderOpts...), false
 }
 
-func handleFindPath(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) string {
+func handleFindPath(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
 	from := requiredString(args, "from")
 	if from == "" {
-		return "Error: from is required"
+		return "Error: from is required", true
 	}
 	to := requiredString(args, "to")
 	if to == "" {
-		return "Error: to is required"
+		return "Error: to is required", true
 	}
 	maxDepth := 10
 	if v, ok := args["max_depth"].(float64); ok && v > 0 {
@@ -493,90 +504,90 @@ func handleFindPath(st *store.Store, opts []query.Option, renderOpts []render.Op
 	}
 	path, err := query.FindPath(st, from, to, maxDepth, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
 	data, err := json.Marshal(path)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
-	return string(data)
+	return string(data), false
 }
 
-func handleMethodSearch(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) string {
+func handleMethodSearch(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
 	methodName := requiredString(args, "method_name")
 	if methodName == "" {
-		return "Error: method_name is required"
+		return "Error: method_name is required", true
 	}
 	results, err := query.MethodSearch(st, methodName, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
 	if len(results) == 0 {
-		return healthNotice(st)
+		return healthNotice(st), false
 	}
-	return render.RenderSearch(results, renderOpts...)
+	return render.RenderSearch(results, renderOpts...), false
 }
 
-func handleInterfaceImpls(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) string {
+func handleInterfaceImpls(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
 	interfaceName := requiredString(args, "interface_name")
 	if interfaceName == "" {
-		return "Error: interface_name is required"
+		return "Error: interface_name is required", true
 	}
 	results, err := query.InterfaceImplementations(st, interfaceName, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
 	data, err := json.Marshal(results)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
-	return string(data)
+	return string(data), false
 }
 
-func handleUnused(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) string {
+func handleUnused(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
 	results, err := query.UnusedSymbols(st, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
 	data, err := json.Marshal(results)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
-	return string(data)
+	return string(data), false
 }
 
-func handleCycles(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) string {
+func handleCycles(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
 	edgeType := requiredString(args, "edge_type")
 	if edgeType == "" {
-		return errEdgeTypeRequired
+		return errEdgeTypeRequired, true
 	}
 	cycles, err := query.DetectCycles(st, edgeType)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
 	data, err := json.Marshal(cycles)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
-	return string(data)
+	return string(data), false
 }
 
-func handleSymbolsInFile(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) string {
+func handleSymbolsInFile(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
 	filePath := requiredString(args, "file_path")
 	if filePath == "" {
-		return "Error: file_path is required"
+		return "Error: file_path is required", true
 	}
 	results, err := query.SymbolsInFile(st, filePath, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
-	return render.RenderSearch(results, renderOpts...)
+	return render.RenderSearch(results, renderOpts...), false
 }
 
-func handleBlastRadius(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) string {
+func handleBlastRadius(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
 	qn := requiredString(args, "qualified_name")
 	if qn == "" {
-		return errQualifiedNameRequired
+		return errQualifiedNameRequired, true
 	}
 	depth := 3
 	if v, ok := args["depth"].(float64); ok && v > 0 {
@@ -584,19 +595,19 @@ func handleBlastRadius(st *store.Store, opts []query.Option, renderOpts []render
 	}
 	result, err := query.GetBlastRadius(st, qn, depth, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
 	data, err := json.Marshal(result)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
-	return string(data)
+	return string(data), false
 }
 
-func handleSymbolBody(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) string {
+func handleSymbolBody(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
 	qn := requiredString(args, "qualified_name")
 	if qn == "" {
-		return errQualifiedNameRequired
+		return errQualifiedNameRequired, true
 	}
 	contextLines := 0
 	if v, ok := args["context_lines"].(float64); ok && v > 0 {
@@ -608,12 +619,12 @@ func handleSymbolBody(st *store.Store, _ []query.Option, renderOpts []render.Opt
 	}
 	result, err := query.GetSymbolBody(st, qn, contextLines, includeDoc)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
-	return render.RenderSymbolBody(result, renderOpts...)
+	return render.RenderSymbolBody(result, renderOpts...), false
 }
 
-func handleDependencyLayers(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) string {
+func handleDependencyLayers(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
 	topHubs := 5
 	if v, ok := args["top_hubs"].(float64); ok && v > 0 {
 		topHubs = int(v)
@@ -624,24 +635,24 @@ func handleDependencyLayers(st *store.Store, _ []query.Option, renderOpts []rend
 	}
 	result, err := query.DependencyLayers(st, includeTests, topHubs)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
-	return render.RenderDependencyLayers(result, renderOpts...)
+	return render.RenderDependencyLayers(result, renderOpts...), false
 }
 
-func handleDependencyFlow(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) string {
+func handleDependencyFlow(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
 	pkgPath := requiredString(args, "package_path")
 	if pkgPath == "" {
-		return errPackagePathRequired
+		return errPackagePathRequired, true
 	}
 	result, err := query.DependencyFlow(st, pkgPath)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
-	return render.RenderDependencyFlow(result, renderOpts...)
+	return render.RenderDependencyFlow(result, renderOpts...), false
 }
 
-func handleEntryPoints(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) string {
+func handleEntryPoints(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
 	var heuristics []string
 	if v, ok := args["heuristics"].([]any); ok {
 		for _, h := range v {
@@ -656,13 +667,13 @@ func handleEntryPoints(st *store.Store, _ []query.Option, renderOpts []render.Op
 	}
 	entries, err := query.EntryPoints(st, heuristics, includeTests)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
-	return render.RenderEntryPoints(entries, renderOpts...)
+	return render.RenderEntryPoints(entries, renderOpts...), false
 }
 
-func handleChangedSymbols(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) string {
-	ref := "main"
+func handleChangedSymbols(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+	ref := ""
 	if v, ok := args["ref"].(string); ok && v != "" {
 		ref = v
 	}
@@ -684,12 +695,12 @@ func handleChangedSymbols(st *store.Store, _ []query.Option, renderOpts []render
 	}
 	result, err := query.ChangedSymbols(st, repoDir, ref, withBlast, includeBodies, includeTests)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
-	return render.RenderChangedSymbols(result, renderOpts...)
+	return render.RenderChangedSymbols(result, renderOpts...), false
 }
 
-func (s *Server) handleIndex(args map[string]any) string {
+func (s *Server) handleIndex(args map[string]any) (string, bool) {
 	path := "."
 	if v, ok := args["path"].(string); ok && v != "" {
 		path = v
@@ -697,12 +708,12 @@ func (s *Server) handleIndex(args map[string]any) string {
 
 	absPath, err := filepath.Abs(path)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
 
 	parseResult, err := parse.Run(absPath)
 	if err != nil {
-		return fmt.Sprintf("Error: parse error: %v", err)
+		return fmt.Sprintf("Error: parse error: %v", err), true
 	}
 
 	resolveResult := resolve.Run(parseResult)
@@ -710,24 +721,24 @@ func (s *Server) handleIndex(args map[string]any) string {
 	dbPath := filepath.Join(absPath, ".codemap", "codemap.db")
 	newStore, err := store.Create(dbPath)
 	if err != nil {
-		return fmt.Sprintf("Error: store error: %v", err)
+		return fmt.Sprintf("Error: store error: %v", err), true
 	}
 
 	churn, _ := vcs.GitFileChurn(absPath, "HEAD")
 
-	if err := newStore.Write(resolveResult, nil, churn); err != nil {
+	if err := newStore.Write(resolveResult, parse.FileContents(parseResult), churn); err != nil {
 		_ = newStore.Close()
-		return fmt.Sprintf("Error: write error: %v", err)
+		return fmt.Sprintf("Error: write error: %v", err), true
 	}
 
 	if err := newStore.SetIndexedAt(time.Now()); err != nil {
 		_ = newStore.Close()
-		return fmt.Sprintf("Error: set indexed_at error: %v", err)
+		return fmt.Sprintf("Error: set indexed_at error: %v", err), true
 	}
 
 	if err := newStore.SetRepoMeta(absPath, gitHead(absPath), len(resolveResult.Packages), len(resolveResult.Symbols)); err != nil {
 		_ = newStore.Close()
-		return fmt.Sprintf("Error: set repo meta error: %v", err)
+		return fmt.Sprintf("Error: set repo meta error: %v", err), true
 	}
 
 	if s.store != nil {
@@ -744,7 +755,7 @@ func (s *Server) handleIndex(args map[string]any) string {
 	if len(parseResult.Errors) > 0 {
 		msg += fmt.Sprintf("; %d package(s) failed to load", len(parseResult.Errors))
 	}
-	return msg
+	return msg, false
 }
 
 func requiredString(args map[string]any, key string) string {
@@ -990,7 +1001,7 @@ func (s *Server) handleToolsList(id json.RawMessage) {
 	})
 }
 
-func handleSearchText(st *store.Store, qOpts []query.Option, rOpts []render.Option, args map[string]any) string {
+func handleSearchText(st *store.Store, qOpts []query.Option, rOpts []render.Option, args map[string]any) (string, bool) {
 	pattern := requiredString(args, "pattern")
 	filePattern := ""
 	if v, ok := args["file_pattern"].(string); ok {
@@ -1006,15 +1017,15 @@ func handleSearchText(st *store.Store, qOpts []query.Option, rOpts []render.Opti
 	}
 	matches, err := query.SearchText(st, pattern, filePattern, isRegex, contextLines)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
 	if len(matches) == 0 {
-		return healthNotice(st)
+		return healthNotice(st), false
 	}
-	return render.RenderTextMatches(matches, rOpts...)
+	return render.RenderTextMatches(matches, rOpts...), false
 }
 
-func handleContextBundle(st *store.Store, qOpts []query.Option, rOpts []render.Option, args map[string]any) string {
+func handleContextBundle(st *store.Store, qOpts []query.Option, rOpts []render.Option, args map[string]any) (string, bool) {
 	qn := requiredString(args, "qualified_name")
 	tokenBudget := 8000
 	if v, ok := args["token_budget"].(float64); ok {
@@ -1022,12 +1033,12 @@ func handleContextBundle(st *store.Store, qOpts []query.Option, rOpts []render.O
 	}
 	bundle, err := query.ContextBundle(st, qn, tokenBudget)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
-	return render.RenderBundle(bundle, rOpts...)
+	return render.RenderBundle(bundle, rOpts...), false
 }
 
-func handleHotspots(st *store.Store, qOpts []query.Option, rOpts []render.Option, args map[string]any) string {
+func handleHotspots(st *store.Store, qOpts []query.Option, rOpts []render.Option, args map[string]any) (string, bool) {
 	topN := 10
 	if v, ok := args["top_n"].(float64); ok {
 		topN = int(v)
@@ -1042,12 +1053,12 @@ func handleHotspots(st *store.Store, qOpts []query.Option, rOpts []render.Option
 	}
 	hotspots, err := query.Hotspots(st, topN, minComplexity, minChurn)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
-	return render.RenderHotspots(hotspots, rOpts...)
+	return render.RenderHotspots(hotspots, rOpts...), false
 }
 
-func handleSymbolImportance(st *store.Store, qOpts []query.Option, rOpts []render.Option, args map[string]any) string {
+func handleSymbolImportance(st *store.Store, qOpts []query.Option, rOpts []render.Option, args map[string]any) (string, bool) {
 	topN := 10
 	if v, ok := args["top_n"].(float64); ok {
 		topN = int(v)
@@ -1058,9 +1069,9 @@ func handleSymbolImportance(st *store.Store, qOpts []query.Option, rOpts []rende
 	}
 	entries, err := query.SymbolImportance(st, topN, scope)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error: %v", err), true
 	}
-	return render.RenderImportance(entries, rOpts...)
+	return render.RenderImportance(entries, rOpts...), false
 }
 
 func buildToolsList() []map[string]any {
@@ -1352,7 +1363,7 @@ func sourceTools() []map[string]any {
 		toolDef("changed_symbols",
 			"Get the symbols changed in the working tree relative to a git ref (default 'main'), classified by change_type (modified/added/removed). Each changed symbol can carry an optional blast_radius and source body. Replaces 'git diff' + manual hunk-to-symbol mapping + per-symbol blast_radius lookups.",
 			map[string]any{
-				"ref":               stringProp("Git ref to diff against (default 'main')"),
+				"ref":               stringProp("Git ref to diff against (default: repository's default branch, e.g. main or master)"),
 				"with_blast_radius": boolProp("Attach blast_radius to each changed symbol (default true)"),
 				"include_bodies":    boolProp("Attach source body to each changed symbol (default false)"),
 				"include_tests":     boolProp("Include test packages/symbols (default false)"),

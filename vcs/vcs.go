@@ -61,9 +61,39 @@ func runGit(repoDir string, args ...string) (string, error) {
 	return stdout.String(), nil
 }
 
+// headRef is the git ref used to identify the current commit, both in
+// porcelain commands and as the detached-HEAD branch name.
+const headRef = "HEAD"
+
+// DefaultBranch returns the repository's integration branch name (from the
+// remote's HEAD), falling back to the current branch, then to "HEAD" when no
+// branch can be determined. This lets tools diff against a sensible base
+// regardless of whether the default branch is called main or master.
+func DefaultBranch(repoDir string) string {
+	if err := IsGitRepo(repoDir); err != nil {
+		return headRef
+	}
+	if out, err := runGit(repoDir, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"); err == nil {
+		branch := strings.TrimSpace(out)
+		if i := strings.Index(branch, "/"); i >= 0 {
+			branch = branch[i+1:]
+		}
+		if branch != "" {
+			return branch
+		}
+	}
+	if out, err := runGit(repoDir, "rev-parse", "--abbrev-ref", headRef); err == nil {
+		branch := strings.TrimSpace(out)
+		if branch != "" && branch != headRef {
+			return branch
+		}
+	}
+	return headRef
+}
+
 // GitHead returns the current HEAD commit hash of the repo at repoDir.
 func GitHead(repoDir string) (string, error) {
-	out, err := runGit(repoDir, "rev-parse", "HEAD")
+	out, err := runGit(repoDir, "rev-parse", headRef)
 	if err != nil {
 		return "", err
 	}

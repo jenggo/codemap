@@ -920,7 +920,7 @@ func InterfaceImplementations(s *store.Store, interfaceName string, opts ...Opti
 		}
 	}
 
-	var results []InterfaceImpl
+	results := make([]InterfaceImpl, 0)
 	for _, implType := range implTypes {
 		methods, err := s.MethodsByReceiver(extractShortName(implType), false)
 		if err != nil {
@@ -978,7 +978,7 @@ func UnusedSymbols(s *store.Store, opts ...Option) ([]UnusedSymbol, error) {
 		}
 	}
 
-	var unused []UnusedSymbol
+	unused := make([]UnusedSymbol, 0)
 	for _, sym := range allSyms {
 		if sym.Exported {
 			continue
@@ -1011,7 +1011,7 @@ func DetectCycles(s *store.Store, edgeType string) ([]Cycle, error) {
 		graph[e.FromRef] = append(graph[e.FromRef], e.ToRef)
 	}
 
-	var cycles []Cycle
+	cycles := make([]Cycle, 0)
 	visited := make(map[string]bool)
 	inStack := make(map[string]bool)
 	var path []string
@@ -1901,12 +1901,12 @@ type ChangedSymbolsResult struct {
 }
 
 func ChangedSymbols(s *store.Store, repoDir, ref string, withBlast, includeBodies, includeTests bool) (*ChangedSymbolsResult, error) {
-	if ref == "" {
-		ref = kindMain
-	}
 	repoDir, err := resolveRepoDir(repoDir)
 	if err != nil {
 		return nil, err
+	}
+	if ref == "" {
+		ref = vcs.DefaultBranch(repoDir)
 	}
 
 	statuses, err := vcs.GitFileStatuses(repoDir, ref)
