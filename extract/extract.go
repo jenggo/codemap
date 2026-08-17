@@ -3,12 +3,25 @@ package extract
 import (
 	"go/ast"
 	"go/token"
+	"reflect"
+	"strconv"
 	"strings"
 )
 
 type Position struct {
 	File string
 	Line int
+}
+
+// StructField records one struct field's Go name, effective wire name (from
+// the first recognized serialization tag — cbor, json, yaml, toml, bson, db —
+// falling back to the Go name) and Go type. Contract analysis compares structs
+// on effective wire name + type, so fields are captured at index time and
+// served from the symbol table, never re-walked.
+type StructField struct {
+	GoName   string `json:"go_name,omitempty"`
+	WireName string `json:"wire_name,omitempty"`
+	GoType   string `json:"go_type,omitempty"`
 }
 
 type Symbol struct {
@@ -19,9 +32,10 @@ type Symbol struct {
 	Signature     string
 	Doc           string
 	Pos           Position
+	Fields        []StructField
+	Complexity    int
 	Exported      bool
 	IsTest        bool
-	Complexity    int
 }
 
 type Edge struct {
@@ -158,7 +172,7 @@ func (e *fileExtractor) extractTypeSpec(ts *ast.TypeSpec, kind string, doc *ast.
 		actualKind = kindType
 	}
 
-	e.result.Symbols = append(e.result.Symbols, Symbol{
+	sym := Symbol{
 		QualifiedName: qualifiedName,
 		Name:          ts.Name.Name,
 		Kind:          actualKind,
@@ -170,7 +184,65 @@ func (e *fileExtractor) extractTypeSpec(ts *ast.TypeSpec, kind string, doc *ast.
 		},
 		Exported: ts.Name.IsExported(),
 		IsTest:   e.isTest,
-	})
+	}
+	if st, ok := ts.Type.(*ast.StructType); ok {
+		sym.Fields = extractStructFields(st)
+	}
+
+	e.result.Symbols = append(e.result.Symbols, sym)
+}
+
+// extractStructFields captures each field's Go name, effective CBOR name and
+// type. Embedded fields (no name) use their type as the Go name.
+func extractStructFields(st *ast.StructType) []StructField {
+	if st.Fields == nil {
+		return nil
+	}
+	fields := make([]StructField, 0, len(st.Fields.List))
+	for _, f := range st.Fields.List {
+		var goName string
+		if len(f.Names) > 0 {
+			goName = f.Names[0].Name
+		} else {
+			goName = exprString(f.Type)
+		}
+		fields = append(fields, StructField{
+			GoName:   goName,
+			WireName: wireName(f, goName),
+			GoType:   exprString(f.Type),
+		})
+	}
+	return fields
+}
+
+// wireTagPriority lists the serialization tags consulted to derive a field's
+// effective wire name, most wire-specific first. The first tag present wins.
+var wireTagPriority = []string{"cbor", "json", "yaml", "toml", "bson", "db"}
+
+// wireName resolves the effective wire name for a field: the value of the
+// first recognized serialization tag (`cbor`, `json`, `yaml`, `toml`, `bson`,
+// `db`) when present, otherwise the Go field name.
+func wireName(f *ast.Field, goName string) string {
+	if f.Tag == nil {
+		return goName
+	}
+	tag, err := strconv.Unquote(f.Tag.Value)
+	if err != nil {
+		return goName
+	}
+	st := reflect.StructTag(tag)
+	for _, key := range wireTagPriority {
+		if name, ok := st.Lookup(key); ok {
+			// Tag may include options after a comma (e.g. "name,omitempty").
+			if i := strings.Index(name, ","); i >= 0 {
+				name = name[:i]
+			}
+			if name != "" && name != "-" {
+				return name
+			}
+		}
+	}
+	return goName
 }
 
 func (e *fileExtractor) extractValueSpec(vs *ast.ValueSpec, kind string, doc *ast.CommentGroup) {

@@ -21,13 +21,21 @@ type Options struct {
 	Kind              string
 	Package           string
 	File              string
+	Repo              string
 	EdgeTypes         []string
+	Depth             int
 	IncludeTests      bool
 	IncludeUnexported bool
-	Depth             int
 }
 
 type Option func(*Options)
+
+// WithRepo scopes a query to one workspace member (module path).
+func WithRepo(repo string) Option {
+	return func(o *Options) {
+		o.Repo = repo
+	}
+}
 
 func WithTests() Option {
 	return func(o *Options) {
@@ -80,6 +88,7 @@ func WithDepth(depth int) Option {
 type PackageSummary struct {
 	Path            string
 	Name            string
+	Repo            string `json:"repo,omitempty"`
 	ExportedSymbols []SymbolDetail
 	ImportCount     int
 }
@@ -91,6 +100,7 @@ type SymbolDetail struct {
 	Signature     string
 	Doc           string
 	PosFile       string
+	Repo          string `json:"repo,omitempty"`
 	PosLine       int
 	Exported      bool
 }
@@ -100,6 +110,8 @@ type EdgeDetail struct {
 	ToRef    string `json:"to_ref"`
 	EdgeType string `json:"edge_type"`
 	PosFile  string `json:"pos_file"`
+	Repo     string `json:"repo,omitempty"`
+	State    string `json:"state,omitempty"`
 	PosLine  int    `json:"pos_line"`
 }
 
@@ -111,9 +123,18 @@ type ShowResult struct {
 
 type OverviewResult struct {
 	Packages      []PackageSummary
+	Repos         []RepoSummary
 	TotalPackages int
 	TotalSymbols  int
 	TotalEdges    int
+}
+
+// RepoSummary reports one workspace member's lifecycle state and index time.
+type RepoSummary struct {
+	ModulePath string `json:"module_path"`
+	Dir        string `json:"dir"`
+	State      string `json:"state"`
+	IndexedAt  string `json:"indexed_at"`
 }
 
 type SearchResult struct {
@@ -123,6 +144,7 @@ type SearchResult struct {
 	Doc           string
 	Receiver      string
 	PosFile       string
+	Repo          string `json:"repo,omitempty"`
 	PosLine       int
 	Exported      bool
 }
@@ -141,16 +163,77 @@ func edgeToDetail(e store.Edge) EdgeDetail {
 		EdgeType: e.EdgeType,
 		PosFile:  e.PosFile,
 		PosLine:  e.PosLine,
+		Repo:     e.Repo,
 	}
 }
 
-var allEdgeTypes = []string{edgeTypeCalls, edgeTypeReferences, edgeTypeSatisfies, edgeTypeEmbeds, edgeTypeImports}
+// filterSearchResults narrows results to one workspace member (module path).
+// An empty repo means "no filter" — single-repo mode is unaffected.
+func filterSearchResults(results []SearchResult, repo string) []SearchResult {
+	if repo == "" {
+		return results
+	}
+	out := make([]SearchResult, 0, len(results))
+	for _, r := range results {
+		if r.Repo == repo {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func filterSymbolDetails(items []SymbolDetail, repo string) []SymbolDetail {
+	if repo == "" {
+		return items
+	}
+	out := make([]SymbolDetail, 0, len(items))
+	for _, it := range items {
+		if it.Repo == repo {
+			out = append(out, it)
+		}
+	}
+	return out
+}
+
+func filterEdges(edges []EdgeDetail, repo string) []EdgeDetail {
+	if repo == "" {
+		return edges
+	}
+	out := make([]EdgeDetail, 0, len(edges))
+	for _, e := range edges {
+		if e.Repo == repo {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func filterPathSteps(path []PathStep, repo string) []PathStep {
+	if repo == "" {
+		return path
+	}
+	out := make([]PathStep, 0, len(path))
+	for _, p := range path {
+		if p.Repo == repo {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// repoMismatch reports whether a symbol lookup violates a repo scope.
+func repoMismatch(actualRepo, wanted string) bool {
+	return wanted != "" && actualRepo != wanted
+}
+
+var allEdgeTypes = []string{edgeTypeCalls, edgeTypeReferences, edgeTypeSatisfies, edgeTypeEmbeds, edgeTypeImports, edgeTypeContract}
 
 const edgeTypeSatisfies = "satisfies"
 const edgeTypeCalls = "calls"
 const edgeTypeReferences = "references"
 const edgeTypeImports = "imports"
 const edgeTypeEmbeds = "embeds"
+const edgeTypeContract = "contract"
 
 const kindFunction = "function"
 const kindMain = "main"
@@ -191,13 +274,7 @@ func traverse(start string, fetch edgeFetcher, nextNode nextNodeFn, depth int, a
 
 			for _, e := range edges {
 				if edgeTypeAllowed(e.EdgeType, allowTypes) {
-					result = append(result, EdgeDetail{
-						FromRef:  e.FromRef,
-						ToRef:    e.ToRef,
-						EdgeType: e.EdgeType,
-						PosFile:  e.PosFile,
-						PosLine:  e.PosLine,
-					})
+					result = append(result, edgeToDetail(e))
 					nextQueue = append(nextQueue, nextNode(e))
 				}
 			}
@@ -217,7 +294,11 @@ func CallersOf(s *store.Store, qualifiedName string, opts ...Option) ([]EdgeDeta
 	if len(allowTypes) == 0 {
 		allowTypes = allEdgeTypes
 	}
-	return traverse(qualifiedName, s.EdgesTo, func(e store.Edge) string { return e.FromRef }, options.Depth, allowTypes)
+	edges, err := traverse(qualifiedName, s.EdgesTo, func(e store.Edge) string { return e.FromRef }, options.Depth, allowTypes)
+	if err != nil {
+		return nil, err
+	}
+	return filterEdges(edges, options.Repo), nil
 }
 
 func CalleesOf(s *store.Store, qualifiedName string, opts ...Option) ([]EdgeDetail, error) {
@@ -229,7 +310,11 @@ func CalleesOf(s *store.Store, qualifiedName string, opts ...Option) ([]EdgeDeta
 	if len(allowTypes) == 0 {
 		allowTypes = allEdgeTypes
 	}
-	return traverse(qualifiedName, s.EdgesFrom, func(e store.Edge) string { return e.ToRef }, options.Depth, allowTypes)
+	edges, err := traverse(qualifiedName, s.EdgesFrom, func(e store.Edge) string { return e.ToRef }, options.Depth, allowTypes)
+	if err != nil {
+		return nil, err
+	}
+	return filterEdges(edges, options.Repo), nil
 }
 
 func Show(s *store.Store, qualifiedName string, opts ...Option) (*ShowResult, error) {
@@ -241,6 +326,9 @@ func Show(s *store.Store, qualifiedName string, opts ...Option) (*ShowResult, er
 	sym, err := s.SymbolByName(qualifiedName)
 	if err != nil {
 		return nil, err
+	}
+	if repoMismatch(sym.Repo, options.Repo) {
+		return nil, fmt.Errorf("symbol %s not found in repo %s", qualifiedName, options.Repo)
 	}
 
 	incoming, err := s.EdgesTo(qualifiedName)
@@ -263,29 +351,18 @@ func Show(s *store.Store, qualifiedName string, opts ...Option) (*ShowResult, er
 			PosFile:       sym.PosFile,
 			PosLine:       sym.PosLine,
 			Exported:      sym.Exported,
+			Repo:          sym.Repo,
 		},
 		IncomingEdges: []EdgeDetail{},
 		OutgoingEdges: []EdgeDetail{},
 	}
 
 	for _, e := range incoming {
-		result.IncomingEdges = append(result.IncomingEdges, EdgeDetail{
-			FromRef:  e.FromRef,
-			ToRef:    e.ToRef,
-			EdgeType: e.EdgeType,
-			PosFile:  e.PosFile,
-			PosLine:  e.PosLine,
-		})
+		result.IncomingEdges = append(result.IncomingEdges, edgeToDetail(e))
 	}
 
 	for _, e := range outgoing {
-		result.OutgoingEdges = append(result.OutgoingEdges, EdgeDetail{
-			FromRef:  e.FromRef,
-			ToRef:    e.ToRef,
-			EdgeType: e.EdgeType,
-			PosFile:  e.PosFile,
-			PosLine:  e.PosLine,
-		})
+		result.OutgoingEdges = append(result.OutgoingEdges, edgeToDetail(e))
 	}
 
 	return result, nil
@@ -308,6 +385,9 @@ func Overview(s *store.Store, opts ...Option) (*OverviewResult, error) {
 		if !options.IncludeTests && p.IsTest {
 			continue
 		}
+		if repoMismatch(p.Repo, options.Repo) {
+			continue
+		}
 
 		summary := buildPackageSummary(s, p, options.IncludeTests)
 		result.Packages = append(result.Packages, summary)
@@ -322,6 +402,20 @@ func Overview(s *store.Store, opts ...Option) (*OverviewResult, error) {
 		result.TotalEdges = len(allEdges)
 	}
 
+	if repos, err := s.WorkspaceHealth(); err == nil && len(repos) > 0 {
+		for _, r := range repos {
+			if repoMismatch(r.ModulePath, options.Repo) {
+				continue
+			}
+			result.Repos = append(result.Repos, RepoSummary{
+				ModulePath: r.ModulePath,
+				Dir:        r.Dir,
+				State:      s.RepoState(r),
+				IndexedAt:  r.IndexedAt,
+			})
+		}
+	}
+
 	return result, nil
 }
 
@@ -331,6 +425,7 @@ func buildPackageSummary(s *store.Store, p store.Package, includeTests bool) Pac
 	summary := PackageSummary{
 		Path: p.Path,
 		Name: p.Name,
+		Repo: p.Repo,
 	}
 
 	importEdges, _ := s.EdgesFrom(p.Path)
@@ -351,6 +446,7 @@ func buildPackageSummary(s *store.Store, p store.Package, includeTests bool) Pac
 				PosFile:       sym.PosFile,
 				PosLine:       sym.PosLine,
 				Exported:      sym.Exported,
+				Repo:          sym.Repo,
 			})
 		}
 	}
@@ -387,13 +483,14 @@ func Search(s *store.Store, pattern string, opts ...Option) ([]SearchResult, err
 			PosFile:       sym.PosFile,
 			PosLine:       sym.PosLine,
 			Exported:      sym.Exported,
+			Repo:          sym.Repo,
 		})
 	}
 
 	if options.File == "" {
 		sortSearchResults(result, patternLower)
 	}
-	return result, nil
+	return filterSearchResults(result, options.Repo), nil
 }
 
 func matchTier(nameLower, patternLower string) int {
@@ -462,15 +559,21 @@ func MethodsOf(s *store.Store, typeName string, opts ...Option) ([]SymbolDetail,
 			PosFile:       sym.PosFile,
 			PosLine:       sym.PosLine,
 			Exported:      sym.Exported,
+			Repo:          sym.Repo,
 		})
 	}
 
+	results = filterSymbolDetails(results, options.Repo)
+	if options.Repo != "" && len(results) == 0 {
+		return nil, fmt.Errorf("type not found: %s in repo %s", typeName, options.Repo)
+	}
 	return results, nil
 }
 
 type PackageResult struct {
 	Path            string
 	Name            string
+	Repo            string `json:"repo,omitempty"`
 	ExportedSymbols []SymbolDetail
 	ImportCount     int
 }
@@ -488,7 +591,7 @@ func Package(s *store.Store, pkgPath string, opts ...Option) (*PackageResult, er
 
 	var found *store.Package
 	for _, p := range pkgs {
-		if p.Path == pkgPath && (!p.IsTest || options.IncludeTests) {
+		if p.Path == pkgPath && (!p.IsTest || options.IncludeTests) && !repoMismatch(p.Repo, options.Repo) {
 			found = &p
 			break
 		}
@@ -524,6 +627,7 @@ func Package(s *store.Store, pkgPath string, opts ...Option) (*PackageResult, er
 			PosFile:       sym.PosFile,
 			PosLine:       sym.PosLine,
 			Exported:      sym.Exported,
+			Repo:          sym.Repo,
 		})
 	}
 
@@ -532,6 +636,7 @@ func Package(s *store.Store, pkgPath string, opts ...Option) (*PackageResult, er
 		Name:            found.Name,
 		ImportCount:     importCount,
 		ExportedSymbols: symbols,
+		Repo:            found.Repo,
 	}, nil
 }
 
@@ -548,15 +653,9 @@ func EdgesByType(s *store.Store, edgeType string, opts ...Option) ([]EdgeDetail,
 
 	result := make([]EdgeDetail, len(edges))
 	for i, e := range edges {
-		result[i] = EdgeDetail{
-			FromRef:  e.FromRef,
-			ToRef:    e.ToRef,
-			EdgeType: e.EdgeType,
-			PosFile:  e.PosFile,
-			PosLine:  e.PosLine,
-		}
+		result[i] = edgeToDetail(e)
 	}
-	return result, nil
+	return filterEdges(result, options.Repo), nil
 }
 
 func AllEdges(s *store.Store, opts ...Option) ([]EdgeDetail, error) {
@@ -572,15 +671,9 @@ func AllEdges(s *store.Store, opts ...Option) ([]EdgeDetail, error) {
 
 	result := make([]EdgeDetail, len(edges))
 	for i, e := range edges {
-		result[i] = EdgeDetail{
-			FromRef:  e.FromRef,
-			ToRef:    e.ToRef,
-			EdgeType: e.EdgeType,
-			PosFile:  e.PosFile,
-			PosLine:  e.PosLine,
-		}
+		result[i] = edgeToDetail(e)
 	}
-	return result, nil
+	return filterEdges(result, options.Repo), nil
 }
 
 func ImportersOf(s *store.Store, pkgPath string, opts ...Option) ([]EdgeDetail, error) {
@@ -600,13 +693,14 @@ func ImportersOf(s *store.Store, pkgPath string, opts ...Option) ([]EdgeDetail, 
 	}
 
 	result := filterEdgesByType(edges, allowTypes)
+	result = filterEdges(result, options.Repo)
 	if len(result) > 0 {
 		return result, nil
 	}
 
 	fallback := importersViaShortPath(s, pkgPath, allowTypes)
 	if fallback != nil {
-		return fallback, nil
+		return filterEdges(fallback, options.Repo), nil
 	}
 	return result, nil
 }
@@ -662,19 +756,42 @@ func ImportsOf(s *store.Store, pkgPath string, opts ...Option) ([]EdgeDetail, er
 		allowTypes = []string{edgeTypeImports}
 	}
 
+	knownModules, _ := s.KnownModulePaths()
+	pkgSet, _ := s.ListPackages()
+	indexed := make(map[string]bool)
+	for _, p := range pkgSet {
+		indexed[p.Path] = true
+	}
+
 	result := make([]EdgeDetail, 0)
 	for _, e := range edges {
 		if edgeTypeAllowed(e.EdgeType, allowTypes) {
-			result = append(result, EdgeDetail{
-				FromRef:  e.FromRef,
-				ToRef:    e.ToRef,
-				EdgeType: e.EdgeType,
-				PosFile:  e.PosFile,
-				PosLine:  e.PosLine,
-			})
+			d := edgeToDetail(e)
+			if e.EdgeType == edgeTypeImports && !indexed[e.ToRef] {
+				if targetModule := modulePathForRef(e.ToRef, knownModules); targetModule != "" {
+					d.State = "not indexed"
+				}
+			}
+			result = append(result, d)
 		}
 	}
-	return result, nil
+	return filterEdges(result, options.Repo), nil
+}
+
+// modulePathForRef returns the configured module path that owns ref (ref is a
+// package import path or symbol name built from one), or "" when ref is not
+// under any known module. Prefix-collision-safe: the longest matching module
+// wins and ref must cross a path boundary.
+func modulePathForRef(ref string, knownModules []string) string {
+	best := ""
+	for _, m := range knownModules {
+		if ref == m || strings.HasPrefix(ref, m+"/") || strings.HasPrefix(ref, m+".") {
+			if len(m) > len(best) {
+				best = m
+			}
+		}
+	}
+	return best
 }
 
 func SearchByPrefix(s *store.Store, prefix string, opts ...Option) ([]SearchResult, error) {
@@ -699,20 +816,30 @@ func SearchByPrefix(s *store.Store, prefix string, opts ...Option) ([]SearchResu
 			PosFile:       sym.PosFile,
 			PosLine:       sym.PosLine,
 			Exported:      sym.Exported,
+			Repo:          sym.Repo,
 		})
 	}
 
-	return result, nil
+	return filterSearchResults(result, options.Repo), nil
 }
 
 func TransitiveImports(s *store.Store, pkgPath string, opts ...Option) ([]EdgeDetail, error) {
+	options := &Options{}
+	for _, o := range opts {
+		o(options)
+	}
+
 	pkgs, err := s.ListPackages()
 	if err != nil {
 		return nil, err
 	}
 	projectSet, found := buildProjectSet(pkgs, pkgPath)
 	if !found {
-		return transitiveImportsLegacy(s, pkgPath)
+		legacy, err := transitiveImportsLegacy(s, pkgPath)
+		if err != nil {
+			return nil, err
+		}
+		return filterEdges(legacy, options.Repo), nil
 	}
 
 	allImports, err := s.EdgesByType(edgeTypeImports)
@@ -720,7 +847,7 @@ func TransitiveImports(s *store.Store, pkgPath string, opts ...Option) ([]EdgeDe
 		return nil, err
 	}
 
-	return transitiveImportBFS(pkgPath, allImports, projectSet), nil
+	return filterEdges(transitiveImportBFS(pkgPath, allImports, projectSet), options.Repo), nil
 }
 
 func buildProjectSet(pkgs []store.Package, pkgPath string) (map[string]bool, bool) {
@@ -798,10 +925,11 @@ func TypeUsage(s *store.Store, typeName string, opts ...Option) ([]SearchResult,
 			PosFile:       sym.PosFile,
 			PosLine:       sym.PosLine,
 			Exported:      sym.Exported,
+			Repo:          sym.Repo,
 		})
 	}
 
-	return result, nil
+	return filterSearchResults(result, options.Repo), nil
 }
 
 type PathStep struct {
@@ -809,6 +937,7 @@ type PathStep struct {
 	To       string
 	EdgeType string
 	PosFile  string
+	Repo     string
 	PosLine  int
 }
 
@@ -821,15 +950,27 @@ func enqueueIfUnvisited(name string, e store.Edge, path []PathStep, visited map[
 	if visited[name] {
 		return queue
 	}
-	step := PathStep{From: e.FromRef, To: e.ToRef, EdgeType: e.EdgeType, PosFile: e.PosFile, PosLine: e.PosLine}
+	step := PathStep{From: e.FromRef, To: e.ToRef, EdgeType: e.EdgeType, PosFile: e.PosFile, PosLine: e.PosLine, Repo: e.Repo}
 	nextPath := append(append([]PathStep{}, path...), step)
 	return append(queue, pathNode{name: name, path: nextPath})
 }
 
 func FindPath(s *store.Store, from, to string, maxDepth int, opts ...Option) ([]PathStep, error) {
+	options := &Options{}
+	for _, o := range opts {
+		o(options)
+	}
 	if maxDepth <= 0 {
 		maxDepth = 10
 	}
+
+	// Contract edges (non-suggested, non-suppressed) join the traversal so
+	// cross-repo wire relationships show up in paths.
+	contracts, cerr := s.QueryContracts(store.ContractFilter{})
+	if cerr != nil {
+		contracts = nil
+	}
+
 	visited := make(map[string]bool)
 	queue := []pathNode{{name: from}}
 
@@ -843,31 +984,68 @@ func FindPath(s *store.Store, from, to string, maxDepth int, opts ...Option) ([]
 		visited[current.name] = true
 
 		if current.name == to && len(current.path) > 0 {
-			return current.path, nil
+			return filterPathSteps(current.path, options.Repo), nil
 		}
 
 		if len(current.path) >= maxDepth {
 			continue
 		}
 
-		edges, err := s.EdgesFrom(current.name)
-		if err != nil {
-			return nil, err
-		}
-		for _, e := range edges {
+		queue = expandPathNode(s, current, options.Repo, queue, visited, contracts)
+	}
+
+	return nil, fmt.Errorf("no path found from %s to %s", from, to)
+}
+
+// expandPathNode enqueues every out- and in-edge of current (respecting a repo
+// scope) plus cross-repo contract edges as the next BFS frontier.
+func expandPathNode(s *store.Store, current pathNode, repo string, queue []pathNode, visited map[string]bool, contracts []store.Contract) []pathNode {
+	outEdges, err := s.EdgesFrom(current.name)
+	if err != nil {
+		return queue
+	}
+	for _, e := range outEdges {
+		if !repoMismatch(e.Repo, repo) {
 			queue = enqueueIfUnvisited(e.ToRef, e, current.path, visited, queue)
 		}
+	}
 
-		edges, err = s.EdgesTo(current.name)
-		if err != nil {
-			return nil, err
-		}
-		for _, e := range edges {
+	inEdges, err := s.EdgesTo(current.name)
+	if err != nil {
+		return queue
+	}
+	for _, e := range inEdges {
+		if !repoMismatch(e.Repo, repo) {
 			queue = enqueueIfUnvisited(e.FromRef, e, current.path, visited, queue)
 		}
 	}
 
-	return nil, fmt.Errorf("no path found from %s to %s", from, to)
+	for _, c := range contracts {
+		if c.Suggested {
+			continue
+		}
+		switch {
+		case c.FromRef == current.name:
+			if !repoMismatch(c.Repo, repo) {
+				queue = enqueueIfUnvisited(c.ToRef, contractToEdge(c), current.path, visited, queue)
+			}
+		case c.ToRef == current.name:
+			if !repoMismatch(c.Repo, repo) {
+				queue = enqueueIfUnvisited(c.FromRef, contractToEdge(c), current.path, visited, queue)
+			}
+		}
+	}
+	return queue
+}
+
+// contractToEdge adapts a contract row to an edge step for path rendering.
+func contractToEdge(c store.Contract) store.Edge {
+	return store.Edge{
+		FromRef:  c.FromRef,
+		ToRef:    c.ToRef,
+		EdgeType: edgeTypeContract,
+		Repo:     c.Repo,
+	}
 }
 
 func MethodSearch(s *store.Store, methodName string, opts ...Option) ([]SearchResult, error) {
@@ -892,9 +1070,10 @@ func MethodSearch(s *store.Store, methodName string, opts ...Option) ([]SearchRe
 			PosFile:       sym.PosFile,
 			PosLine:       sym.PosLine,
 			Exported:      sym.Exported,
+			Repo:          sym.Repo,
 		})
 	}
-	return result, nil
+	return filterSearchResults(result, options.Repo), nil
 }
 
 type InterfaceImpl struct {
@@ -1061,6 +1240,10 @@ func DetectCycles(s *store.Store, edgeType string) ([]Cycle, error) {
 }
 
 func SymbolsInFile(s *store.Store, filePath string, opts ...Option) ([]SearchResult, error) {
+	options := &Options{}
+	for _, o := range opts {
+		o(options)
+	}
 	syms, err := s.SearchSymbolsByFile(filePath, "", nil, false)
 	if err != nil {
 		return nil, err
@@ -1077,9 +1260,10 @@ func SymbolsInFile(s *store.Store, filePath string, opts ...Option) ([]SearchRes
 			PosFile:       sym.PosFile,
 			PosLine:       sym.PosLine,
 			Exported:      sym.Exported,
+			Repo:          sym.Repo,
 		})
 	}
-	return result, nil
+	return filterSearchResults(result, options.Repo), nil
 }
 
 type BlastRadius struct {
@@ -1092,6 +1276,10 @@ type BlastRadius struct {
 }
 
 func GetBlastRadius(s *store.Store, qualifiedName string, depth int, opts ...Option) (*BlastRadius, error) {
+	options := &Options{}
+	for _, o := range opts {
+		o(options)
+	}
 	if depth <= 0 {
 		depth = 3
 	}
@@ -1102,7 +1290,7 @@ func GetBlastRadius(s *store.Store, qualifiedName string, depth int, opts ...Opt
 	}
 	directCount := 0
 	for _, e := range directCallers {
-		if e.EdgeType == edgeTypeCalls || e.EdgeType == edgeTypeReferences {
+		if !repoMismatch(e.Repo, options.Repo) && (e.EdgeType == edgeTypeCalls || e.EdgeType == edgeTypeReferences) {
 			directCount++
 		}
 	}
@@ -1118,6 +1306,9 @@ func GetBlastRadius(s *store.Store, qualifiedName string, depth int, opts ...Opt
 	implCount := 0
 	embedCount := 0
 	for _, e := range directCallers {
+		if repoMismatch(e.Repo, options.Repo) {
+			continue
+		}
 		if e.EdgeType == edgeTypeSatisfies {
 			implCount++
 		}
@@ -1142,6 +1333,44 @@ func GetBlastRadius(s *store.Store, qualifiedName string, depth int, opts ...Opt
 	}, nil
 }
 
+// BlastRadiusWithContracts extends GetBlastRadius to include contract-aware
+// cross-repo consumers. Non-suggested contract edges are counted as direct
+// consumers; suggested edges are excluded unless explicitly opted in.
+func BlastRadiusWithContracts(s *store.Store, qualifiedName string, depth int, opts ...Option) (*BlastRadius, error) {
+	br, err := GetBlastRadius(s, qualifiedName, depth, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Query contract edges where this symbol is the producer.
+	contracts, err := s.QueryContracts(store.ContractFilter{})
+	if err != nil {
+		return br, nil // contract query failure is non-fatal
+	}
+
+	options := &Options{}
+	for _, o := range opts {
+		o(options)
+	}
+
+	contractConsumers := 0
+	for _, c := range contracts {
+		if c.FromRef == qualifiedName && c.Direction == store.ContractDirectionProducer && !c.Suggested {
+			if !repoMismatch(c.Repo, options.Repo) {
+				contractConsumers++
+			}
+		}
+		if c.ToRef == qualifiedName && c.Direction == store.ContractDirectionConsumer && !c.Suggested {
+			if !repoMismatch(c.Repo, options.Repo) {
+				contractConsumers++
+			}
+		}
+	}
+
+	br.DirectCallers += contractConsumers
+	return br, nil
+}
+
 func ListPackages(s *store.Store, opts ...Option) ([]store.Package, error) {
 	options := &Options{}
 	for _, o := range opts {
@@ -1156,14 +1385,20 @@ func ListPackages(s *store.Store, opts ...Option) ([]store.Package, error) {
 	if !options.IncludeTests {
 		var filtered []store.Package
 		for _, p := range pkgs {
-			if !p.IsTest {
+			if !p.IsTest && !repoMismatch(p.Repo, options.Repo) {
 				filtered = append(filtered, p)
 			}
 		}
 		return filtered, nil
 	}
 
-	return pkgs, nil
+	var filtered []store.Package
+	for _, p := range pkgs {
+		if !repoMismatch(p.Repo, options.Repo) {
+			filtered = append(filtered, p)
+		}
+	}
+	return filtered, nil
 }
 
 type spanMatch struct {
@@ -1885,6 +2120,7 @@ type ChangedSymbol struct {
 	ChangeType    string
 	PosFile       string
 	Body          string
+	Repo          string `json:"repo,omitempty"`
 	PosLine       int
 }
 
@@ -1935,6 +2171,39 @@ func ChangedSymbols(s *store.Store, repoDir, ref string, withBlast, includeBodie
 		processChangedFile(s, result, st.Path, ct, withBlast, includeBodies, includeTests, seen, hunks)
 	}
 
+	return result, nil
+}
+
+// WorkspaceChangedSymbols computes a workspace-wide diff: changed symbols from
+// every indexed member, each computed against that repo's own default ref and
+// tagged with its repo (module path). Repos with no checkout are skipped.
+func WorkspaceChangedSymbols(s *store.Store, withBlast, includeBodies, includeTests bool) (*ChangedSymbolsResult, error) {
+	repos, err := s.ListRepos()
+	if err != nil {
+		return nil, err
+	}
+
+	result := &ChangedSymbolsResult{}
+	for _, r := range repos {
+		if r.Missing {
+			continue
+		}
+		if _, err := os.Stat(r.Dir); os.IsNotExist(err) {
+			continue
+		}
+		perRepo, err := ChangedSymbols(s, r.Dir, "", withBlast, includeBodies, includeTests)
+		if err != nil {
+			continue
+		}
+		for i := range perRepo.Symbols {
+			perRepo.Symbols[i].Repo = r.ModulePath
+		}
+		result.Symbols = append(result.Symbols, perRepo.Symbols...)
+		result.Summary.Modified += perRepo.Summary.Modified
+		result.Summary.Added += perRepo.Summary.Added
+		result.Summary.Removed += perRepo.Summary.Removed
+		result.Summary.FilesChanged += perRepo.Summary.FilesChanged
+	}
 	return result, nil
 }
 

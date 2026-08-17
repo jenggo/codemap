@@ -103,15 +103,15 @@
       "Path": "codemap/testdata/multipackage/pkgA",
       "Name": "pkgA",
       "Dir": "/home/jenggo/go/src/cli/codemap/testdata/multipackage/pkgA",
-      "IsTest": false,
-      "SymCount": 4
+      "SymCount": 4,
+      "IsTest": false
     },
     {
       "Path": "codemap/testdata/multipackage/pkgB",
       "Name": "pkgB",
       "Dir": "/home/jenggo/go/src/cli/codemap/testdata/multipackage/pkgB",
-      "IsTest": false,
-      "SymCount": 4
+      "SymCount": 4,
+      "IsTest": false
     }
   ]
 }

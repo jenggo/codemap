@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"codemap/cmd/codemap/initcmd"
+	"codemap/contract"
 	"codemap/mcp"
 	"codemap/parse"
 	"codemap/query"
@@ -16,6 +18,7 @@ import (
 	"codemap/resolve"
 	"codemap/store"
 	"codemap/vcs"
+	"codemap/workspace"
 )
 
 func main() {
@@ -30,16 +33,22 @@ type parsedFlags struct {
 	kindFilter        string
 	packageFilter     string
 	dbPath            string
+	repo              string
+	severity          string
+	direction         string
 	edgeTypes         []string
 	format            render.Format
-	includeTests      bool
-	fullDocs          bool
-	includeUnexported bool
-	regex             bool
 	contextLines      int
 	topN              int
 	minComplexity     int
 	minChurn          int
+	minConfidence     float64
+	includeTests      bool
+	fullDocs          bool
+	includeUnexported bool
+	regex             bool
+	workspace         bool
+	discover          bool
 }
 
 func parseArgs(args []string, defaultDBPath string) (parsedFlags, []string) {
@@ -82,14 +91,29 @@ func handleFlag(arg string, args []string, i int, flags *parsedFlags) (bool, int
 			flags.edgeTypes = splitCSV(args[i+1])
 			return true, i + 1
 		}
-	case "--kind":
-		return consumeStringArg(args, i, &flags.kindFilter)
 	case "--exported":
 		return handleExportedFlag(args, i, flags)
-	case "--package":
-		return consumeStringArg(args, i, &flags.packageFilter)
 	case "--regex":
 		flags.regex = true
+	case "--workspace":
+		flags.workspace = true
+	case "--discover":
+		flags.discover = true
+	default:
+		return handleValueFlags(arg, args, i, flags)
+	}
+	return false, i
+}
+
+// handleValueFlags consumes the flag forms that take a following value.
+func handleValueFlags(arg string, args []string, i int, flags *parsedFlags) (bool, int) {
+	switch arg {
+	case "--kind":
+		return consumeStringArg(args, i, &flags.kindFilter)
+	case "--package":
+		return consumeStringArg(args, i, &flags.packageFilter)
+	case "--repo":
+		return consumeStringArg(args, i, &flags.repo)
 	case "--context-lines":
 		return consumeIntArg(args, i, &flags.contextLines)
 	case "--top-n":
@@ -98,10 +122,21 @@ func handleFlag(arg string, args []string, i int, flags *parsedFlags) (bool, int
 		return consumeIntArg(args, i, &flags.minComplexity)
 	case "--min-churn":
 		return consumeIntArg(args, i, &flags.minChurn)
+	case "--severity":
+		return consumeStringArg(args, i, &flags.severity)
+	case "--direction":
+		return consumeStringArg(args, i, &flags.direction)
+	case "--min-confidence":
+		if i+1 < len(args) {
+			if v, err := strconv.ParseFloat(args[i+1], 64); err == nil {
+				flags.minConfidence = v
+			}
+			return true, i + 1
+		}
+		return false, i
 	default:
 		return false, i
 	}
-	return false, i
 }
 
 func consumeStringArg(args []string, i int, target *string) (bool, int) {
@@ -155,7 +190,7 @@ func run() error {
 	queryOpts := buildQueryOpts(flags)
 	renderOpts := buildRenderOpts(flags)
 
-	return dispatchCommand(cmd, filteredArgs, flags.dbPath, queryOpts, renderOpts)
+	return dispatchCommand(cmd, filteredArgs, flags, queryOpts, renderOpts)
 }
 
 func buildQueryOpts(flags parsedFlags) []query.Option {
@@ -178,6 +213,9 @@ func buildQueryOpts(flags parsedFlags) []query.Option {
 	if flags.includeUnexported {
 		opts = append(opts, query.WithUnexported())
 	}
+	if flags.repo != "" {
+		opts = append(opts, query.WithRepo(flags.repo))
+	}
 	return opts
 }
 
@@ -189,25 +227,27 @@ func buildRenderOpts(flags parsedFlags) []render.Option {
 	return opts
 }
 
-func dispatchCommand(cmd string, args []string, dbPath string, queryOpts []query.Option, renderOpts []render.Option) error {
+func dispatchCommand(cmd string, args []string, flags parsedFlags, queryOpts []query.Option, renderOpts []render.Option) error {
 	switch cmd {
 	case "index":
 		path := "."
 		if len(args) > 0 {
 			path = args[0]
 		}
-		cmdIndex(path, dbPath)
+		cmdIndex(path, flags.dbPath, flags.workspace, flags.discover)
 	case "init", "inject":
 		cmdInit()
 	case "serve":
-		cmdServe(dbPath)
+		cmdServe(flags.dbPath)
+	case "workspace":
+		return cmdWorkspace(args, flags.dbPath, flags, renderOpts)
 	default:
-		return dispatchQueryCommand(cmd, args, dbPath, queryOpts, renderOpts)
+		return dispatchQueryCommand(cmd, args, flags.dbPath, flags, queryOpts, renderOpts)
 	}
 	return nil
 }
 
-func dispatchQueryCommand(cmd string, args []string, dbPath string, queryOpts []query.Option, renderOpts []render.Option) error {
+func dispatchQueryCommand(cmd string, args []string, dbPath string, flags parsedFlags, queryOpts []query.Option, renderOpts []render.Option) error {
 	switch cmd {
 	case "overview":
 		cmdOverview(dbPath, queryOpts, renderOpts)
@@ -240,6 +280,21 @@ func dispatchQueryCommand(cmd string, args []string, dbPath string, queryOpts []
 	case "importance":
 		cmdImportance(dbPath, renderOpts)
 	default:
+		return dispatchDataCommand(cmd, dbPath, flags)
+	}
+	return nil
+}
+
+// dispatchDataCommand routes the remaining data-oriented query commands.
+func dispatchDataCommand(cmd, dbPath string, flags parsedFlags) error {
+	switch cmd {
+	case "contracts":
+		cmdContracts(dbPath, flags)
+	case "contract-drift":
+		cmdContractDrift(dbPath, flags)
+	case "runtime-contracts":
+		cmdRuntimeContracts(dbPath, flags)
+	default:
 		printUsage()
 		return fmt.Errorf("unknown command: %s", cmd)
 	}
@@ -254,7 +309,12 @@ func withRequiredArg(args []string, name string, fn func(string)) error {
 	return nil
 }
 
-func cmdIndex(path, dbPath string) {
+func cmdIndex(path, dbPath string, workspace, discover bool) {
+	if workspace {
+		cmdIndexWorkspace(path, dbPath, discover)
+		return
+	}
+
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -305,6 +365,199 @@ func cmdIndex(path, dbPath string) {
 		len(resolveResult.Packages),
 		len(resolveResult.Symbols),
 		len(resolveResult.Edges))
+}
+
+func cmdIndexWorkspace(path, dbPath string, discover bool) {
+	configPath := workspace.DefaultPath(path)
+	if configPath == "" {
+		cmdDiscoverWorkspace(path, dbPath, discover)
+		return
+	}
+
+	cfg, err := workspace.Load(configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	if err := indexWorkspace(cfg, dbPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+	}
+}
+
+func cmdDiscoverWorkspace(path, dbPath string, discover bool) {
+	module, err := workspace.ReadModulePath(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: no codemap.yaml found and %s is not a Go module; create codemap.yaml or run `codemap index` without --workspace\n", path)
+		return
+	}
+	if !discover {
+		fmt.Fprintf(os.Stderr, "Error: no codemap.yaml found. Run with --discover to propose sibling modules as a workspace.\n")
+		return
+	}
+	candidates, err := workspace.Discover(module, path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	if len(candidates) == 0 {
+		fmt.Fprintf(os.Stderr, "Error: no sibling Go modules found under %s\n", filepath.Dir(path))
+		return
+	}
+	fmt.Println("Discovered sibling modules:")
+	for _, c := range candidates {
+		fmt.Printf("  %s\t%s\n", c.Module, c.Dir)
+	}
+	fmt.Print("Index these as a workspace? [y/N] ")
+	var answer string
+	if _, err := fmt.Scanln(&answer); err != nil || !strings.EqualFold(strings.TrimSpace(answer), "y") {
+		fmt.Println("aborted")
+		return
+	}
+	absRoot, err := filepath.Abs(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	cfg := &workspace.Config{Root: filepath.Dir(absRoot), Members: []workspace.Member{{Module: module, Dir: absRoot}}}
+	for _, c := range candidates {
+		cfg.Members = append(cfg.Members, workspace.Member{Module: c.Module, Dir: c.Dir})
+	}
+	if err := indexWorkspace(cfg, dbPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+	}
+}
+
+func indexWorkspace(cfg *workspace.Config, dbPath string) error {
+	summaries, err := workspace.IndexAll(cfg, dbPath)
+	if err != nil {
+		return err
+	}
+	for _, s := range summaries {
+		state := s.State
+		if s.Missing {
+			state = "missing"
+		}
+		fmt.Printf("%-20s %5d packages, %5d symbols, %5d edges  (%s)\n", s.Repo, s.Packages, s.Symbols, s.Edges, state)
+	}
+
+	if len(cfg.Existing()) > 0 {
+		st, err := store.Open(dbPath)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = st.Close() }()
+
+		cCfg := cfg.ContractConfig()
+		for _, p := range cfg.ContractSuppressionPairs() {
+			if err := st.SuppressContracts(p[0], p[1]); err != nil {
+				return err
+			}
+		}
+		if reanalyzed, err := contract.ReanalyzeStaleContracts(st, cCfg); err != nil {
+			return fmt.Errorf("contract analysis: %w", err)
+		} else if len(reanalyzed) > 0 {
+			fmt.Printf("contract analysis refreshed for %d repo(s)\n", len(reanalyzed))
+		}
+	}
+	return nil
+}
+
+func cmdWorkspace(args []string, dbPath string, flags parsedFlags, renderOpts []render.Option) error {
+	if len(args) < 1 {
+		printWorkspaceUsage()
+		return fmt.Errorf("workspace requires a subcommand")
+	}
+	sub := args[0]
+	switch sub {
+	case "index":
+		path := "."
+		if len(args) > 1 {
+			path = args[1]
+		}
+		cmdIndexWorkspace(path, dbPath, flags.discover)
+	case "status", "health":
+		return cmdWorkspaceStatus(dbPath)
+	case "reindex":
+		return cmdWorkspaceReindex(dbPath)
+	case "changed-symbols":
+		return cmdWorkspaceChangedSymbols(dbPath, renderOpts)
+	default:
+		printWorkspaceUsage()
+		return fmt.Errorf("unknown workspace subcommand: %s", sub)
+	}
+	return nil
+}
+
+func cmdWorkspaceStatus(dbPath string) error {
+	s, err := store.Open(dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return err
+	}
+	defer func() { _ = s.Close() }()
+
+	repos, err := s.WorkspaceHealth()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return err
+	}
+	if len(repos) == 0 {
+		fmt.Println("No workspace repos registered. Run `codemap index --workspace` first.")
+		return nil
+	}
+	for _, r := range repos {
+		state := s.RepoState(r)
+		fmt.Printf("%-20s %s", r.ModulePath, state)
+		if r.IndexedAt != "" {
+			fmt.Printf("  indexed_at=%s", r.IndexedAt)
+		}
+		if state == "stale" {
+			fmt.Print("  (auto-reindex on next query)")
+		}
+		fmt.Println()
+	}
+	return nil
+}
+
+func cmdWorkspaceReindex(dbPath string) error {
+	reindexed, err := workspace.ReindexStale(dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return err
+	}
+	if len(reindexed) == 0 {
+		fmt.Println("No stale repos to reindex")
+		return nil
+	}
+	fmt.Printf("Reindexed: %v\n", reindexed)
+	return nil
+}
+
+func cmdWorkspaceChangedSymbols(dbPath string, renderOpts []render.Option) error {
+	s, err := store.Open(dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return err
+	}
+	defer func() { _ = s.Close() }()
+
+	result, err := query.WorkspaceChangedSymbols(s, true, false, false)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return err
+	}
+	fmt.Print(render.RenderChangedSymbols(result, renderOpts...))
+	return nil
+}
+
+func printWorkspaceUsage() {
+	fmt.Println("Usage: codemap workspace <subcommand> [args]")
+	fmt.Println()
+	fmt.Println("Subcommands:")
+	fmt.Println("  index [path]           Index the workspace declared in codemap.yaml")
+	fmt.Println("  status (or health)     Show per-repo index state (indexed/stale/missing)")
+	fmt.Println("  reindex                Reindex stale repos")
+	fmt.Println("  changed-symbols        Workspace-wide changed symbols (per-repo against its own ref)")
 }
 
 func cmdOverview(dbPath string, qOpts []query.Option, rOpts []render.Option) {
@@ -609,8 +862,16 @@ func printUsage() {
 	fmt.Println("  search-text <pattern>     Search file contents (FTS5 or regex)")
 	fmt.Println("  hotspots                  Show code hotspots (complexity x churn)")
 	fmt.Println("  importance                Show symbol importance (PageRank)")
+	fmt.Println("  contracts                 List contract edges across repos")
+	fmt.Println("  contract-drift            List structural drift reports")
+	fmt.Println("  runtime-contracts         List runtime contract entities (Redis/JetStream/WS)")
+	fmt.Println("  workspace                 Workspace commands (index/status/reindex/changed-symbols)")
 	fmt.Println("  serve                     Start MCP server")
 	fmt.Println()
+	printUsageFlags()
+}
+
+func printUsageFlags() {
 	fmt.Println("Flags:")
 	fmt.Println("  --include-tests           Include test packages and symbols")
 	fmt.Println("  --include-unexported      Include unexported symbols (for package)")
@@ -623,11 +884,14 @@ func printUsage() {
 	fmt.Println("  --kind <kind>             Filter by symbol kind (for search)")
 	fmt.Println("  --exported [bool]         Filter by exported status (for search)")
 	fmt.Println("  --package <pkg>           Filter by package path (for search)")
+	fmt.Println("  --repo <module>           Scope query to one workspace repo (search/show/callers-of/callees-of/importers-of/imports-of/blast-radius)")
 	fmt.Println("  --regex                   Use regex mode (for search-text)")
 	fmt.Println("  --context-lines <n>       Context lines around matches (for search-text)")
 	fmt.Println("  --top-n <n>               Number of results (for hotspots/importance)")
 	fmt.Println("  --min-complexity <n>      Minimum complexity (for hotspots)")
 	fmt.Println("  --min-churn <n>           Minimum churn (for hotspots)")
+	fmt.Println("  --workspace               Index as a workspace (with index)")
+	fmt.Println("  --discover                Auto-discover sibling Go modules as a workspace (with index --workspace)")
 }
 
 func parseBool(s string) *bool {
@@ -636,4 +900,75 @@ func parseBool(s string) *bool {
 		return nil
 	}
 	return &v
+}
+
+func cmdContracts(dbPath string, flags parsedFlags) {
+	s, err := store.Open(dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	defer func() { _ = s.Close() }()
+
+	contracts, err := s.QueryContracts(store.ContractFilter{
+		Repo:          flags.repo,
+		Direction:     flags.direction,
+		Severity:      flags.severity,
+		MinConfidence: flags.minConfidence,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+
+	data, err := json.MarshalIndent(contracts, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	fmt.Println(string(data))
+}
+
+func cmdContractDrift(dbPath string, flags parsedFlags) {
+	s, err := store.Open(dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	defer func() { _ = s.Close() }()
+
+	drifts, err := s.QueryDrift(store.DriftSeverity(flags.severity), flags.repo)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+
+	data, err := json.MarshalIndent(drifts, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	fmt.Println(string(data))
+}
+
+func cmdRuntimeContracts(dbPath string, flags parsedFlags) {
+	s, err := store.Open(dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	defer func() { _ = s.Close() }()
+
+	contracts, err := s.QueryRuntimeContracts(store.RuntimeContractKind(flags.kindFilter), flags.repo)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+
+	data, err := json.MarshalIndent(contracts, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	fmt.Println(string(data))
 }

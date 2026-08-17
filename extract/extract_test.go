@@ -111,3 +111,101 @@ func empty()
 	}
 	t.Fatal("no FuncDecl found")
 }
+
+func TestWireNameGenericTags(t *testing.T) {
+	tests := []struct {
+		name string
+		code string
+		want string
+	}{
+		{
+			name: "cbor tag wins over json",
+			code: `package main
+type T struct {
+	Host string ` +
+				"`cbor:\"host\" json:\"hostname\"`" + `
+}
+`, want: "host",
+		},
+		{
+			name: "json tag",
+			code: `package main
+type T struct {
+	FirstName string ` +
+				"`json:\"first_name\"`" + `
+}
+`, want: "first_name",
+		},
+		{
+			name: "yaml tag",
+			code: `package main
+type T struct {
+	Enabled bool ` +
+				"`yaml:\"enabled,omitempty\"`" + `
+}
+`, want: "enabled",
+		},
+		{
+			name: "toml tag",
+			code: `package main
+type T struct {
+	Port int ` +
+				"`toml:\"port\"`" + `
+}
+`, want: "port",
+		},
+		{
+			name: "bson tag",
+			code: `package main
+type T struct {
+	ID string ` +
+				"`bson:\"_id\"`" + `
+}
+`, want: "_id",
+		},
+		{
+			name: "db tag",
+			code: `package main
+type T struct {
+	UserID int64 ` +
+				"`db:\"user_id\"`" + `
+}
+`, want: "user_id",
+		},
+		{
+			name: "no tag falls back to go name",
+			code: `package main
+type T struct {
+	CreatedAt time.Time
+}
+`,
+			want: "CreatedAt",
+		},
+		{
+			name: "tag with dash is skipped",
+			code: `package main
+type T struct {
+	Secret string ` +
+				"`json:\"-\"`" + `
+}
+`, want: "Secret",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fset := token.NewFileSet()
+			f, err := parser.ParseFile(fset, "test.go", tt.code, 0)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			field := f.Decls[0].(*ast.GenDecl).Specs[0].(*ast.TypeSpec).Type.(*ast.StructType).Fields.List[0]
+			goName := "Fallback"
+			if len(field.Names) > 0 {
+				goName = field.Names[0].Name
+			}
+			if got := wireName(field, goName); got != tt.want {
+				t.Errorf("wireName = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

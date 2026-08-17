@@ -46,8 +46,8 @@
       "Path": "codemap/testdata/simple",
       "Name": "simple",
       "Dir": "/home/jenggo/go/src/cli/codemap/testdata/simple",
-      "IsTest": false,
-      "SymCount": 4
+      "SymCount": 4,
+      "IsTest": false
     }
   ]
 }

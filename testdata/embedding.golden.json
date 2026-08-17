@@ -96,8 +96,8 @@
       "Path": "codemap/testdata/embedding",
       "Name": "embedding",
       "Dir": "/home/jenggo/go/src/cli/codemap/testdata/embedding",
-      "IsTest": false,
-      "SymCount": 8
+      "SymCount": 8,
+      "IsTest": false
     }
   ]
 }

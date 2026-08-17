@@ -3,6 +3,7 @@ package render
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -491,6 +492,104 @@ func marshalJSON(v any) string {
 	return string(data)
 }
 
+// encodeTOON serializes v to TOON, dropping empty repo fields so single-repo
+// output stays byte-for-byte identical to pre-workspace builds while workspace
+// output carries a repo tag on every symbol and edge.
+func encodeTOON(v any) string {
+	out, err := gotoon.Encode(toonValue(v))
+	if err != nil {
+		return marshalJSON(v)
+	}
+	return out
+}
+
+// toonValue normalizes v the way gotoon does (struct -> map via json tags) but
+// omits repo keys whose value is empty.
+func toonValue(v any) any {
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Interface:
+		if rv.IsNil() {
+			return nil
+		}
+		return toonValue(rv.Elem().Interface())
+	case reflect.Struct:
+		return toonStruct(rv)
+	case reflect.Slice, reflect.Array:
+		out := make([]any, rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			out[i] = toonValue(rv.Index(i).Interface())
+		}
+		return out
+	case reflect.Map:
+		return toonMap(rv)
+	case reflect.Invalid, reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128, reflect.String,
+		reflect.Chan, reflect.Func, reflect.UnsafePointer:
+		return v
+	default:
+		return v
+	}
+}
+
+func toonStruct(rv reflect.Value) any {
+	obj := make(map[string]any)
+	t := rv.Type()
+	for i := 0; i < rv.NumField(); i++ {
+		f := t.Field(i)
+		if f.PkgPath != "" {
+			continue
+		}
+		name := toonFieldName(f)
+		val := toonValue(rv.Field(i).Interface())
+		if isRepoKey(name) && isEmptyValue(val) {
+			continue
+		}
+		obj[name] = val
+	}
+	return obj
+}
+
+func toonFieldName(f reflect.StructField) string {
+	if tag := f.Tag.Get("json"); tag != "" && tag != "-" {
+		if idx := strings.Index(tag, ","); idx >= 0 {
+			tag = tag[:idx]
+		}
+		return tag
+	}
+	return f.Name
+}
+
+func toonMap(rv reflect.Value) any {
+	if rv.Type().Key().Kind() != reflect.String {
+		return nil
+	}
+	obj := make(map[string]any)
+	iter := rv.MapRange()
+	for iter.Next() {
+		k := iter.Key().String()
+		val := toonValue(iter.Value().Interface())
+		if isRepoKey(k) && isEmptyValue(val) {
+			continue
+		}
+		obj[k] = val
+	}
+	return obj
+}
+
+func isRepoKey(key string) bool {
+	return key == "repo" || key == "Repo" || key == "repos"
+}
+
+func isEmptyValue(v any) bool {
+	if v == nil {
+		return true
+	}
+	s, ok := v.(string)
+	return ok && s == ""
+}
+
 func symToJSON(sym query.SymbolDetail, fullDocs bool) symJSON {
 	doc := sym.Doc
 	if !fullDocs {
@@ -529,10 +628,10 @@ func renderOverviewTOON(result *query.OverviewResult) string {
 		},
 		keyPackages: result.Packages,
 	}
-	out, err := gotoon.Encode(data)
-	if err != nil {
-		return marshalJSON(result)
+	if len(result.Repos) > 0 {
+		data["repos"] = result.Repos
 	}
+	out := encodeTOON(data)
 	return out
 }
 
@@ -542,46 +641,31 @@ func renderShowTOON(result *query.ShowResult) string {
 		"incoming_edges": result.IncomingEdges,
 		"outgoing_edges": result.OutgoingEdges,
 	}
-	out, err := gotoon.Encode(data)
-	if err != nil {
-		return marshalJSON(result)
-	}
+	out := encodeTOON(data)
 	return out
 }
 
 func renderEdgesTOON(edges []query.EdgeDetail) string {
 	data := map[string]any{"edges": edges}
-	out, err := gotoon.Encode(data)
-	if err != nil {
-		return marshalJSON(edges)
-	}
+	out := encodeTOON(data)
 	return out
 }
 
 func renderSearchTOON(results []query.SearchResult) string {
 	data := map[string]any{"results": results}
-	out, err := gotoon.Encode(data)
-	if err != nil {
-		return marshalJSON(results)
-	}
+	out := encodeTOON(data)
 	return out
 }
 
 func renderListPackagesTOON(pkgs []store.Package) string {
 	data := map[string]any{keyPackages: pkgs}
-	out, err := gotoon.Encode(data)
-	if err != nil {
-		return marshalJSON(pkgs)
-	}
+	out := encodeTOON(data)
 	return out
 }
 
 func renderMethodsOfTOON(methods []query.SymbolDetail) string {
 	data := map[string]any{"methods": methods}
-	out, err := gotoon.Encode(data)
-	if err != nil {
-		return marshalJSON(methods)
-	}
+	out := encodeTOON(data)
 	return out
 }
 
@@ -592,10 +676,7 @@ func renderPackageTOON(pkg *query.PackageResult) string {
 		"import_count":     pkg.ImportCount,
 		"exported_symbols": pkg.ExportedSymbols,
 	}
-	out, err := gotoon.Encode(data)
-	if err != nil {
-		return marshalJSON(pkg)
-	}
+	out := encodeTOON(data)
 	return out
 }
 
@@ -773,10 +854,7 @@ func renderDependencyLayersTOON(r *query.LayersResult) string {
 		"layers": r.Layers,
 		"hubs":   r.Hubs,
 	}
-	out, err := gotoon.Encode(data)
-	if err != nil {
-		return renderDependencyLayersJSON(r)
-	}
+	out := encodeTOON(data)
 	return out
 }
 
@@ -807,10 +885,7 @@ func renderDependencyFlowTOON(r *query.FlowResult) string {
 		"importers":          r.Importers,
 		"transitive_imports": r.TransitiveImports,
 	}
-	out, err := gotoon.Encode(data)
-	if err != nil {
-		return marshalJSON(r)
-	}
+	out := encodeTOON(data)
 	return out
 }
 
@@ -878,10 +953,7 @@ func renderEntryPointsTOON(entries []query.EntryPoint) string {
 		"entry_points": entries,
 		"by_reason":    byReason,
 	}
-	out, err := gotoon.Encode(data)
-	if err != nil {
-		return marshalJSON(entries)
-	}
+	out := encodeTOON(data)
 	return out
 }
 
@@ -936,10 +1008,7 @@ func renderChangedSymbolsTOON(r *query.ChangedSymbolsResult) string {
 		"summary": r.Summary,
 		"symbols": r.Symbols,
 	}
-	out, err := gotoon.Encode(data)
-	if err != nil {
-		return marshalJSON(r)
-	}
+	out := encodeTOON(data)
 	return out
 }
 
@@ -1119,10 +1188,7 @@ func renderBundleTOON(b *query.Bundle) string {
 		"same_file":      b.SameFile,
 		"token_estimate": b.TokenEstimate,
 	}
-	out, err := gotoon.Encode(data)
-	if err != nil {
-		return marshalJSON(b)
-	}
+	out := encodeTOON(data)
 	return out
 }
 
@@ -1157,10 +1223,7 @@ func RenderHotspots(hotspots []query.Hotspot, opts ...Option) string {
 
 func renderHotspotsTOON(hotspots []query.Hotspot) string {
 	data := map[string]any{"hotspots": hotspots}
-	out, err := gotoon.Encode(data)
-	if err != nil {
-		return marshalJSON(hotspots)
-	}
+	out := encodeTOON(data)
 	return out
 }
 
@@ -1195,9 +1258,6 @@ func RenderImportance(entries []query.ImportanceEntry, opts ...Option) string {
 
 func renderImportanceTOON(entries []query.ImportanceEntry) string {
 	data := map[string]any{"importance": entries}
-	out, err := gotoon.Encode(data)
-	if err != nil {
-		return marshalJSON(entries)
-	}
+	out := encodeTOON(data)
 	return out
 }

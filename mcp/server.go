@@ -9,19 +9,24 @@ import (
 	"strings"
 	"time"
 
+	"codemap/contract"
 	"codemap/parse"
 	"codemap/query"
 	"codemap/render"
 	"codemap/resolve"
 	"codemap/store"
 	"codemap/vcs"
+	"codemap/workspace"
 )
 
 type Server struct {
-	store    *store.Store
-	dbPath   string
-	repoPath string
-	warnings []string
+	store          *store.Store
+	dbPath         string
+	repoPath       string
+	warnings       []string
+	reindexed      []string
+	contractCfg    contract.Config
+	hasContractCfg bool
 }
 
 func New(s *store.Store) *Server {
@@ -32,33 +37,76 @@ func NewLazy(dbPath string) *Server {
 	return &Server{dbPath: dbPath, repoPath: "."}
 }
 
+// contractConfig returns the contract analysis config: the workspace-declared
+// config when one was loaded, otherwise defaults.
+func (s *Server) contractConfig() contract.Config {
+	if s.hasContractCfg {
+		return s.contractCfg
+	}
+	return contract.DefaultConfig()
+}
+
+// contractConfigFromWorkspace builds a contract analysis config from a parsed
+// workspace config (suppress pairs + custom runtime extractors).
+func contractConfigFromWorkspace(cfg *workspace.Config) contract.Config {
+	return cfg.ContractConfig()
+}
+
 func (s *Server) getStore() (*store.Store, error) {
-	if s.store != nil {
-		if err := s.checkStaleness(); err != nil {
-			return nil, err
+	s.reindexed = nil
+	dbPath := s.resolveDBPath()
+
+	if s.store == nil {
+		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+			if err := s.autoIndex(s.repoPath); err != nil {
+				return nil, fmt.Errorf("auto-index failed: %w", err)
+			}
+			return s.store, nil
 		}
-		return s.store, nil
+		st, err := store.Open(dbPath)
+		if err != nil {
+			if err := s.autoIndex(s.repoPath); err != nil {
+				return nil, fmt.Errorf("auto-index failed: %w", err)
+			}
+			return s.store, nil
+		}
+		s.store = st
 	}
 
-	dbPath := s.resolveDBPath()
+	if err := s.refreshStale(dbPath); err != nil {
+		return nil, err
+	}
+	return s.store, nil
+}
+
+// refreshStale re-indexes any stale repo before the query answers. Workspace
+// databases reindex per member; single-repo databases keep the legacy
+// full-rebuild path. Repos reindexed this call are recorded for the response.
+func (s *Server) refreshStale(dbPath string) error {
+	repos, err := s.store.ListRepos()
+	if err == nil && len(repos) > 0 {
+		reindexed, rerr := workspace.ReindexStale(dbPath)
+		if rerr != nil {
+			return rerr
+		}
+		s.reindexed = append(s.reindexed, reindexed...)
+
+		// Reanalyze stale contract data.
+		contractReanalyzed, cerr := contract.ReanalyzeStaleContracts(s.store, s.contractConfig())
+		if cerr == nil && len(contractReanalyzed) > 0 {
+			for _, repo := range contractReanalyzed {
+				s.reindexed = append(s.reindexed, repo+" (contracts)")
+			}
+		}
+
+		return nil
+	}
 
 	stale, _ := store.IsStale(dbPath, s.repoPath)
 	if stale {
-		if err := s.autoIndex(s.repoPath); err != nil {
-			return nil, fmt.Errorf("auto-index failed: %w", err)
-		}
-		return s.store, nil
+		return s.autoIndex(s.repoPath)
 	}
-
-	st, err := store.Open(dbPath)
-	if err != nil {
-		if err := s.autoIndex(s.repoPath); err != nil {
-			return nil, fmt.Errorf("auto-index failed: %w", err)
-		}
-		return s.store, nil
-	}
-	s.store = st
-	return st, nil
+	return nil
 }
 
 func (s *Server) resolveDBPath() string {
@@ -66,14 +114,6 @@ func (s *Server) resolveDBPath() string {
 		return s.dbPath
 	}
 	return store.DefaultPath()
-}
-
-func (s *Server) checkStaleness() error {
-	stale, _ := store.IsStale(s.resolveDBPath(), s.repoPath)
-	if stale {
-		return s.autoIndex(s.repoPath)
-	}
-	return nil
 }
 
 func (s *Server) autoIndex(path string) error {
@@ -197,9 +237,16 @@ func (s *Server) handleToolsCall(id json.RawMessage, msg map[string]json.RawMess
 	}
 
 	result, isErr := s.handleTool(toolCall.Name, toolCall.Arguments)
+	var notices []string
+	if len(s.reindexed) > 0 {
+		notices = append(notices, "reindexed: ["+strings.Join(s.reindexed, ", ")+"]")
+	}
 	if len(s.warnings) > 0 {
-		result = strings.Join(s.warnings, "\n") + "\n\n" + result
+		notices = append(notices, strings.Join(s.warnings, "\n"))
 		s.warnings = nil
+	}
+	if len(notices) > 0 {
+		result = strings.Join(notices, "\n") + "\n\n" + result
 	}
 	res := map[string]any{
 		"content": []map[string]any{{keyType: "text", "text": result}},
@@ -227,45 +274,71 @@ func (s *Server) handleTool(name string, args map[string]any) (string, bool) {
 
 	opts, renderOpts := s.buildOptions(args)
 
-	handlers := map[string]toolHandler{
-		"overview":              handleOverview,
-		"show":                  handleShow,
-		"callers_of":            handleCallersOf,
-		"callees_of":            handleCalleesOf,
-		"search":                handleSearch,
-		keyToolPackage:          handlePackage,
-		"methods_of":            handleMethodsOf,
-		"importers_of":          handleImportersOf,
-		"imports_of":            handleImportsOf,
-		"edges_by_type":         handleEdgesByType,
-		"all_edges":             handleAllEdges,
-		"list_packages":         handleListPackages,
-		"type_usage":            handleTypeUsage,
-		"transitive_imports":    handleTransitiveImports,
-		"search_prefix":         handleSearchPrefix,
-		"find_path":             handleFindPath,
-		"method_search":         handleMethodSearch,
-		"interface_impls":       handleInterfaceImpls,
-		"unused":                handleUnused,
-		"cycles":                handleCycles,
-		"symbols_in_file":       handleSymbolsInFile,
-		"blast_radius":          handleBlastRadius,
-		"get_symbol_body":       handleSymbolBody,
-		"dependency_layers":     handleDependencyLayers,
-		"dependency_flow":       handleDependencyFlow,
-		"entry_points":          handleEntryPoints,
-		"changed_symbols":       handleChangedSymbols,
-		"search_text":           handleSearchText,
-		"get_context_bundle":    handleContextBundle,
-		"get_hotspots":          handleHotspots,
-		"get_symbol_importance": handleSymbolImportance,
-	}
-
-	handler, ok := handlers[name]
+	handler, ok := queryHandlers()[name]
 	if !ok {
 		return fmt.Sprintf("Error: unknown tool %s", name), true
 	}
-	return handler(st, opts, renderOpts, args)
+	result, isErr := handler(st, opts, renderOpts, args)
+	if isErr {
+		if note := notIndexedNote(st, primaryArg(args)); note != "" {
+			result += note
+		}
+	}
+	return result, isErr
+}
+
+func queryHandlers() map[string]toolHandler {
+	return map[string]toolHandler{
+		"overview":                  handleOverview,
+		"show":                      handleShow,
+		"callers_of":                handleCallersOf,
+		"callees_of":                handleCalleesOf,
+		"search":                    handleSearch,
+		keyToolPackage:              handlePackage,
+		"methods_of":                handleMethodsOf,
+		"importers_of":              handleImportersOf,
+		"imports_of":                handleImportsOf,
+		"edges_by_type":             handleEdgesByType,
+		"all_edges":                 handleAllEdges,
+		"list_packages":             handleListPackages,
+		"type_usage":                handleTypeUsage,
+		"transitive_imports":        handleTransitiveImports,
+		"search_prefix":             handleSearchPrefix,
+		"find_path":                 handleFindPath,
+		"method_search":             handleMethodSearch,
+		"interface_impls":           handleInterfaceImpls,
+		"unused":                    handleUnused,
+		"cycles":                    handleCycles,
+		"symbols_in_file":           handleSymbolsInFile,
+		"blast_radius":              handleBlastRadius,
+		"get_symbol_body":           handleSymbolBody,
+		"dependency_layers":         handleDependencyLayers,
+		"dependency_flow":           handleDependencyFlow,
+		"entry_points":              handleEntryPoints,
+		"changed_symbols":           handleChangedSymbols,
+		"search_text":               handleSearchText,
+		"get_context_bundle":        handleContextBundle,
+		"get_hotspots":              handleHotspots,
+		"get_symbol_importance":     handleSymbolImportance,
+		"health":                    handleHealth,
+		"codemap_health":            handleHealth,
+		"workspace_changed_symbols": handleWorkspaceChangedSymbols,
+		"contracts":                 handleContracts,
+		"contract_drift":            handleContractDrift,
+		"runtime_contracts":         handleRuntimeContracts,
+		"suppress_contract":         handleSuppressContract,
+	}
+}
+
+// primaryArg guesses the symbol/package name a tool call is about, so a missed
+// lookup can be attributed to a missing repo rather than silent absence.
+func primaryArg(args map[string]any) string {
+	for _, k := range []string{keyQualifiedName, keyPattern, "package_path", keyPath, keyTypeName, "prefix", "method_name", "interface_name", "from", "to"} {
+		if v, ok := args[k].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func (s *Server) buildOptions(args map[string]any) ([]query.Option, []render.Option) {
@@ -277,6 +350,9 @@ func (s *Server) buildOptions(args map[string]any) ([]query.Option, []render.Opt
 	}
 	if b, ok := args["full_docs"].(bool); ok && b {
 		renderOpts = append(renderOpts, render.WithFullDocs())
+	}
+	if v, ok := args["repo"].(string); ok && v != "" {
+		opts = append(opts, query.WithRepo(v))
 	}
 	renderOpts = append(renderOpts, render.WithFormat(render.FormatTOON))
 
@@ -593,7 +669,7 @@ func handleBlastRadius(st *store.Store, opts []query.Option, renderOpts []render
 	if v, ok := args["depth"].(float64); ok && v > 0 {
 		depth = int(v)
 	}
-	result, err := query.GetBlastRadius(st, qn, depth, opts...)
+	result, err := query.BlastRadiusWithContracts(st, qn, depth, opts...)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err), true
 	}
@@ -700,6 +776,119 @@ func handleChangedSymbols(st *store.Store, _ []query.Option, renderOpts []render
 	return render.RenderChangedSymbols(result, renderOpts...), false
 }
 
+func handleWorkspaceChangedSymbols(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+	withBlast := true
+	if b, ok := args["with_blast_radius"].(bool); ok {
+		withBlast = b
+	}
+	includeBodies := false
+	if b, ok := args["include_bodies"].(bool); ok {
+		includeBodies = b
+	}
+	includeTests := false
+	if b, ok := args["include_tests"].(bool); ok {
+		includeTests = b
+	}
+	result, err := query.WorkspaceChangedSymbols(st, withBlast, includeBodies, includeTests)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err), true
+	}
+	return render.RenderChangedSymbols(result, renderOpts...), false
+}
+
+func handleHealth(st *store.Store, _ []query.Option, _ []render.Option, _ map[string]any) (string, bool) {
+	repos, err := st.ListRepos()
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err), true
+	}
+	if len(repos) == 0 {
+		h := st.Health()
+		out := fmt.Sprintf("indexed_at=%s repo=%s head=%s %d packages, %d symbols",
+			h.IndexedAt, h.RepoPath, h.GitHead, h.PackageCount, h.SymbolCount)
+		return out, false
+	}
+	var b strings.Builder
+	b.WriteString("repos:\n")
+	for _, r := range repos {
+		state := st.RepoState(r)
+		fmt.Fprintf(&b, "  %s: %s", r.ModulePath, state)
+		if r.IndexedAt != "" {
+			fmt.Fprintf(&b, "  indexed_at=%s", r.IndexedAt)
+		}
+		if state == "stale" {
+			b.WriteString("  (auto-reindex on next query)")
+		}
+		if state == "missing" {
+			b.WriteString("  (queries for this repo return 'repo not indexed')")
+		}
+		b.WriteString("\n")
+	}
+	return b.String(), false
+}
+
+// notIndexedNote reports when a queried name belongs to a workspace member
+// that is missing/not indexed, so agents never mistake absence for fact.
+func notIndexedNote(st *store.Store, name string) string {
+	repos, err := st.ListRepos()
+	if err != nil {
+		return ""
+	}
+	for _, r := range repos {
+		if !r.Missing {
+			continue
+		}
+		if name == r.ModulePath || strings.HasPrefix(name, r.ModulePath+"/") || strings.HasPrefix(name, r.ModulePath+".") {
+			return fmt.Sprintf("; note: %s is not indexed (missing checkout)", r.ModulePath)
+		}
+	}
+	return ""
+}
+
+// handleWorkspaceIndex indexes every member of the workspace declared by the
+// codemap.yaml nearest to absPath into that directory's database.
+func (s *Server) handleWorkspaceIndex(absPath string) (string, bool) {
+	cfg, err := workspace.Load(workspace.DefaultPath(absPath))
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err), true
+	}
+	wsDBPath := filepath.Join(absPath, ".codemap", "codemap.db")
+	summaries, err := workspace.IndexAll(cfg, wsDBPath)
+	if err != nil {
+		return fmt.Sprintf("Error: workspace index: %v", err), true
+	}
+	var b strings.Builder
+	for _, sm := range summaries {
+		fmt.Fprintf(&b, "%s: %d packages, %d symbols, %d edges (%s)\n", sm.Repo, sm.Packages, sm.Symbols, sm.Edges, sm.State)
+	}
+	if s.store != nil {
+		_ = s.store.Close()
+	}
+	st, err := store.Open(wsDBPath)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err), true
+	}
+	s.store = st
+	s.dbPath = wsDBPath
+	s.repoPath = absPath
+
+	s.contractCfg = contractConfigFromWorkspace(cfg)
+	s.hasContractCfg = true
+	for _, p := range cfg.ContractSuppressionPairs() {
+		if err := st.SuppressContracts(p[0], p[1]); err != nil {
+			return fmt.Sprintf("Error: recording contract suppression: %v", err), true
+		}
+	}
+	reanalyzed, cerr := contract.ReanalyzeStaleContracts(st, s.contractCfg)
+	if cerr != nil {
+		return fmt.Sprintf("Error: contract analysis: %v", cerr), true
+	}
+	for _, repo := range reanalyzed {
+		b.WriteString(repo + ": contract analysis refreshed\n")
+	}
+
+	return strings.TrimSpace(b.String()), false
+}
+
 func (s *Server) handleIndex(args map[string]any) (string, bool) {
 	path := "."
 	if v, ok := args["path"].(string); ok && v != "" {
@@ -709,6 +898,11 @@ func (s *Server) handleIndex(args map[string]any) (string, bool) {
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err), true
+	}
+
+	// Workspace mode: index every member declared by the nearest codemap.yaml.
+	if configPath := workspace.DefaultPath(absPath); configPath != "" {
+		return s.handleWorkspaceIndex(absPath)
 	}
 
 	parseResult, err := parse.Run(absPath)
@@ -802,14 +996,19 @@ const (
 	keyExported      = "exported"
 	keyEdgeType      = "edge_type"
 	keyPath          = "path"
+	keyRepo          = "repo"
+	keyPattern       = "pattern"
 	keyIncludeTests  = "include_tests"
 	keyDepth         = "depth"
 	keyPackagePath   = "package_path"
 	keyName          = "name"
+	keyTypeName      = "type_name"
 	keyType          = "type"
 	keyDescription   = "description"
 	keyBody          = "body"
 	keyToolPackage   = "package"
+	keyEvidence      = "evidence"
+	keyIndexedAt     = "indexed_at"
 )
 
 const (
@@ -817,6 +1016,11 @@ const (
 	descSymbolKind         = "string — symbol kind"
 	descSourceFilePath     = "string — source file path"
 	descLineNumber         = "int — line number"
+	descSourceSymbolQN     = "string — source symbol qualified name"
+	descTargetSymbolQN     = "string — target symbol qualified name"
+	descEvidence           = "string — evidence for this contract edge"
+	descIndexedAt          = "string — ISO 8601 timestamp of analysis"
+	descRepoModulePath     = "string — repo module path"
 )
 
 var returnTypeSchemas = map[string]any{
@@ -831,8 +1035,8 @@ var returnTypeSchemas = map[string]any{
 		keyExported:      "bool — whether the symbol is exported (capitalized)",
 	},
 	"EdgeDetail": map[string]any{
-		"from_ref":  "string — source symbol qualified name",
-		"to_ref":    "string — target symbol qualified name",
+		keyFromRef:  descSourceSymbolQN,
+		keyToRef:    descTargetSymbolQN,
 		keyEdgeType: "string — relationship type: calls, references, satisfies, embeds, imports",
 		keyPosFile:  "string — source file where edge occurs",
 		keyPosLine:  "int — line number where edge occurs",
@@ -961,6 +1165,47 @@ var returnTypeSchemas = map[string]any{
 		"pos_line":       descLineNumber,
 		"importance":     "float64 — PageRank importance score",
 	},
+	"Contract": map[string]any{
+		"id":         "int — contract ID",
+		keyFromRef:   descSourceSymbolQN,
+		keyToRef:     descTargetSymbolQN,
+		"direction":  "string — producer, consumer, or shared",
+		"confidence": "float64 — confidence score (0-1)",
+		"severity":   "string — compatible, breaking, or unknown",
+		"suggested":  "bool — true if below confidence threshold",
+		keyEvidence:  descEvidence,
+		keyIndexedAt: descIndexedAt,
+		keyRepo:      descRepoModulePath,
+	},
+	"DriftReport": map[string]any{
+		"id":         "int — drift report ID",
+		keyFromRef:   descSourceSymbolQN,
+		keyToRef:     descTargetSymbolQN,
+		"severity":   "string — compatible, breaking, or unknown",
+		"fields":     "[]DriftField — field-level divergence details",
+		keyEvidence:  descEvidence,
+		keyIndexedAt: descIndexedAt,
+		keyRepo:      descRepoModulePath,
+	},
+	"DriftField": map[string]any{
+		"wire_name": "string — effective wire field name (cbor/json/yaml/toml/bson/db tag, else Go name)",
+		"type_a":    "string — type in source repo",
+		"type_b":    "string — type in target repo",
+		"repo_a":    "string — source repo",
+		"repo_b":    "string — target repo",
+		"status":    "string — removed, renamed, type_changed, added, same_value_different_name, value_changed",
+	},
+	"RuntimeContract": map[string]any{
+		"id":         "int — runtime contract ID",
+		"kind":       "string — redis, jetstream, or ws_type",
+		"pattern":    "string — normalized pattern",
+		keyFromRef:   descSourceSymbolQN,
+		keyToRef:     descTargetSymbolQN,
+		"direction":  "string — producer, consumer, or shared",
+		keyEvidence:  descEvidence,
+		keyIndexedAt: descIndexedAt,
+		keyRepo:      descRepoModulePath,
+	},
 }
 
 func handleSchema() string {
@@ -1086,10 +1331,13 @@ func buildToolsList() []map[string]any {
 func indexTools() []map[string]any {
 	return []map[string]any{
 		toolDef("index",
-			"Index the Go repository at the given path. Indexing happens automatically on first tool call, so this is only needed to force a full re-index. Returns the number of packages, symbols, and edges indexed.",
+			"Index the Go repository at the given path (or the workspace declared by its codemap.yaml). Indexing happens automatically on first tool call, so this is only needed to force a full re-index. Returns the number of packages, symbols, and edges indexed.",
 			map[string]any{
 				"path": stringProp("Absolute or relative path to the Go repository root. Defaults to current directory."),
 			}),
+		toolDef("health",
+			"Source of truth for index freshness: per-repo state (indexed/stale/missing) and indexed_at. Use when results look stale or a query misses a symbol you expect to exist.",
+			map[string]any{}),
 		toolDef("overview",
 			"Get a bird's-eye architecture summary of all indexed Go packages: each package's path, exported symbols with signatures, and import counts. Use instead of reading multiple files to understand project structure.",
 			map[string]any{
@@ -1101,6 +1349,7 @@ func indexTools() []map[string]any {
 			map[string]any{
 				keyQualifiedName: stringProp("Fully qualified symbol name (e.g., cli/codemap/extract.Run)"),
 				"full_docs":      boolProp("Show full documentation instead of first sentence"),
+				keyRepo:          repoProp(),
 			},
 			"qualified_name"),
 		toolDef("callers_of",
@@ -1109,6 +1358,7 @@ func indexTools() []map[string]any {
 				keyQualifiedName: stringProp("Fully qualified symbol name"),
 				"edge_types":     stringArrayProp("Optional filter for specific edge types (e.g., calls, references, satisfies, embeds, imports)"),
 				keyDepth:         intProp("Traversal depth for transitive callers (default: 1 = direct only)"),
+				keyRepo:          repoProp(),
 			},
 			"qualified_name"),
 		toolDef("callees_of",
@@ -1117,6 +1367,7 @@ func indexTools() []map[string]any {
 				keyQualifiedName: stringProp("Fully qualified symbol name"),
 				"edge_types":     stringArrayProp("Optional filter for specific edge types (e.g., calls, references, satisfies, embeds, imports)"),
 				keyDepth:         intProp("Traversal depth for transitive callees (default: 1 = direct only)"),
+				keyRepo:          repoProp(),
 			},
 			"qualified_name"),
 	}
@@ -1128,6 +1379,7 @@ func queryTools() []map[string]any {
 	tools = append(tools, symbolTools()...)
 	tools = append(tools, graphTools()...)
 	tools = append(tools, advancedTools()...)
+	tools = append(tools, contractTools()...)
 	return tools
 }
 
@@ -1146,22 +1398,25 @@ func symbolTools() []map[string]any {
 			map[string]any{
 				"path":               stringProp("Package import path"),
 				"include_unexported": boolProp("Include unexported symbols"),
+				keyRepo:              repoProp(),
 			},
 			"path"),
 		toolDef("methods_of",
 			"Find all methods on a Go type by its short name (e.g., 'Server', 'Store'). Returns each method's qualified name, signature, file path, line number, and documentation. Use instead of grep when you need a type's full method set.",
 			map[string]any{
-				"type_name": stringProp("Short type name (e.g., Store)"),
+				keyTypeName: stringProp("Short type name (e.g., Store)"),
+				keyRepo:     repoProp(),
 			},
 			"type_name"),
 		toolDef("search",
 			"Search Go symbols (functions, types, methods, interfaces, constants, variables) by name. Returns qualified names, file paths, line numbers, signatures, and documentation. More precise than grep for finding Go symbol definitions and declarations. Use this when you know a symbol name but not its location.",
 			map[string]any{
-				"pattern":       stringProp("Search pattern (case-insensitive substring match)"),
+				keyPattern:      stringProp("Search pattern (case-insensitive substring match)"),
 				keyIncludeTests: boolProp("Include test packages and symbols"),
 				"kind":          stringProp("Filter by symbol kind (e.g., function, method, type, const, var, interface)"),
 				"exported":      boolProp("Filter by exported status"),
 				"file":          stringProp("Filter by file path (substring match on pos_file, e.g., 'server.go' or 'mcp/')"),
+				keyRepo:         repoProp(),
 			},
 			"pattern"),
 		toolDef("list_packages",
@@ -1178,12 +1433,14 @@ func graphTools() []map[string]any {
 			"Find all Go packages that import the given package. Returns package paths and line numbers. Use to understand a package's downstream dependents and blast radius of changes.",
 			map[string]any{
 				keyPackagePath: stringProp("Package import path"),
+				"repo":         repoProp(),
 			},
 			"package_path"),
 		toolDef("imports_of",
 			"Find all packages imported by the given Go package. Returns import paths and line numbers. Use to understand a package's upstream dependencies.",
 			map[string]any{
 				keyPackagePath: stringProp("Package import path"),
+				"repo":         repoProp(),
 			},
 			"package_path"),
 		toolDef("edges_by_type",
@@ -1198,7 +1455,7 @@ func graphTools() []map[string]any {
 		toolDef("search_text",
 			"Search file contents using FTS5 full-text search or regex. Returns matching file paths, line numbers, and context lines. Use for finding text patterns in source code.",
 			map[string]any{
-				"pattern":       stringProp("Search pattern (FTS5 query or regex)"),
+				keyPattern:      stringProp("Search pattern (FTS5 query or regex)"),
 				"file_pattern":  stringProp("File path filter pattern (substring match, optional)"),
 				"is_regex":      boolProp("Use regex mode instead of FTS5 (default false)"),
 				"context_lines": intProp("Number of context lines around each match (default 0)"),
@@ -1240,7 +1497,7 @@ func typeAndImportTools() []map[string]any {
 		toolDef("type_usage",
 			"Find all symbols that use a given type in their signatures (parameters, return types, fields). Returns qualified names, kinds, signatures, and file locations. Use to find where a type is used across the codebase.",
 			map[string]any{
-				"type_name":     stringProp("Type name to search for (e.g., 'error', 'string', 'MyStruct')"),
+				keyTypeName:     stringProp("Type name to search for (e.g., 'error', 'string', 'MyStruct')"),
 				keyIncludeTests: boolProp("Include test packages and symbols"),
 			},
 			"type_name"),
@@ -1284,6 +1541,7 @@ func analysisTools() []map[string]any {
 			map[string]any{
 				keyQualifiedName: stringProp("Symbol qualified name"),
 				keyDepth:         intProp("Transitive caller depth (default: 3)"),
+				keyRepo:          repoProp(),
 			},
 			"qualified_name"),
 	}
@@ -1297,6 +1555,7 @@ func pathAndSearchTools() []map[string]any {
 				"from":      stringProp("Starting symbol qualified name"),
 				"to":        stringProp("Target symbol qualified name"),
 				"max_depth": intProp("Maximum traversal depth (default: 10)"),
+				keyRepo:     repoProp(),
 			},
 			"from", "to"),
 		toolDef("method_search",
@@ -1318,7 +1577,7 @@ func pathAndSearchTools() []map[string]any {
 func toolDef(name, description string, properties map[string]any, required ...string) map[string]any {
 	t := map[string]any{
 		keyName:        name,
-		keyDescription: description,
+		keyDescription: description + staleGuidance,
 		"inputSchema": map[string]any{
 			keyType:      "object",
 			"properties": properties,
@@ -1328,6 +1587,15 @@ func toolDef(name, description string, properties map[string]any, required ...st
 		t["inputSchema"].(map[string]any)["required"] = required
 	}
 	return t
+}
+
+// staleGuidance is appended to every tool description so agents know results
+// reflect a fresh index and how to force a manual one.
+const staleGuidance = " Results reflect a fresh index — codemap re-indexes any stale repo before answering. If you still suspect stale data, run `codemap index` (or `codemap index --workspace`)."
+
+// repoProp is the optional repo scope property shared by query tools.
+func repoProp() map[string]any {
+	return stringProp("Optional workspace member (module path) to scope results to (e.g. 'krucil'). Workspace mode only.")
 }
 
 func stringProp(desc string) map[string]any {
@@ -1364,6 +1632,13 @@ func sourceTools() []map[string]any {
 			"Get the symbols changed in the working tree relative to a git ref (default 'main'), classified by change_type (modified/added/removed). Each changed symbol can carry an optional blast_radius and source body. Replaces 'git diff' + manual hunk-to-symbol mapping + per-symbol blast_radius lookups.",
 			map[string]any{
 				"ref":               stringProp("Git ref to diff against (default: repository's default branch, e.g. main or master)"),
+				"with_blast_radius": boolProp("Attach blast_radius to each changed symbol (default true)"),
+				"include_bodies":    boolProp("Attach source body to each changed symbol (default false)"),
+				"include_tests":     boolProp("Include test packages/symbols (default false)"),
+			}),
+		toolDef("workspace_changed_symbols",
+			"Get a workspace-wide diff of changed symbols: every member repo's changed symbols, each computed against that repo's own reference and tagged with its repo. Replaces running changed_symbols per repo manually.",
+			map[string]any{
 				"with_blast_radius": boolProp("Attach blast_radius to each changed symbol (default true)"),
 				"include_bodies":    boolProp("Attach source body to each changed symbol (default false)"),
 				"include_tests":     boolProp("Include test packages/symbols (default false)"),

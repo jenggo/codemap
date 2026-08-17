@@ -76,8 +76,8 @@
       "Path": "codemap/testdata/interfaces",
       "Name": "interfaces",
       "Dir": "/home/jenggo/go/src/cli/codemap/testdata/interfaces",
-      "IsTest": false,
-      "SymCount": 6
+      "SymCount": 6,
+      "IsTest": false
     }
   ]
 }

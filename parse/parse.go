@@ -22,6 +22,10 @@ type PackageInfo struct {
 	ImportPath string
 	Name       string
 	Dir        string
+	// ModulePath is the module path this package is attributed to. Empty in
+	// single-repo mode; set by workspace indexing to the nearest enclosing
+	// go.mod's module path.
+	ModulePath string
 	Files      []string
 	IsTest     bool
 }
@@ -79,6 +83,312 @@ type goListPkg struct {
 
 type goListError struct {
 	Err string
+}
+
+// WorkspaceRoot is one module tree to index in workspace mode. ModulePath is
+// the canonical repo identity (nearest-enclosing go.mod's module path).
+type WorkspaceRoot struct {
+	Dir        string
+	ModulePath string
+}
+
+// RunWorkspace indexes every module root into one Result, attributing each
+// package to the nearest enclosing go.mod. Nested go.mod modules that are not
+// themselves roots are indexed too, so module boundaries are never crossed.
+// All files share a single FileSet so cross-package references resolve.
+func RunWorkspace(roots []WorkspaceRoot) (*Result, error) {
+	result := &Result{
+		Files: make(map[string]*ast.File),
+		Fset:  token.NewFileSet(),
+	}
+	seen := make(map[string]bool)
+
+	rootSet := make(map[string]bool)
+	for _, r := range roots {
+		abs, err := filepath.Abs(r.Dir)
+		if err != nil {
+			return nil, err
+		}
+		rootSet[abs] = true
+	}
+
+	for _, root := range roots {
+		if err := runWorkspaceRoot(result, root, rootSet, seen); err != nil {
+			return nil, err
+		}
+	}
+
+	return result, nil
+}
+
+func runWorkspaceRoot(result *Result, root WorkspaceRoot, rootSet, seen map[string]bool) error {
+	absRoot, err := filepath.Abs(root.Dir)
+	if err != nil {
+		return err
+	}
+
+	nested := discoverNestedModules(absRoot)
+
+	if err := goListInto(result, absRoot, root.ModulePath, seen); err == nil {
+		for _, nd := range nested {
+			if rootSet[nd] {
+				continue
+			}
+			module := readModulePath(nd)
+			if module == "" {
+				continue
+			}
+			_ = goListInto(result, nd, module, seen)
+		}
+		return nil
+	}
+
+	return runModuleWalk(result, absRoot, root.ModulePath)
+}
+
+// discoverNestedModules returns the absolute paths of directories under root
+// that contain their own go.mod (excluding root itself), so module boundaries
+// are respected during indexing.
+func discoverNestedModules(absRoot string) []string {
+	var nested []string
+	_ = filepath.Walk(absRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !info.IsDir() || path == absRoot {
+			return nil
+		}
+		if strings.HasPrefix(info.Name(), ".") || info.Name() == dirVendor || info.Name() == "node_modules" {
+			return filepath.SkipDir
+		}
+		if _, err := os.Stat(filepath.Join(path, "go.mod")); err == nil {
+			nested = append(nested, path)
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	return nested
+}
+
+// runModuleWalk is the workspace fallback (no go toolchain): walk the module
+// tree, skipping nested go.mod boundaries, attributing every package to the
+// module's path. Import paths are the module path plus the package's relative
+// directory, so namespacing holds without go list.
+func runModuleWalk(result *Result, moduleRoot, modulePath string) error {
+	err := filepath.Walk(moduleRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !info.IsDir() {
+			return nil
+		}
+		if strings.HasPrefix(info.Name(), ".") || info.Name() == dirVendor {
+			return filepath.SkipDir
+		}
+		if path != moduleRoot {
+			if _, err := os.Stat(filepath.Join(path, "go.mod")); err == nil {
+				return filepath.SkipDir
+			}
+		}
+		return processWorkspaceDir(result, path, moduleRoot, modulePath)
+	})
+	return err
+}
+
+func processWorkspaceDir(result *Result, dir, moduleRoot, modulePath string) error {
+	bpkg, err := build.ImportDir(dir, 0)
+	if err != nil {
+		return nil
+	}
+
+	rel, err := filepath.Rel(moduleRoot, dir)
+	if err != nil {
+		return nil
+	}
+	rel = filepath.ToSlash(rel)
+	importPath := modulePath
+	if rel != "." {
+		importPath = modulePath + "/" + rel
+	}
+
+	files := make([]string, 0, len(bpkg.GoFiles)+len(bpkg.CgoFiles))
+	files = append(files, bpkg.GoFiles...)
+	files = append(files, bpkg.CgoFiles...)
+	testFiles := bpkg.TestGoFiles
+
+	isTest := len(testFiles) > 0 && len(files) == 0
+
+	allFiles := make([]string, 0, len(files)+len(testFiles))
+	allFiles = append(allFiles, files...)
+	allFiles = append(allFiles, testFiles...)
+
+	if len(allFiles) == 0 {
+		return nil
+	}
+
+	pkgInfo := PackageInfo{
+		ImportPath: importPath,
+		Name:       bpkg.Name,
+		Dir:        dir,
+		IsTest:     isTest,
+		ModulePath: modulePath,
+	}
+
+	parseFilesInto(result, &pkgInfo, allFiles, dir)
+
+	if len(pkgInfo.Files) > 0 {
+		result.Packages = append(result.Packages, pkgInfo)
+	}
+
+	if len(testFiles) > 0 && !isTest {
+		processTestFilesWorkspace(result, dir, importPath, bpkg.Name, testFiles, modulePath)
+	}
+
+	return nil
+}
+
+// parseFilesInto parses each file into result.Files and records it on pkgInfo,
+// skipping files already parsed (shared FileSet across workspace members).
+func parseFilesInto(result *Result, pkgInfo *PackageInfo, files []string, dir string) {
+	for _, f := range files {
+		fullPath := filepath.Join(dir, f)
+		if _, exists := result.Files[fullPath]; exists {
+			continue
+		}
+		astFile, err := parser.ParseFile(result.Fset, fullPath, nil, parser.ParseComments)
+		if err != nil {
+			result.Errors = append(result.Errors, Error{
+				File: fullPath,
+				Err:  err.Error(),
+			})
+			continue
+		}
+		result.Files[fullPath] = astFile
+		pkgInfo.Files = append(pkgInfo.Files, fullPath)
+	}
+}
+
+func processTestFilesWorkspace(result *Result, dir, importPath, pkgName string, testFiles []string, modulePath string) {
+	testPkgInfo := PackageInfo{
+		ImportPath: importPath + "_test",
+		Name:       pkgName + "_test",
+		Dir:        dir,
+		IsTest:     true,
+		ModulePath: modulePath,
+	}
+	for _, f := range testFiles {
+		fullPath := filepath.Join(dir, f)
+		if _, exists := result.Files[fullPath]; exists {
+			continue
+		}
+		astFile, err := parser.ParseFile(result.Fset, fullPath, nil, parser.ParseComments)
+		if err != nil {
+			result.Errors = append(result.Errors, Error{
+				File: fullPath,
+				Err:  err.Error(),
+			})
+			continue
+		}
+		result.Files[fullPath] = astFile
+		testPkgInfo.Files = append(testPkgInfo.Files, fullPath)
+	}
+	if len(testPkgInfo.Files) > 0 {
+		result.Packages = append(result.Packages, testPkgInfo)
+	}
+}
+
+// goListInto runs `go list -e -json ./...` in abs and merges the packages into
+// result, attributing them to modulePath. seen dedupes packages by import path
+// so nested or overlapping module runs don't double-index.
+func goListInto(result *Result, abs, modulePath string, seen map[string]bool) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "list", "-e", "-json", "./...")
+	cmd.Dir = abs
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("go list: %s: %w", strings.TrimSpace(stderr.String()), err)
+	}
+
+	dec := json.NewDecoder(&stdout)
+	for {
+		var p goListPkg
+		if err := dec.Decode(&p); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return fmt.Errorf("decoding go list output: %w", err)
+		}
+		if p.Error != nil {
+			result.Errors = append(result.Errors, Error{File: p.Dir, Err: p.Error.Err})
+			continue
+		}
+		for _, de := range p.DepsErrors {
+			result.Errors = append(result.Errors, Error{File: p.Dir, Err: de.Err})
+		}
+		addGoListPkgInto(result, p, modulePath, seen)
+	}
+	if len(result.Packages) == 0 && len(result.Errors) > 0 {
+		return fmt.Errorf("go list: %s", result.Errors[0].Err)
+	}
+	return nil
+}
+
+func addGoListPkgInto(result *Result, p goListPkg, modulePath string, seen map[string]bool) {
+	files := make([]string, 0, len(p.GoFiles)+len(p.CgoFiles))
+	files = append(files, p.GoFiles...)
+	files = append(files, p.CgoFiles...)
+	testFiles := make([]string, 0, len(p.TestGoFiles)+len(p.XTestGoFiles))
+	testFiles = append(testFiles, p.TestGoFiles...)
+	testFiles = append(testFiles, p.XTestGoFiles...)
+
+	isTest := len(testFiles) > 0 && len(files) == 0
+
+	allFiles := make([]string, 0, len(files)+len(testFiles))
+	allFiles = append(allFiles, files...)
+	allFiles = append(allFiles, testFiles...)
+
+	if len(allFiles) == 0 {
+		return
+	}
+
+	pkgInfo := PackageInfo{
+		ImportPath: p.ImportPath,
+		Name:       p.Name,
+		Dir:        p.Dir,
+		IsTest:     isTest,
+		ModulePath: modulePath,
+	}
+
+	for _, f := range allFiles {
+		fullPath := filepath.Join(p.Dir, f)
+		if _, exists := result.Files[fullPath]; exists {
+			continue
+		}
+		astFile, err := parser.ParseFile(result.Fset, fullPath, nil, parser.ParseComments)
+		if err != nil {
+			result.Errors = append(result.Errors, Error{
+				File: fullPath,
+				Err:  err.Error(),
+			})
+			continue
+		}
+		result.Files[fullPath] = astFile
+		pkgInfo.Files = append(pkgInfo.Files, fullPath)
+	}
+
+	if len(pkgInfo.Files) > 0 {
+		if !seen[pkgInfo.ImportPath] {
+			result.Packages = append(result.Packages, pkgInfo)
+			seen[pkgInfo.ImportPath] = true
+		}
+	}
+
+	if len(testFiles) > 0 && !isTest {
+		processTestFilesWorkspace(result, p.Dir, p.ImportPath, p.Name, testFiles, modulePath)
+	}
 }
 
 // goList resolves packages with `go list -e -json ./...`. The -e flag keeps
@@ -175,6 +485,8 @@ func addGoListPkg(result *Result, p goListPkg) {
 	}
 }
 
+const dirVendor = "vendor"
+
 func runDirWalk(pattern string) (*Result, error) {
 	result := &Result{
 		Files: make(map[string]*ast.File),
@@ -193,7 +505,7 @@ func runDirWalk(pattern string) (*Result, error) {
 		if !info.IsDir() {
 			return nil
 		}
-		if strings.HasPrefix(info.Name(), ".") || info.Name() == "vendor" {
+		if strings.HasPrefix(info.Name(), ".") || info.Name() == dirVendor {
 			return filepath.SkipDir
 		}
 		return processDir(result, path)
