@@ -64,8 +64,16 @@ For multi-repo workspaces where binaries are coupled by wire protocols rather th
 
 - **Contract edges** — links a producer/consumer symbol to its counterpart in another repo via two signals: a shared message-type string constant and a structural shape match (confidence-scored, with `suggested` below a threshold).
 - **Structural drift** — compares struct shapes on their **effective wire name**: the first recognized serialization tag (`cbor`, `json`, `yaml`, `toml`, `bson`, `db`), falling back to the Go field name. Field additions are compatible; renames, removals, and type changes are breaking.
-- **Runtime contracts** — Redis key patterns, JetStream subjects, WS type strings (plus any custom kinds) extracted from call-site literals, normalized for interpolation, with producer/consumer direction.
-- **Runtime extractor registry** — the built-in redis/jetstream/ws extractors are data-driven (`contracts.extractors` in `codemap.yaml`), so a new infrastructure (Postgres, RabbitMQ, Kafka, ...) is a YAML entry, not new code. Per extractor you can pick which string-literal method argument is the entity (`arg_index`, 0-based — RabbitMQ `Publish(exchange, key, ...)` uses `1`) and a built-in normalizer (`raw` | `redis` | `subject`).
+- **Runtime contracts** — Redis key patterns, JetStream subjects, WS type strings (plus any custom kinds) extracted from call-site literals, normalized for interpolation, with producer/consumer direction. Call-site detection is receiver-aware via an import gate: the built-in redis extractor fires only in files importing a Redis-protocol client (`redis`, `valkey`, `rueidis`, `keydb`), the jetstream extractor only in `nats` files, so a UI struct's `.Set(...)` or an AMQP `.Publish(...)` never becomes a fake Redis/JetStream contract. Strings are captured by a balanced-paren scanner, so interpolation never truncates a literal and multi-key commands (`MSet(k1, k2)`) capture every key.
+- **Runtime extractor registry** — the built-in redis/jetstream/ws extractors are data-driven (`contracts.extractors` in `codemap.yaml`), so a new infrastructure (Postgres, RabbitMQ, Kafka, ...) is a YAML entry, not new code. Per extractor you can pick:
+  - `imports_match` — import substrings gating call-site extraction (empty fires anywhere; entries for a built-in kind extend its default gate),
+  - `producer_methods`/`consumer_methods` — method names and their role,
+  - `arg_index` — first string-literal argument holding the entity, 0-based, with every string arg from it captured (RabbitMQ `Publish(exchange, key, ...)` uses `1`),
+  - `const_prefix` — shared-constant entities by symbol-name prefix plus decode-switch scoping,
+  - `config_patterns` — regexes over config literals whose capture group 1 is the entity,
+  - `normalize` — a built-in normalizer (`raw` | `redis` | `subject`),
+  - `normalize_rules` — inline ordered `{regex, replace}` rules applied after `normalize`, so any pattern shape normalizes without Go changes.
+  Anything describable as a call-site literal, config literal, or const-named entity is pure config; only a fundamentally new *scan semantics* (not method calls, config fields, or constants) would need a Go scanner. Config is validated at build time: a negative `arg_index`, an empty `kind`, a malformed `contracts.suppress` entry (missing `→`), or an invalid `normalize_rules` regex fails loudly naming the offending extractor/rule; an unknown `normalize` name warns and falls back to raw.
 - **Suppression** — `contracts.suppress` drops specific from→to pairs; suppressed pairs never appear.
 
 Commands: `contracts`, `contract-drift`, `runtime-contracts` (MCP: `contracts`, `contract_drift`, `runtime_contracts`, `suppress_contract`). Contract edges participate in blast-radius and path-finding.

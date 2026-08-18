@@ -1,5 +1,8 @@
 package types
 
+import "github.com/nats-io/nats.go"
+
+// jetStream is satisfied by the NATS client in the real workspace.
 type jetStream interface {
 	Subscribe(subject string, cb func())
 }
@@ -18,3 +21,5 @@ func AddStream(js interface{ AddStream(string) error }) error {
 func Listen(js jetStream) {
 	js.Subscribe("agent.response.<request_id>", func() {})
 }
+
+var _ = nats.Options{}

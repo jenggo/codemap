@@ -3,6 +3,8 @@ package vcs
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os/exec"
 	"path/filepath"
@@ -290,9 +292,34 @@ func GitShowFile(repoDir, ref, file string) ([]byte, error) {
 	return []byte(out), nil
 }
 
+// GitDirtyDiff reports whether repoDir has uncommitted .go changes relative to
+// ref and returns a fingerprint of that diff. The fingerprint lets callers
+// check whether an index already reflects this exact working-tree state, so a
+// repo that is legitimately dirty (in-progress edits) is not reindexed after
+// every query. Returns an error when git is unavailable or repoDir is not a
+// repository, so callers can fall back to mtime-only staleness checks.
+func GitDirtyDiff(repoDir, ref string) (bool, string, error) {
+	if err := IsGitRepo(repoDir); err != nil {
+		return false, "", err
+	}
+	out, err := runGit(repoDir, "diff", ref, "--", "*.go")
+	if err != nil {
+		return false, "", err
+	}
+	sum := sha256.Sum256([]byte(out))
+	return strings.TrimSpace(out) != "", fmt.Sprintf("%x", sum[:]), nil
+}
+
+// ErrNoCommits reports a repository that has never had a commit. Churn is
+// legitimately empty there; callers need not treat it as degraded.
+var ErrNoCommits = errors.New("no commits in repository")
+
+// GitFileChurn returns per-file commit counts for .go files in repoDir, or an
+// error when git itself fails (missing binary, not a repository, corrupt repo).
+// A repository with no commits yields ErrNoCommits, not an empty map with nil.
 func GitFileChurn(repoDir, ref string) (map[string]int, error) {
 	if err := IsGitRepo(repoDir); err != nil {
-		return map[string]int{}, nil
+		return nil, err
 	}
 	args := []string{"log", "--format=format:", "--name-only"}
 	if ref != "" {
@@ -301,7 +328,10 @@ func GitFileChurn(repoDir, ref string) (map[string]int, error) {
 	args = append(args, "--", "*.go")
 	out, err := runGit(repoDir, args...)
 	if err != nil {
-		return map[string]int{}, nil
+		if isNoCommitsErr(err) {
+			return nil, ErrNoCommits
+		}
+		return nil, err
 	}
 	churn := make(map[string]int)
 	for line := range strings.SplitSeq(out, "\n") {
@@ -315,4 +345,15 @@ func GitFileChurn(repoDir, ref string) (map[string]int, error) {
 		churn[line]++
 	}
 	return churn, nil
+}
+
+func isNoCommitsErr(err error) bool {
+	msg := err.Error()
+	// Different git versions phrase an empty repository differently: some say
+	// "does not have any commits yet", others fail to resolve HEAD.
+	return strings.Contains(msg, "does not have any commits yet") ||
+		strings.Contains(msg, "does not have any commits") ||
+		strings.Contains(msg, "bad revision 'HEAD'") ||
+		strings.Contains(msg, "unknown revision") ||
+		strings.Contains(msg, "unknown revision or path not in the working tree")
 }

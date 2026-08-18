@@ -1,7 +1,7 @@
 {
   "packages": 1,
   "symbols": 8,
-  "edges": 17,
+  "edges": 13,
   "overview": [
     {
       "Path": "codemap/testdata/embedding",

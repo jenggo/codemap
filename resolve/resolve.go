@@ -8,7 +8,6 @@ import (
 	goimporter "go/importer"
 	"go/token"
 	"go/types"
-	"slices"
 	"sort"
 	"sync"
 )
@@ -28,25 +27,75 @@ type Result struct {
 	Warnings []string
 }
 
+// parseContext precomputes the file-indexed maps shared across package
+// processing in a single pass over the parse result, replacing per-package
+// full-set scans (O(F·P) and pointer-equality scans) with O(F) map lookups.
+type parseContext struct {
+	fset      *token.FileSet
+	files     map[string]*ast.File   // file path -> AST
+	fileToDir map[string]string      // file path -> owning package dir
+	pkgFiles  map[string][]*ast.File // package import path -> AST files
+	pathByAST map[*ast.File]string   // AST pointer -> file path
+}
+
+func newParseContext(pr *parse.Result) *parseContext {
+	ctx := &parseContext{
+		fset:      pr.Fset,
+		files:     pr.Files,
+		fileToDir: make(map[string]string),
+		pkgFiles:  make(map[string][]*ast.File),
+		pathByAST: make(map[*ast.File]string, len(pr.Files)),
+	}
+	for path, af := range pr.Files {
+		ctx.pathByAST[af] = path
+	}
+	for _, pkg := range pr.Packages {
+		for _, f := range pkg.Files {
+			if _, ok := pr.Files[f]; !ok {
+				continue
+			}
+			ctx.fileToDir[f] = pkg.Dir
+			ctx.pkgFiles[pkg.ImportPath] = append(ctx.pkgFiles[pkg.ImportPath], pr.Files[f])
+		}
+	}
+	return ctx
+}
+
 func Run(parseResult *parse.Result) *Result {
 	result := &Result{
 		Packages: parseResult.Packages,
 	}
 
+	// De-duplicate warnings across the whole run so the same concrete type
+	// error never appears more than once.
+	seen := make(map[string]bool)
+	warn := func(msg string) {
+		if seen[msg] {
+			return
+		}
+		seen[msg] = true
+		result.Warnings = append(result.Warnings, msg)
+	}
+
 	imp := newImporter(parseResult)
+	imp.warn = func(pkgPath string, err error) {
+		// Attribute the concrete dependency error to the package being checked
+		// instead of collapsing it into a generic "could not type-check".
+		warn(fmt.Sprintf("%s: %v", pkgPath, err))
+	}
 
 	conf := &types.Config{
 		Importer: imp,
 		Error: func(err error) {
-			result.Warnings = append(result.Warnings, err.Error())
+			warn(err.Error())
 		},
 	}
 
-	pkgFiles := groupFilesByPackage(parseResult)
+	ctx := newParseContext(parseResult)
 
 	var typePackages []*types.Package
 	for _, pkgInfo := range parseResult.Packages {
-		typePkg := processPackage(conf, parseResult, pkgFiles, pkgInfo, result)
+		typePkg := processPackage(conf, ctx, pkgInfo, result, warn)
 		if typePkg != nil {
 			typePackages = append(typePackages, typePkg)
 		}
@@ -142,8 +191,8 @@ func satisfiesInterface(ctorType, ifaceType *types.Named) bool {
 		types.Implements(types.NewPointer(ctorType), iface)
 }
 
-func processPackage(conf *types.Config, parseResult *parse.Result, pkgFiles map[string][]*ast.File, pkgInfo parse.PackageInfo, result *Result) *types.Package {
-	files := pkgFiles[pkgInfo.Dir]
+func processPackage(conf *types.Config, ctx *parseContext, pkgInfo parse.PackageInfo, result *Result, warn func(string)) *types.Package {
+	files := ctx.pkgFiles[pkgInfo.ImportPath]
 	if len(files) == 0 {
 		return nil
 	}
@@ -154,21 +203,18 @@ func processPackage(conf *types.Config, parseResult *parse.Result, pkgFiles map[
 		Defs:       make(map[*ast.Ident]types.Object),
 	}
 
-	typePkg, err := conf.Check(pkgInfo.ImportPath, parseResult.Fset, files, info)
+	typePkg, err := conf.Check(pkgInfo.ImportPath, ctx.fset, files, info)
 	if err != nil {
-		result.Warnings = append(result.Warnings, err.Error())
+		warn(err.Error())
 	}
 
-	fileMap := make(map[string]*ast.File)
+	fileMap := make(map[string]*ast.File, len(files))
 	for _, f := range files {
-		for filePath, astFile := range parseResult.Files {
-			if astFile == f {
-				fileMap[filePath] = astFile
-				break
-			}
+		if path, ok := ctx.pathByAST[f]; ok {
+			fileMap[path] = f
 		}
 	}
-	extResult := extract.Run(pkgInfo.ImportPath, fileMap, parseResult.Fset, pkgInfo.IsTest)
+	extResult := extract.Run(pkgInfo.ImportPath, fileMap, ctx.fset, pkgInfo.IsTest)
 
 	for _, sym := range extResult.Symbols {
 		result.Symbols = append(result.Symbols, ResolvedSymbol{Symbol: sym})
@@ -181,31 +227,12 @@ func processPackage(conf *types.Config, parseResult *parse.Result, pkgFiles map[
 		result.Edges = append(result.Edges, ResolvedEdge{Edge: edge})
 	}
 
-	resolveCallSites(fileMap, parseResult.Fset, info, pkgInfo.ImportPath, result)
-	resolveReferences(fileMap, parseResult.Fset, info, pkgInfo.ImportPath, result)
+	resolveCallSites(fileMap, ctx.fset, info, pkgInfo.ImportPath, result)
+	resolveReferences(fileMap, ctx.fset, info, pkgInfo.ImportPath, result)
 	resolveInterfaceSatisfaction(typePkg, pkgInfo.ImportPath, result)
 	resolveStructEmbedding(typePkg, pkgInfo.ImportPath, result)
 
 	return typePkg
-}
-
-func groupFilesByPackage(pr *parse.Result) map[string][]*ast.File {
-	files := make(map[string][]*ast.File)
-	for filePath, astFile := range pr.Files {
-		dir := ""
-		for _, pkg := range pr.Packages {
-			if slices.Contains(pkg.Files, filePath) {
-				dir = pkg.Dir
-			}
-			if dir != "" {
-				break
-			}
-		}
-		if dir != "" {
-			files[dir] = append(files[dir], astFile)
-		}
-	}
-	return files
 }
 
 func resolveCallSites(files map[string]*ast.File, fset *token.FileSet, info *types.Info, pkgPath string, result *Result) {
@@ -341,14 +368,37 @@ func resolveReferences(files map[string]*ast.File, fset *token.FileSet, info *ty
 	for _, astFile := range files {
 		var currentFunc string
 
+		// Nodes that are the callee of a call expression already produce a
+		// `calls` edge (resolveCallSites runs first). Emitting a `references`
+		// edge for the same expression would double-count the call site in every
+		// edge-based metric, so callee identifiers and selector expressions are
+		// skipped here. Method values (`f := obj.Get`) and non-call selectors
+		// (field access, type references) are not call callees and still emit
+		// `references`. A single pre-order walk suffices because the CallExpr is
+		// visited before its callee children, so the callee set is complete
+		// when the children are reached — the former separate collection pass
+		// is gone (one walk per reference-exposed declaration instead of two).
+		calleeNodes := make(map[ast.Node]bool)
 		ast.Inspect(astFile, func(n ast.Node) bool {
 			switch node := n.(type) {
 			case *ast.FuncDecl:
 				currentFunc = funcDeclName(node, pkgPath)
+			case *ast.CallExpr:
+				switch fun := node.Fun.(type) {
+				case *ast.SelectorExpr:
+					calleeNodes[fun] = true
+					calleeNodes[fun.Sel] = true
+				case *ast.Ident:
+					calleeNodes[fun] = true
+				}
 			case *ast.SelectorExpr:
-				resolveSelectorRef(node, currentFunc, fset, info, result)
+				if !calleeNodes[node] {
+					resolveSelectorRef(node, currentFunc, fset, info, result)
+				}
 			case *ast.Ident:
-				resolveIdentRef(node, currentFunc, fset, info, result)
+				if !calleeNodes[node] {
+					resolveIdentRef(node, currentFunc, fset, info, result)
+				}
 			}
 			return true
 		})
@@ -547,6 +597,11 @@ type importer struct {
 
 	inProgress map[string]bool
 
+	// warn records concrete type-check errors for a project dependency, keyed
+	// by the import path being checked. Nil means "drop" (no-op), matching the
+	// pre-diagnostic behavior.
+	warn func(pkgPath string, err error)
+
 	mu sync.Mutex
 }
 
@@ -597,7 +652,11 @@ func (i *importer) Import(path string) (*types.Package, error) {
 
 	conf := &types.Config{
 		Importer: i,
-		Error:    func(error) {},
+		Error: func(err error) {
+			if i.warn != nil {
+				i.warn(path, err)
+			}
+		},
 	}
 	pkg, _ := conf.Check(path, i.fset, files, nil)
 

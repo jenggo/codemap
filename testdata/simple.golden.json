@@ -1,7 +1,7 @@
 {
   "packages": 1,
   "symbols": 4,
-  "edges": 5,
+  "edges": 4,
   "overview": [
     {
       "Path": "codemap/testdata/simple",

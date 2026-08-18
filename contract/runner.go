@@ -2,6 +2,7 @@ package contract
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"codemap/store"
@@ -47,7 +48,7 @@ func ReanalyzeStaleContracts(st *store.Store, cfg Config) ([]string, error) {
 		}
 		stale, err := st.IsContractStale(repo.ModulePath)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("contract staleness check for %s: %w", repo.ModulePath, err)
 		}
 		if stale {
 			staleRepos = append(staleRepos, repo.ModulePath)
@@ -128,15 +129,15 @@ func buildAnalysis(st *store.Store) (*Analysis, error) {
 }
 
 // extractStringConst extracts the string value from a const signature.
-// e.g., `= "agent_ask"` → "agent_ask"
+// Recognizes `= "agent_ask"`, `"agent_ask"`, and typed forms such as
+// `<Name> <Type> = "agent_ask"` → "agent_ask".
 func extractStringConst(sig string) string {
 	sig = trimSpaces(sig)
 	if len(sig) < 3 {
 		return ""
 	}
-	if sig[0] == '=' {
-		sig = sig[1:]
-		sig = trimSpaces(sig)
+	if eq := strings.Index(sig, "="); eq >= 0 {
+		sig = trimSpaces(sig[eq+1:])
 	}
 	if len(sig) >= 2 && sig[0] == '"' && sig[len(sig)-1] == '"' {
 		return sig[1 : len(sig)-1]
@@ -162,6 +163,7 @@ func trimSpaces(s string) string {
 // edge to high confidence and classifies drift. Structurally identical pairs
 // with no shared constant produce low-confidence suggested edges.
 func extractContracts(analysis *Analysis, now string) ([]store.Contract, []store.DriftReport) {
+	idx := buildAnalysisIndex(analysis)
 	pairs := FindSharedTypeConstants(analysis)
 	contracts := make([]store.Contract, 0, len(pairs))
 	var drifts []store.DriftReport
@@ -199,7 +201,7 @@ func extractContracts(analysis *Analysis, now string) ([]store.Contract, []store
 		contracts = append(contracts, store.Contract{
 			FromRef:    fromRef,
 			ToRef:      toRef,
-			Direction:  InferContractDirection(analysis, fromRef, toRef),
+			Direction:  InferContractDirection(idx, analysis, fromRef, toRef),
 			Confidence: confidence,
 			Severity:   severity,
 			Suggested:  suggested,
@@ -208,14 +210,16 @@ func extractContracts(analysis *Analysis, now string) ([]store.Contract, []store
 		})
 	}
 
-	contracts = append(contracts, suggestedShapePairs(analysis, now)...)
+	contracts = append(contracts, suggestedShapePairs(analysis, idx, now)...)
 
 	return contracts, drifts
 }
 
 // suggestedShapePairs creates low-confidence suggested edges between
-// structurally identical structs across repos that share no type constant.
-func suggestedShapePairs(analysis *Analysis, now string) []store.Contract {
+// structurally identical structs across repos that share no type constant. The
+// pair loop only compares candidates whose field sets share at least one wire
+// name (precomputed), so disjoint structs never run a shape comparison.
+func suggestedShapePairs(analysis *Analysis, idx *analysisIndex, now string) []store.Contract {
 	structs := shapeCandidates(analysis)
 
 	seen := make(map[string]bool)
@@ -231,7 +235,10 @@ func suggestedShapePairs(analysis *Analysis, now string) []store.Contract {
 				continue
 			}
 			seen[key] = true
-			if c, ok := shapeOnlyContract(a, b, analysis, now); ok {
+			if !shareWireField(idx, a, b) {
+				continue
+			}
+			if c, ok := shapeOnlyContract(a, b, idx, now); ok {
 				out = append(out, c)
 			}
 		}
@@ -255,8 +262,8 @@ func shapeCandidates(analysis *Analysis) []StructInfo {
 
 // shapeOnlyContract builds a suggested contract for two structs when they are
 // structurally identical, unrelated by a shared constant, and cross-repo.
-func shapeOnlyContract(a, b StructInfo, analysis *Analysis, now string) (store.Contract, bool) {
-	if haveSharedConstant(analysis, a, b) {
+func shapeOnlyContract(a, b StructInfo, idx *analysisIndex, now string) (store.Contract, bool) {
+	if haveSharedConstantIndex(idx, a, b) {
 		return store.Contract{}, false
 	}
 	comp := CompareStructShapes(a, b)

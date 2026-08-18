@@ -1215,6 +1215,12 @@ func RenderHotspots(hotspots []query.Hotspot, opts ...Option) string {
 			fmt.Fprintf(&b, "   risk: %.2f  complexity: %d  churn: %d\n", h.RiskScore, h.Complexity, h.ChurnCount)
 			fmt.Fprintf(&b, "   pos: %s:%d\n\n", h.PosFile, h.PosLine)
 		}
+		for _, h := range hotspots {
+			if h.ChurnError != "" {
+				fmt.Fprintf(&b, "note: churn data degraded — %s\n", h.ChurnError)
+				break
+			}
+		}
 		return b.String()
 	default:
 		return renderHotspotsTOON(hotspots)

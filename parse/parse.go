@@ -211,18 +211,13 @@ func processWorkspaceDir(result *Result, dir, moduleRoot, modulePath string) err
 		importPath = modulePath + "/" + rel
 	}
 
-	files := make([]string, 0, len(bpkg.GoFiles)+len(bpkg.CgoFiles))
+	files := make([]string, 0, len(bpkg.GoFiles)+len(bpkg.CgoFiles)+len(bpkg.TestGoFiles))
 	files = append(files, bpkg.GoFiles...)
 	files = append(files, bpkg.CgoFiles...)
-	testFiles := bpkg.TestGoFiles
+	files = append(files, bpkg.TestGoFiles...)
+	externalTestFiles := bpkg.XTestGoFiles
 
-	isTest := len(testFiles) > 0 && len(files) == 0
-
-	allFiles := make([]string, 0, len(files)+len(testFiles))
-	allFiles = append(allFiles, files...)
-	allFiles = append(allFiles, testFiles...)
-
-	if len(allFiles) == 0 {
+	if len(files) == 0 && len(externalTestFiles) == 0 {
 		return nil
 	}
 
@@ -230,18 +225,18 @@ func processWorkspaceDir(result *Result, dir, moduleRoot, modulePath string) err
 		ImportPath: importPath,
 		Name:       bpkg.Name,
 		Dir:        dir,
-		IsTest:     isTest,
+		IsTest:     len(bpkg.GoFiles)+len(bpkg.CgoFiles) == 0,
 		ModulePath: modulePath,
 	}
 
-	parseFilesInto(result, &pkgInfo, allFiles, dir)
+	parseFilesInto(result, &pkgInfo, files, dir)
 
 	if len(pkgInfo.Files) > 0 {
 		result.Packages = append(result.Packages, pkgInfo)
 	}
 
-	if len(testFiles) > 0 && !isTest {
-		processTestFilesWorkspace(result, dir, importPath, bpkg.Name, testFiles, modulePath)
+	if len(externalTestFiles) > 0 {
+		processTestFilesWorkspace(result, dir, importPath, bpkg.Name, externalTestFiles, modulePath, nil)
 	}
 
 	return nil
@@ -268,7 +263,7 @@ func parseFilesInto(result *Result, pkgInfo *PackageInfo, files []string, dir st
 	}
 }
 
-func processTestFilesWorkspace(result *Result, dir, importPath, pkgName string, testFiles []string, modulePath string) {
+func processTestFilesWorkspace(result *Result, dir, importPath, pkgName string, externalTestFiles []string, modulePath string, seen map[string]bool) {
 	testPkgInfo := PackageInfo{
 		ImportPath: importPath + "_test",
 		Name:       pkgName + "_test",
@@ -276,7 +271,7 @@ func processTestFilesWorkspace(result *Result, dir, importPath, pkgName string, 
 		IsTest:     true,
 		ModulePath: modulePath,
 	}
-	for _, f := range testFiles {
+	for _, f := range externalTestFiles {
 		fullPath := filepath.Join(dir, f)
 		if _, exists := result.Files[fullPath]; exists {
 			continue
@@ -293,7 +288,12 @@ func processTestFilesWorkspace(result *Result, dir, importPath, pkgName string, 
 		testPkgInfo.Files = append(testPkgInfo.Files, fullPath)
 	}
 	if len(testPkgInfo.Files) > 0 {
-		result.Packages = append(result.Packages, testPkgInfo)
+		if seen == nil || !seen[testPkgInfo.ImportPath] {
+			result.Packages = append(result.Packages, testPkgInfo)
+			if seen != nil {
+				seen[testPkgInfo.ImportPath] = true
+			}
+		}
 	}
 }
 
@@ -337,20 +337,12 @@ func goListInto(result *Result, abs, modulePath string, seen map[string]bool) er
 }
 
 func addGoListPkgInto(result *Result, p goListPkg, modulePath string, seen map[string]bool) {
-	files := make([]string, 0, len(p.GoFiles)+len(p.CgoFiles))
+	files := make([]string, 0, len(p.GoFiles)+len(p.CgoFiles)+len(p.TestGoFiles))
 	files = append(files, p.GoFiles...)
 	files = append(files, p.CgoFiles...)
-	testFiles := make([]string, 0, len(p.TestGoFiles)+len(p.XTestGoFiles))
-	testFiles = append(testFiles, p.TestGoFiles...)
-	testFiles = append(testFiles, p.XTestGoFiles...)
+	files = append(files, p.TestGoFiles...)
 
-	isTest := len(testFiles) > 0 && len(files) == 0
-
-	allFiles := make([]string, 0, len(files)+len(testFiles))
-	allFiles = append(allFiles, files...)
-	allFiles = append(allFiles, testFiles...)
-
-	if len(allFiles) == 0 {
+	if len(files) == 0 && len(p.XTestGoFiles) == 0 {
 		return
 	}
 
@@ -358,11 +350,11 @@ func addGoListPkgInto(result *Result, p goListPkg, modulePath string, seen map[s
 		ImportPath: p.ImportPath,
 		Name:       p.Name,
 		Dir:        p.Dir,
-		IsTest:     isTest,
+		IsTest:     len(p.GoFiles)+len(p.CgoFiles) == 0,
 		ModulePath: modulePath,
 	}
 
-	for _, f := range allFiles {
+	for _, f := range files {
 		fullPath := filepath.Join(p.Dir, f)
 		if _, exists := result.Files[fullPath]; exists {
 			continue
@@ -386,8 +378,8 @@ func addGoListPkgInto(result *Result, p goListPkg, modulePath string, seen map[s
 		}
 	}
 
-	if len(testFiles) > 0 && !isTest {
-		processTestFilesWorkspace(result, p.Dir, p.ImportPath, p.Name, testFiles, modulePath)
+	if len(p.XTestGoFiles) > 0 {
+		processTestFilesWorkspace(result, p.Dir, p.ImportPath, p.Name, p.XTestGoFiles, modulePath, seen)
 	}
 }
 
@@ -438,20 +430,12 @@ func goList(abs string) (*Result, error) {
 }
 
 func addGoListPkg(result *Result, p goListPkg) {
-	files := make([]string, 0, len(p.GoFiles)+len(p.CgoFiles))
+	files := make([]string, 0, len(p.GoFiles)+len(p.CgoFiles)+len(p.TestGoFiles))
 	files = append(files, p.GoFiles...)
 	files = append(files, p.CgoFiles...)
-	testFiles := make([]string, 0, len(p.TestGoFiles)+len(p.XTestGoFiles))
-	testFiles = append(testFiles, p.TestGoFiles...)
-	testFiles = append(testFiles, p.XTestGoFiles...)
+	files = append(files, p.TestGoFiles...)
 
-	isTest := len(testFiles) > 0 && len(files) == 0
-
-	allFiles := make([]string, 0, len(files)+len(testFiles))
-	allFiles = append(allFiles, files...)
-	allFiles = append(allFiles, testFiles...)
-
-	if len(allFiles) == 0 {
+	if len(files) == 0 && len(p.XTestGoFiles) == 0 {
 		return
 	}
 
@@ -459,10 +443,10 @@ func addGoListPkg(result *Result, p goListPkg) {
 		ImportPath: p.ImportPath,
 		Name:       p.Name,
 		Dir:        p.Dir,
-		IsTest:     isTest,
+		IsTest:     len(p.GoFiles)+len(p.CgoFiles) == 0,
 	}
 
-	for _, f := range allFiles {
+	for _, f := range files {
 		fullPath := filepath.Join(p.Dir, f)
 		astFile, err := parser.ParseFile(result.Fset, fullPath, nil, parser.ParseComments)
 		if err != nil {
@@ -480,8 +464,8 @@ func addGoListPkg(result *Result, p goListPkg) {
 		result.Packages = append(result.Packages, pkgInfo)
 	}
 
-	if len(testFiles) > 0 && !isTest {
-		processTestFiles(result, p.Dir, p.ImportPath, p.Name, testFiles)
+	if len(p.XTestGoFiles) > 0 {
+		processTestFiles(result, p.Dir, p.ImportPath, p.Name, p.XTestGoFiles)
 	}
 }
 
@@ -531,18 +515,13 @@ func processDir(result *Result, dir string) error {
 		}
 	}
 
-	files := make([]string, 0, len(bpkg.GoFiles)+len(bpkg.CgoFiles))
+	files := make([]string, 0, len(bpkg.GoFiles)+len(bpkg.CgoFiles)+len(bpkg.TestGoFiles))
 	files = append(files, bpkg.GoFiles...)
 	files = append(files, bpkg.CgoFiles...)
-	testFiles := bpkg.TestGoFiles
+	files = append(files, bpkg.TestGoFiles...)
+	externalTestFiles := bpkg.XTestGoFiles
 
-	isTest := len(testFiles) > 0 && len(files) == 0
-
-	allFiles := make([]string, 0, len(files)+len(testFiles))
-	allFiles = append(allFiles, files...)
-	allFiles = append(allFiles, testFiles...)
-
-	if len(allFiles) == 0 {
+	if len(files) == 0 && len(externalTestFiles) == 0 {
 		return nil
 	}
 
@@ -550,10 +529,10 @@ func processDir(result *Result, dir string) error {
 		ImportPath: importPath,
 		Name:       bpkg.Name,
 		Dir:        dir,
-		IsTest:     isTest,
+		IsTest:     len(bpkg.GoFiles)+len(bpkg.CgoFiles) == 0,
 	}
 
-	for _, f := range allFiles {
+	for _, f := range files {
 		fullPath := filepath.Join(dir, f)
 		astFile, err := parser.ParseFile(result.Fset, fullPath, nil, parser.ParseComments)
 		if err != nil {
@@ -571,21 +550,21 @@ func processDir(result *Result, dir string) error {
 		result.Packages = append(result.Packages, pkgInfo)
 	}
 
-	if len(testFiles) > 0 && !isTest {
-		processTestFiles(result, dir, importPath, bpkg.Name, testFiles)
+	if len(externalTestFiles) > 0 {
+		processTestFiles(result, dir, importPath, bpkg.Name, externalTestFiles)
 	}
 
 	return nil
 }
 
-func processTestFiles(result *Result, dir, importPath, pkgName string, testFiles []string) {
+func processTestFiles(result *Result, dir, importPath, pkgName string, externalTestFiles []string) {
 	testPkgInfo := PackageInfo{
 		ImportPath: importPath + "_test",
 		Name:       pkgName + "_test",
 		Dir:        dir,
 		IsTest:     true,
 	}
-	for _, f := range testFiles {
+	for _, f := range externalTestFiles {
 		fullPath := filepath.Join(dir, f)
 		if _, exists := result.Files[fullPath]; exists {
 			continue

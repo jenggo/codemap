@@ -1,5 +1,8 @@
 package types
 
+import "github.com/redis/go-redis/v9"
+
+// redisClient is satisfied by go-redis in the real workspace.
 type redisClient interface {
 	Set(key string, value any) error
 }
@@ -13,3 +16,5 @@ func TrackSize(rdb redisClient) error {
 func LogLine() string {
 	return "stored krucil_size:99"
 }
+
+var _ = redis.Options{}

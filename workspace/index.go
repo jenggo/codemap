@@ -1,6 +1,7 @@
 package workspace
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -43,7 +44,7 @@ func IndexAll(cfg *Config, dbPath string) ([]IndexSummary, error) {
 	}
 
 	resolveResult := resolve.Run(parseResult)
-	churn := mergedChurn(cfg.Existing())
+	churn, churnErr := mergedChurn(cfg.Existing())
 
 	s, err := store.Create(dbPath)
 	if err != nil {
@@ -60,6 +61,10 @@ func IndexAll(cfg *Config, dbPath string) ([]IndexSummary, error) {
 		if err := s.SetRepoIndexedAt(m.Module, now); err != nil {
 			return nil, fmt.Errorf("set indexed_at for %s: %w", m.Module, err)
 		}
+		s.RecordDirtyFingerprint(m.Dir, m.Module)
+	}
+	if err := s.SetChurnDegraded(churnReason(churnErr)); err != nil {
+		return nil, fmt.Errorf("set churn degradation: %w", err)
 	}
 	for _, m := range cfg.Members {
 		if m.Missing {
@@ -87,12 +92,16 @@ func ReindexRepo(dbPath, modulePath, dir string) (*IndexSummary, error) {
 	}
 	defer func() { _ = s.Close() }()
 
-	churn, _ := vcs.GitFileChurn(dir, "HEAD")
+	churn, churnErr := vcs.GitFileChurn(dir, "HEAD")
 	if err := s.ReplaceRepo(resolveResult, parse.FileContents(parseResult), churn, modulePath); err != nil {
 		return nil, fmt.Errorf("replace repo %s: %w", modulePath, err)
 	}
 	if err := s.SetRepoIndexedAt(modulePath, time.Now()); err != nil {
 		return nil, err
+	}
+	s.RecordDirtyFingerprint(dir, modulePath)
+	if err := s.SetChurnDegraded(churnReason(churnErr)); err != nil {
+		return nil, fmt.Errorf("set churn degradation: %w", err)
 	}
 	return &IndexSummary{
 		Repo:     modulePath,
@@ -119,26 +128,31 @@ func ReindexStale(dbPath string) ([]string, error) {
 	}
 
 	var reindexed []string
+	var errs []error
 	for _, r := range repos {
 		if r.Missing {
 			continue
 		}
 		if _, err := os.Stat(r.Dir); os.IsNotExist(err) {
-			_ = s.SetRepoMissing(r.ModulePath, true)
+			if merr := s.SetRepoMissing(r.ModulePath, true); merr != nil {
+				errs = append(errs, fmt.Errorf("mark %s missing: %w", r.ModulePath, merr))
+			}
 			continue
 		}
 		stale, err := s.IsRepoStale(r.ModulePath)
 		if err != nil {
+			errs = append(errs, fmt.Errorf("staleness check for %s: %w", r.ModulePath, err))
 			continue
 		}
 		if stale {
 			if _, err := ReindexRepo(dbPath, r.ModulePath, r.Dir); err != nil {
-				return reindexed, fmt.Errorf("reindexing %s: %w", r.ModulePath, err)
+				errs = append(errs, fmt.Errorf("reindexing %s: %w", r.ModulePath, err))
+				continue
 			}
 			reindexed = append(reindexed, r.ModulePath)
 		}
 	}
-	return reindexed, nil
+	return reindexed, errors.Join(errs...)
 }
 
 func buildSummaries(cfg *Config, result *resolve.Result) []IndexSummary {
@@ -190,18 +204,33 @@ func hasPrefix(s, module string) bool {
 }
 
 // mergedChurn combines git churn (per-file commit counts) across all member
-// checkouts.
-func mergedChurn(members []Member) map[string]int {
+// checkouts. It returns the first non-benign failure (anything but an empty
+// repo) so callers can record degraded churn instead of pretending the data
+// exists.
+func mergedChurn(members []Member) (map[string]int, error) {
 	out := make(map[string]int)
+	var firstErr error
 	for _, m := range members {
 		churn, err := vcs.GitFileChurn(m.Dir, "HEAD")
 		if err != nil {
+			if !errors.Is(err, vcs.ErrNoCommits) && firstErr == nil {
+				firstErr = fmt.Errorf("git churn for %s: %w", m.Module, err)
+			}
 			continue
 		}
 		maps.Copy(out, churn)
 	}
 	if len(out) == 0 {
-		return nil
+		return nil, firstErr
 	}
-	return out
+	return out, firstErr
+}
+
+// churnReason converts a churn-gathering failure into the reason stored for
+// degraded-churn reporting; benign empty repos produce "" (no degradation).
+func churnReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	return "git churn unavailable: " + err.Error()
 }

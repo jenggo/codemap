@@ -1,7 +1,7 @@
 {
   "packages": 1,
   "symbols": 6,
-  "edges": 19,
+  "edges": 14,
   "overview": [
     {
       "Path": "codemap/testdata/interfaces",

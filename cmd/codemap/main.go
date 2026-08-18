@@ -278,7 +278,7 @@ func dispatchQueryCommand(cmd string, args []string, dbPath string, flags parsed
 	case "hotspots":
 		cmdHotspots(dbPath, renderOpts)
 	case "importance":
-		cmdImportance(dbPath, renderOpts)
+		cmdImportance(dbPath, queryOpts, renderOpts)
 	default:
 		return dispatchDataCommand(cmd, dbPath, flags)
 	}
@@ -343,7 +343,7 @@ func cmdIndex(path, dbPath string, workspace, discover bool) {
 	}
 	defer func() { _ = s.Close() }()
 
-	churn, _ := vcs.GitFileChurn(absPath, "HEAD")
+	churn, churnErr := vcs.GitFileChurn(absPath, "HEAD")
 
 	if err := s.Write(resolveResult, parse.FileContents(parseResult), churn); err != nil {
 		fmt.Fprintf(os.Stderr, "Write error: %v\n", err)
@@ -358,6 +358,11 @@ func cmdIndex(path, dbPath string, workspace, discover bool) {
 	head, _ := vcs.GitHead(absPath)
 	if err := s.SetRepoMeta(absPath, head, len(resolveResult.Packages), len(resolveResult.Symbols)); err != nil {
 		fmt.Fprintf(os.Stderr, "Set repo meta error: %v\n", err)
+		return
+	}
+	s.RecordDirtyFingerprint(absPath, "")
+	if err := s.RecordChurnDegradation(churnErr); err != nil {
+		fmt.Fprintf(os.Stderr, "Set churn degradation error: %v\n", err)
 		return
 	}
 
@@ -446,18 +451,36 @@ func indexWorkspace(cfg *workspace.Config, dbPath string) error {
 			return err
 		}
 		defer func() { _ = st.Close() }()
+		if err := analyzeWorkspaceContracts(st, cfg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
-		cCfg := cfg.ContractConfig()
-		for _, p := range cfg.ContractSuppressionPairs() {
-			if err := st.SuppressContracts(p[0], p[1]); err != nil {
-				return err
-			}
+// analyzeWorkspaceContracts builds the contract config (validated), applies
+// declared suppressions, and refreshes stale contract analysis.
+func analyzeWorkspaceContracts(st *store.Store, cfg *workspace.Config) error {
+	cCfg, ccfgErr := cfg.ContractConfig()
+	if ccfgErr != nil {
+		return fmt.Errorf("contract config: %w", ccfgErr)
+	}
+	for _, w := range cCfg.Warnings {
+		fmt.Printf("warning: %s\n", w)
+	}
+	suppressPairs, pairsErr := cfg.ContractSuppressionPairs()
+	if pairsErr != nil {
+		return fmt.Errorf("contract suppression: %w", pairsErr)
+	}
+	for _, p := range suppressPairs {
+		if err := st.SuppressContracts(p[0], p[1]); err != nil {
+			return err
 		}
-		if reanalyzed, err := contract.ReanalyzeStaleContracts(st, cCfg); err != nil {
-			return fmt.Errorf("contract analysis: %w", err)
-		} else if len(reanalyzed) > 0 {
-			fmt.Printf("contract analysis refreshed for %d repo(s)\n", len(reanalyzed))
-		}
+	}
+	if reanalyzed, err := contract.ReanalyzeStaleContracts(st, cCfg); err != nil {
+		return fmt.Errorf("contract analysis: %w", err)
+	} else if len(reanalyzed) > 0 {
+		fmt.Printf("contract analysis refreshed for %d repo(s)\n", len(reanalyzed))
 	}
 	return nil
 }
@@ -820,7 +843,7 @@ func cmdHotspots(dbPath string, rOpts []render.Option) {
 	fmt.Print(render.RenderHotspots(hotspots, rOpts...))
 }
 
-func cmdImportance(dbPath string, rOpts []render.Option) {
+func cmdImportance(dbPath string, qOpts []query.Option, rOpts []render.Option) {
 	s, err := store.Open(dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -833,7 +856,7 @@ func cmdImportance(dbPath string, rOpts []render.Option) {
 	if topN <= 0 {
 		topN = 10
 	}
-	entries, err := query.SymbolImportance(s, topN, 0)
+	entries, err := query.SymbolImportance(s, topN, 0, qOpts...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return

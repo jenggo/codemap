@@ -18,6 +18,7 @@ func TestSymbolSpan(t *testing.T) {
 	tests := []struct {
 		name          string
 		posLine       int
+		receiver      string
 		qn            string
 		kind          string
 		wantSubstr    string
@@ -37,6 +38,7 @@ func TestSymbolSpan(t *testing.T) {
 		{
 			name:          "method on generic receiver",
 			posLine:       28,
+			receiver:      "Server",
 			qn:            "Get",
 			kind:          "method",
 			wantSubstr:    "func (s *Server[T]) Get() T {",
@@ -94,7 +96,7 @@ func TestSymbolSpan(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			start, end, docOff, grouped, members, err := symbolSpan(file, tc.posLine, tc.qn, tc.kind)
+			start, end, docOff, grouped, members, err := symbolSpan(file, tc.posLine, tc.receiver, tc.qn, tc.kind)
 			if err != nil {
 				t.Fatalf("symbolSpan: %v", err)
 			}
@@ -121,14 +123,98 @@ func TestSymbolSpan(t *testing.T) {
 func TestSymbolSpanNotFound(t *testing.T) {
 	abs, _ := filepath.Abs("../testdata/generics")
 	file := filepath.Join(abs, "generics.go")
-	_, _, _, _, _, err := symbolSpan(file, 1, "NonExistent", "function")
+	_, _, _, _, _, err := symbolSpan(file, 1, "", "NonExistent", "function")
 	if err == nil {
 		t.Fatal("expected error for non-existent symbol")
 	}
 }
 
+// TestSymbolSpanStaleLineFallback simulates a stale index: the recorded line
+// no longer matches the current file, so symbolSpan must re-locate the symbol
+// by name (top-level decls) and by receiver (methods) instead of failing.
+func TestSymbolSpanStaleLineFallback(t *testing.T) {
+	abs, err := filepath.Abs("../testdata/generics")
+	if err != nil {
+		t.Fatalf("abs path: %v", err)
+	}
+	file := filepath.Join(abs, "generics.go")
+
+	tests := []struct {
+		name       string
+		receiver   string
+		qn         string
+		kind       string
+		wantSubstr string
+		wantErr    bool
+	}{
+		{
+			name:       "function by name",
+			receiver:   "",
+			qn:         "PlainFunc",
+			kind:       "function",
+			wantSubstr: "func PlainFunc(x int) int {",
+		},
+		{
+			name:       "method by receiver",
+			receiver:   "Server",
+			qn:         "Get",
+			kind:       "method",
+			wantSubstr: "func (s *Server[T]) Get() T {",
+		},
+		{
+			name:       "second method disambiguation",
+			receiver:   "Server",
+			qn:         "Set",
+			kind:       "method",
+			wantSubstr: "func (s *Server[T]) Set(v T) {",
+		},
+		{
+			name:       "wrong receiver does not match",
+			receiver:   "Other",
+			qn:         "Get",
+			kind:       "method",
+			wantErr:    true,
+			wantSubstr: "",
+		},
+		{
+			name:       "type by name",
+			receiver:   "",
+			qn:         "Server",
+			kind:       "type",
+			wantSubstr: "type Server[T any] struct {",
+		},
+		{
+			name:       "const by name",
+			receiver:   "",
+			qn:         "Answer",
+			kind:       "const",
+			wantSubstr: "const Answer = 42",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			start, end, _, _, _, err := symbolSpan(file, 9999, tc.receiver, tc.qn, tc.kind)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %s (receiver=%s)", tc.qn, tc.receiver)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("symbolSpan fallback: %v", err)
+			}
+			data := readFile(t, file)
+			body := string(data[start:end])
+			if !strings.Contains(body, tc.wantSubstr) {
+				t.Errorf("body does not contain %q\nbody: %s", tc.wantSubstr, body)
+			}
+		})
+	}
+}
+
 func TestSymbolSpanFileMissing(t *testing.T) {
-	_, _, _, _, _, err := symbolSpan("/nonexistent/file.go", 1, "X", "function")
+	_, _, _, _, _, err := symbolSpan("/nonexistent/file.go", 1, "", "X", "function")
 	if err == nil {
 		t.Fatal("expected error for missing file")
 	}
@@ -138,7 +224,7 @@ func TestSymbolSpanInterfaceType(t *testing.T) {
 	abs, _ := filepath.Abs("../testdata/interfaces")
 	file := filepath.Join(abs, "interfaces.go")
 	data := readFile(t, file)
-	start, end, _, _, _, err := symbolSpan(file, 4, "Reader", "type")
+	start, end, _, _, _, err := symbolSpan(file, 4, "", "Reader", "type")
 	if err != nil {
 		t.Fatalf("symbolSpan: %v", err)
 	}

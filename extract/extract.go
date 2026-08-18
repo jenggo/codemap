@@ -85,17 +85,61 @@ func (e *fileExtractor) extract() {
 		}
 	}
 
-	for _, decl := range e.astFile.Decls {
-		switch d := decl.(type) {
+	// One pre-order walk extracts every symbol and computes each function's
+	// cyclomatic complexity inline, eliminating the former per-function
+	// ast.Inspect (one extra walk per function, an O(functions x body) cost).
+	var curFd *ast.FuncDecl
+	var curCount *int
+	type pendingComplexity struct {
+		count *int
+		idx   int
+	}
+	var pending []pendingComplexity
+
+	ast.Inspect(e.astFile, func(n ast.Node) bool {
+		switch node := n.(type) {
 		case *ast.FuncDecl:
-			e.extractFuncDecl(d)
+			sym := e.symbolForFuncDecl(node)
+			idx := len(e.result.Symbols)
+			e.result.Symbols = append(e.result.Symbols, sym)
+			count := 1
+			curFd = node
+			curCount = &count
+			pending = append(pending, pendingComplexity{idx: idx, count: &count})
 		case *ast.GenDecl:
-			e.extractGenDecl(d)
+			e.extractGenDecl(node)
+		case *ast.IfStmt, *ast.ForStmt, *ast.RangeStmt, *ast.CaseClause:
+			if inFunctionBody(node, curFd) && curCount != nil {
+				*curCount++
+			}
+		case *ast.BinaryExpr:
+			if (node.Op == token.LAND || node.Op == token.LOR) && inFunctionBody(node, curFd) && curCount != nil {
+				*curCount++
+			}
 		}
+		return true
+	})
+
+	for _, p := range pending {
+		e.result.Symbols[p.idx].Complexity = *p.count
 	}
 }
 
-func (e *fileExtractor) extractFuncDecl(fd *ast.FuncDecl) {
+// inFunctionBody reports whether n lies within the current function's body
+// span. A node that appears after the body in the file (a package-scope
+// func literal following a declared function, say) still must not count toward
+// the function's complexity, so the range check is required rather than
+// assuming the last FuncDecl owns every later node.
+func inFunctionBody(n ast.Node, fd *ast.FuncDecl) bool {
+	if fd == nil || fd.Body == nil {
+		return false
+	}
+	return n.Pos() >= fd.Body.Pos() && n.End() <= fd.Body.End()
+}
+
+// symbolForFuncDecl builds the symbol describing a function or method
+// declaration. Complexity is patched after the enclosing walk completes.
+func (e *fileExtractor) symbolForFuncDecl(fd *ast.FuncDecl) Symbol {
 	kind := "function"
 	receiver := ""
 	qualifiedName := e.pkgPath + "." + fd.Name.Name
@@ -107,14 +151,13 @@ func (e *fileExtractor) extractFuncDecl(fd *ast.FuncDecl) {
 	}
 
 	pos := e.fset.Position(fd.Pos())
-	sig := signatureString(fd.Type)
 
-	e.result.Symbols = append(e.result.Symbols, Symbol{
+	return Symbol{
 		QualifiedName: qualifiedName,
 		Name:          fd.Name.Name,
 		Kind:          kind,
 		Receiver:      receiver,
-		Signature:     sig,
+		Signature:     signatureString(fd.Type),
 		Doc:           docString(fd.Doc),
 		Pos: Position{
 			File: pos.Filename,
@@ -122,8 +165,8 @@ func (e *fileExtractor) extractFuncDecl(fd *ast.FuncDecl) {
 		},
 		Exported:   fd.Name.IsExported(),
 		IsTest:     e.isTest,
-		Complexity: computeComplexity(fd),
-	})
+		Complexity: 1,
+	}
 }
 
 func (e *fileExtractor) extractGenDecl(gd *ast.GenDecl) {
@@ -411,27 +454,4 @@ func docString(doc *ast.CommentGroup) string {
 		return ""
 	}
 	return doc.Text()
-}
-
-func computeComplexity(fn *ast.FuncDecl) int {
-	if fn.Body == nil {
-		return 1
-	}
-	c := 1
-	ast.Inspect(fn.Body, func(n ast.Node) bool {
-		switch node := n.(type) {
-		case *ast.IfStmt:
-			c++
-		case *ast.ForStmt, *ast.RangeStmt:
-			c++
-		case *ast.CaseClause:
-			c++
-		case *ast.BinaryExpr:
-			if node.Op == token.LAND || node.Op == token.LOR {
-				c++
-			}
-		}
-		return true
-	})
-	return c
 }

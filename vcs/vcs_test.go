@@ -2,6 +2,7 @@ package vcs
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -192,11 +193,21 @@ func TestGitFileChurn(t *testing.T) {
 
 func TestGitFileChurnNonGit(t *testing.T) {
 	dir := t.TempDir()
-	churn, err := GitFileChurn(dir, "HEAD")
-	if err != nil {
-		t.Fatalf("GitFileChurn should not error for non-git dir: %v", err)
+	_, err := GitFileChurn(dir, "HEAD")
+	if err == nil {
+		t.Fatal("expected an error for a non-git directory, not silently empty churn")
 	}
-	if len(churn) != 0 {
-		t.Errorf("expected empty churn map, got %v", churn)
+}
+
+func TestGitFileChurnNoCommits(t *testing.T) {
+	repo := t.TempDir()
+	runGitIn(t, repo, "init", "-q")
+	runGitIn(t, repo, "config", "user.email", "test@example.com")
+	runGitIn(t, repo, "config", "user.name", "Test")
+	writeFile(t, filepath.Join(repo, "a.go"), "package a\n")
+
+	_, err := GitFileChurn(repo, "HEAD")
+	if !errors.Is(err, ErrNoCommits) {
+		t.Fatalf("expected ErrNoCommits for a repo with no commits, got: %v", err)
 	}
 }

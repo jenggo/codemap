@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	sqlite "modernc.org/sqlite"
 
@@ -58,7 +59,23 @@ func init() {
 	)
 }
 
-const schemaVersion = 2
+// parenReceiverRe matches a Go-style receiver wrapper in a qualified name,
+// e.g. "pkg/path.(*Type).Method" or "pkg/path.(Type).Method", and is used by
+// NormalizeQualifiedName to reduce it to the indexed form "pkg/path.Type.Method".
+var parenReceiverRe = regexp.MustCompile(`\.\((?:\*?)([^()]+)\)\.`)
+
+// NormalizeQualifiedName reduces a qualified name that may carry a Go-style
+// receiver wrapper ("pkg/path.(*Type).Method", "pkg/path.(Type).Method") to the
+// form stored in the index ("pkg/path.Type.Method"). Names already in the
+// indexed form are returned unchanged, so the call is idempotent.
+func NormalizeQualifiedName(qn string) string {
+	if !strings.Contains(qn, "(") {
+		return qn
+	}
+	return parenReceiverRe.ReplaceAllString(qn, ".$1.")
+}
+
+const schemaVersion = 3
 
 const schemaSQL = `
 CREATE TABLE IF NOT EXISTS repos (
@@ -105,6 +122,7 @@ CREATE TABLE IF NOT EXISTS edges (
     edge_type   TEXT    NOT NULL,
     pos_file    TEXT    NOT NULL,
     pos_line    INTEGER NOT NULL,
+    sites       TEXT    NOT NULL DEFAULT '[]',
     repo_id     INTEGER REFERENCES repos(id)
 );
 
@@ -118,10 +136,12 @@ CREATE INDEX IF NOT EXISTS idx_symbols_package   ON symbols(package_id);
 CREATE INDEX IF NOT EXISTS idx_symbols_qualified  ON symbols(qualified_name);
 CREATE INDEX IF NOT EXISTS idx_symbols_kind        ON symbols(kind);
 CREATE INDEX IF NOT EXISTS idx_symbols_repo        ON symbols(repo_id);
+CREATE INDEX IF NOT EXISTS idx_symbols_pos_file    ON symbols(pos_file);
 CREATE INDEX IF NOT EXISTS idx_edges_from          ON edges(from_ref);
 CREATE INDEX IF NOT EXISTS idx_edges_to_ref        ON edges(to_ref);
 CREATE INDEX IF NOT EXISTS idx_edges_type          ON edges(edge_type);
 CREATE INDEX IF NOT EXISTS idx_edges_repo          ON edges(repo_id);
+CREATE UNIQUE INDEX IF NOT EXISTS edges_pair       ON edges(COALESCE(repo_id, 0), from_ref, to_ref, edge_type);
 CREATE INDEX IF NOT EXISTS idx_packages_repo       ON packages(repo_id);
 
 CREATE TABLE IF NOT EXISTS contracts (
@@ -211,6 +231,11 @@ const orderByQualifiedName = " ORDER BY s.qualified_name"
 
 type Store struct {
 	db *sql.DB
+
+	// testHook, when set, is invoked at named points in the write path.
+	// Returning a non-nil error aborts the enclosing transaction. Test-only
+	// fault-injection seam for simulating failures at each write stage.
+	testHook func(stage, key string) error
 }
 
 func DefaultPath() string {
@@ -301,7 +326,11 @@ func ensureSchema(db *sql.DB) error {
 		{"edges", repoIDCol, repoColumnDecl},
 		{"files", repoIDCol, repoColumnDecl},
 	} {
-		if !columnExists(db, tc.table, tc.column) {
+		hasCol, err := columnExists(db, tc.table, tc.column)
+		if err != nil {
+			return fmt.Errorf("ensure schema: inspect %s.%s: %w", tc.table, tc.column, err)
+		}
+		if !hasCol {
 			if _, err := db.ExecContext(ctx, "ALTER TABLE "+tc.table+" ADD COLUMN "+tc.column+" "+tc.decl); err != nil {
 				return err
 			}
@@ -309,14 +338,35 @@ func ensureSchema(db *sql.DB) error {
 	}
 
 	// Struct field info for contract shape matching (additive).
-	if !columnExists(db, "symbols", "fields_json") {
+	hasFields, err := columnExists(db, "symbols", "fields_json")
+	if err != nil {
+		return fmt.Errorf("ensure schema: inspect symbols.fields_json: %w", err)
+	}
+	if !hasFields {
 		if _, err := db.ExecContext(ctx, `ALTER TABLE symbols ADD COLUMN fields_json TEXT`); err != nil {
 			return err
 		}
 	}
 
+	// Edge deduplication: the edges table gains a sites column aggregating the
+	// distinct occurrence locations per unique (repo_id, from_ref, to_ref,
+	// edge_type) pair. Existing databases may already contain duplicate rows;
+	// collapse them (keeping the first row per pair, MIN(rowid)) before the
+	// unique index is built, or the index creation would fail.
+	if err := migrateEdgesDedup(db); err != nil {
+		return err
+	}
+
 	if _, err := db.ExecContext(ctx, `INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)`, strconv.Itoa(schemaVersion)); err != nil {
 		return err
+	}
+
+	// Churn application looks symbols up by pos_file; older databases lack the
+	// index and would fall back to full-table scans per update.
+	if !indexExists(db, "idx_symbols_pos_file") {
+		if _, err := db.ExecContext(ctx, `CREATE INDEX idx_symbols_pos_file ON symbols(pos_file)`); err != nil {
+			return err
+		}
 	}
 
 	return ensureContractTables(db)
@@ -419,6 +469,36 @@ var contractTables = []schemaTable{
 	},
 }
 
+// migrateEdgesDedup upgrades the edges table to the deduplicated schema: it adds
+// the aggregate `sites` column and, when the unique pair index is missing,
+// collapses duplicate rows first so the index build can succeed.
+func migrateEdgesDedup(db *sql.DB) error {
+	ctx := context.Background()
+	hasSites, err := columnExists(db, "edges", "sites")
+	if err != nil {
+		return fmt.Errorf("migrate edges dedup: inspect edges.sites: %w", err)
+	}
+	if !hasSites {
+		if _, err := db.ExecContext(ctx, `ALTER TABLE edges ADD COLUMN sites TEXT NOT NULL DEFAULT '[]'`); err != nil {
+			return err
+		}
+	}
+	if indexExists(db, "edges_pair") {
+		return nil
+	}
+	if _, err := db.ExecContext(ctx, `
+		DELETE FROM edges
+		WHERE rowid NOT IN (
+			SELECT MIN(rowid)
+			FROM edges
+			GROUP BY COALESCE(repo_id, 0), from_ref, to_ref, edge_type
+		)`); err != nil {
+		return err
+	}
+	_, err = db.ExecContext(ctx, `CREATE UNIQUE INDEX edges_pair ON edges(COALESCE(repo_id, 0), from_ref, to_ref, edge_type)`)
+	return err
+}
+
 func tableExists(db *sql.DB, name string) bool {
 	var n int
 	err := db.QueryRowContext(context.Background(),
@@ -426,10 +506,17 @@ func tableExists(db *sql.DB, name string) bool {
 	return err == nil && n > 0
 }
 
-func columnExists(db *sql.DB, table, column string) bool {
+func indexExists(db *sql.DB, name string) bool {
+	var n int
+	err := db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?`, name).Scan(&n)
+	return err == nil && n > 0
+}
+
+func columnExists(db *sql.DB, table, column string) (bool, error) {
 	rows, err := db.QueryContext(context.Background(), `PRAGMA table_info(`+table+`)`)
 	if err != nil {
-		return false
+		return false, err
 	}
 	defer func() { _ = rows.Close() }()
 	for rows.Next() {
@@ -437,20 +524,44 @@ func columnExists(db *sql.DB, table, column string) bool {
 		var name, ctype string
 		var dflt any
 		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			return false
+			return false, err
 		}
 		if name == column {
-			return true
+			return true, nil
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return false
+		return false, err
 	}
-	return false
+	return false, nil
 }
 
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+// withTx runs fn inside a single transaction and commits it only when fn
+// returns nil. Any error rolls the transaction back, preserving the previous
+// committed state.
+func (s *Store) withTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// maybeFail is the fault-injection seam used by tests to simulate a failure at
+// a specific write stage or item.
+func (s *Store) maybeFail(stage, key string) error {
+	if s.testHook == nil {
+		return nil
+	}
+	return s.testHook(stage, key)
 }
 
 func (s *Store) Write(result *resolve.Result, files map[string]string, churn map[string]int) error {
@@ -467,27 +578,40 @@ func (s *Store) WriteWorkspace(result *resolve.Result, files map[string]string, 
 
 func (s *Store) write(result *resolve.Result, files map[string]string, churn map[string]int, repos []RepoSpec, workspace bool) error {
 	ctx := context.Background()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		return s.writeTx(ctx, tx, result, files, churn, repos, workspace)
+	})
+}
 
+// writeTx performs the whole index write inside the caller's transaction:
+// packages, symbols, edges, churn, file contents, then both FTS rebuilds. Any
+// failure rolls everything back, preserving the previous committed index.
+func (s *Store) writeTx(ctx context.Context, tx *sql.Tx, result *resolve.Result, files map[string]string, churn map[string]int, repos []RepoSpec, workspace bool) error {
 	repoByModule, err := registerRepos(ctx, tx, repos, workspace)
 	if err != nil {
 		return err
+	}
+
+	// Single-repo mode has no repo attribution (repo_id NULL); delete the
+	// previous index's rows so a full re-index is an atomic swap rather than
+	// an append that accumulates stale packages/symbols/edges/files.
+	if !workspace {
+		if err := clearSingleRepoRows(ctx, tx); err != nil {
+			return err
+		}
 	}
 
 	pkgCache, err := writePackages(ctx, tx, result.Packages, repoByModule)
 	if err != nil {
 		return err
 	}
+	attrib := newPkgAttribution(pkgCache, repoByModule)
 
-	if err := writeSymbols(ctx, tx, result.Symbols, pkgCache, repoByModule); err != nil {
+	if err := writeSymbols(ctx, tx, result.Symbols, attrib); err != nil {
 		return err
 	}
 
-	if err := writeEdges(ctx, tx, result.Edges, pkgCache, repoByModule); err != nil {
+	if err := writeEdges(ctx, tx, result.Edges, attrib); err != nil {
 		return err
 	}
 
@@ -497,27 +621,33 @@ func (s *Store) write(result *resolve.Result, files map[string]string, churn map
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
+	var repoIDFor func(string) int64
+	if workspace {
+		repoIDFor = buildRepoIDFor(repos, repoByModule)
+	}
+	scope := fileScope{repoID: 0}
+	fileDirty, err := s.writeFiles(ctx, tx, files, repoIDFor, scope)
+	if err != nil {
 		return err
 	}
 
-	if err := s.populateFTS(); err != nil {
+	if err := s.maybeFail("fts.symbols", ""); err != nil {
+		return err
+	}
+	if err := s.populateFTS(ctx, tx); err != nil {
 		return err
 	}
 
-	if len(files) > 0 {
-		var repoIDFor func(string) int64
-		if workspace {
-			repoIDFor = buildRepoIDFor(repos, repoByModule)
-		}
-		if err := s.WriteFilesRepo(files, repoIDFor); err != nil {
-			return err
-		}
-		if err := s.populateFileContentFTS(); err != nil {
-			return err
-		}
+	// The file-content FTS is rebuilt only when a file was inserted, updated with
+	// different content, or deleted. An incremental re-index of unchanged files
+	// skips the rebuild entirely (rowids stay stable because unchanged rows are
+	// not rewritten).
+	if err := s.maybeFail("fts.content", ""); err != nil {
+		return err
 	}
-
+	if fileDirty {
+		return s.populateFileContentFTS(ctx, tx)
+	}
 	return nil
 }
 
@@ -575,45 +705,37 @@ func (s *Store) ReplaceRepo(result *resolve.Result, files map[string]string, chu
 	}
 
 	ctx := context.Background()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	if err := deleteRepoRows(ctx, tx, repoID); err != nil {
-		return err
-	}
-	repoByModule := map[string]int64{modulePath: repoID}
-	if err := writeRepoRows(ctx, tx, result, repoByModule, churn); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-
-	if err := s.populateFTS(); err != nil {
-		return err
-	}
-	if len(files) > 0 {
-		if err := s.WriteFilesRepo(files, func(string) int64 { return repoID }); err != nil {
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		if err := deleteRepoRows(ctx, tx, repoID); err != nil {
 			return err
 		}
-		if err := s.populateFileContentFTS(); err != nil {
+		repoByModule := map[string]int64{modulePath: repoID}
+		if err := writeRepoRows(ctx, tx, result, repoByModule, churn); err != nil {
 			return err
 		}
-	}
-	return nil
+		fileDirty, err := s.writeFiles(ctx, tx, files, func(string) int64 { return repoID }, fileScope{repoID: repoID})
+		if err != nil {
+			return err
+		}
+		if err := s.populateFTS(ctx, tx); err != nil {
+			return err
+		}
+		if fileDirty {
+			return s.populateFileContentFTS(ctx, tx)
+		}
+		return nil
+	})
 }
 
 // deleteRepoRows removes every row attributed to a repo, including any
-// per-repo contract intelligence derived from it.
+// per-repo contract intelligence derived from it. File rows are NOT deleted
+// here: writeFiles now owns stale-file cleanup so unchanged files keep their
+// rowid (which keeps file_content_fts consistent without a rebuild).
 func deleteRepoRows(ctx context.Context, tx *sql.Tx, repoID int64) error {
 	for _, stmt := range []string{
 		`DELETE FROM edges WHERE repo_id = ?`,
 		`DELETE FROM symbols WHERE repo_id = ?`,
 		`DELETE FROM packages WHERE repo_id = ?`,
-		`DELETE FROM files WHERE repo_id = ?`,
 		`DELETE FROM contracts WHERE repo_id = ?`,
 		`DELETE FROM runtime_contracts WHERE repo_id = ?`,
 		`DELETE FROM drift WHERE repo_id = ?`,
@@ -632,10 +754,11 @@ func writeRepoRows(ctx context.Context, tx *sql.Tx, result *resolve.Result, repo
 	if err != nil {
 		return err
 	}
-	if err := writeSymbols(ctx, tx, result.Symbols, pkgCache, repoByModule); err != nil {
+	attrib := newPkgAttribution(pkgCache, repoByModule)
+	if err := writeSymbols(ctx, tx, result.Symbols, attrib); err != nil {
 		return err
 	}
-	if err := writeEdges(ctx, tx, result.Edges, pkgCache, repoByModule); err != nil {
+	if err := writeEdges(ctx, tx, result.Edges, attrib); err != nil {
 		return err
 	}
 	if churn != nil {
@@ -647,16 +770,34 @@ func writeRepoRows(ctx context.Context, tx *sql.Tx, result *resolve.Result, repo
 }
 
 // clearWorkspaceRows removes rows attributed to a previous workspace index so a
-// full re-index replaces them atomically.
+// full re-index replaces them atomically. File rows are owned by writeFiles,
+// which deletes stale paths and keeps unchanged rows' rowids stable.
 func clearWorkspaceRows(ctx context.Context, tx *sql.Tx) error {
 	for _, stmt := range []string{
 		`DELETE FROM edges WHERE repo_id IS NOT NULL`,
 		`DELETE FROM symbols WHERE repo_id IS NOT NULL`,
 		`DELETE FROM packages WHERE repo_id IS NOT NULL`,
-		`DELETE FROM files WHERE repo_id IS NOT NULL`,
 		`DELETE FROM contracts WHERE repo_id IS NOT NULL`,
 		`DELETE FROM runtime_contracts WHERE repo_id IS NOT NULL`,
 		`DELETE FROM drift WHERE repo_id IS NOT NULL`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// clearSingleRepoRows removes the previous single-repo index (rows with no repo
+// attribution, repo_id NULL) so a re-index replaces it atomically. Contracts are
+// owned by the contract-analysis write path, not the index write, so they are
+// left untouched. File rows are owned by writeFiles, which deletes stale paths
+// and keeps unchanged rows' rowids stable.
+func clearSingleRepoRows(ctx context.Context, tx *sql.Tx) error {
+	for _, stmt := range []string{
+		`DELETE FROM edges WHERE repo_id IS NULL`,
+		`DELETE FROM symbols WHERE repo_id IS NULL`,
+		`DELETE FROM packages WHERE repo_id IS NULL`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return err
@@ -712,38 +853,69 @@ func nullableRepo(repoID int64) any {
 	return repoID
 }
 
-// packageForRef returns the package import path owning ref, where ref is either
-// the package path itself or a qualified symbol name built from it.
-func packageForRef(ref string, pkgPaths []string) string {
+// pkgAttribution resolves the owning package and repo for symbol and edge
+// writes in constant time per row. It is built once per write from the parsed
+// package set, replacing the former per-row linear scans over all package paths
+// (O(S × P) indexing cost).
+type pkgAttribution struct {
+	pkgCache map[string]int64 // import path -> package id
+	repo     map[string]int64 // import path -> repo id
+}
+
+// newPkgAttribution precomputes repo attribution for every indexed package from
+// the module map, so later per-symbol/edge lookups are plain map hits.
+func newPkgAttribution(pkgCache, repoByModule map[string]int64) *pkgAttribution {
+	a := &pkgAttribution{
+		pkgCache: pkgCache,
+		repo:     make(map[string]int64, len(pkgCache)),
+	}
+	for p := range pkgCache {
+		a.repo[p] = repoForPackage(p, repoByModule)
+	}
+	return a
+}
+
+// pkgFor returns the package id and repo id owning a qualified name. The
+// qualified name itself is tried first (package-level symbols whose name equals
+// the package path); otherwise the longest package-path prefix is probed via
+// dot-boundary map hits — O(len(ref)) lookups, never a scan over all packages.
+func (a *pkgAttribution) pkgFor(ref string) (pkgID, repoID int64) {
+	if id, ok := a.pkgCache[ref]; ok {
+		return id, a.repo[ref]
+	}
+	pkgPath := longestPackagePrefix(ref, a.pkgCache)
+	if pkgPath == "" {
+		return 0, 0
+	}
+	return a.pkgCache[pkgPath], a.repo[pkgPath]
+}
+
+// longestPackagePrefix returns the longest indexed package path that owns ref,
+// where ref is a qualified symbol name built from a package path. The probe
+// only considers prefixes ending at a '.' boundary so short packages sharing a
+// prefix (a vs a.b) never hijack longer ones.
+func longestPackagePrefix(ref string, paths map[string]int64) string {
 	best := ""
-	for _, p := range pkgPaths {
-		if ref == p || strings.HasPrefix(ref, p+".") {
-			if len(p) > len(best) {
-				best = p
-			}
+	for i := 0; i < len(ref); i++ {
+		if ref[i] != '.' {
+			continue
+		}
+		prefix := ref[:i]
+		if _, ok := paths[prefix]; ok && len(prefix) > len(best) {
+			best = prefix
 		}
 	}
 	return best
 }
 
-func writeSymbols(ctx context.Context, tx *sql.Tx, symbols []resolve.ResolvedSymbol, pkgCache, repoByModule map[string]int64) error {
+func writeSymbols(ctx context.Context, tx *sql.Tx, symbols []resolve.ResolvedSymbol, attrib *pkgAttribution) error {
 	symInsert := `INSERT OR IGNORE INTO symbols (qualified_name, package_id, name, kind, receiver, signature, doc, pos_file, pos_line, exported, is_test, complexity, repo_id, fields_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
-	pkgPaths := make([]string, 0, len(pkgCache))
-	for p := range pkgCache {
-		pkgPaths = append(pkgPaths, p)
-	}
-
 	for _, sym := range symbols {
-		pkgPath := packageForRef(sym.Symbol.QualifiedName, pkgPaths)
-		pkgID, ok := pkgCache[sym.Symbol.QualifiedName]
-		if !ok {
-			pkgID = pkgCache[pkgPath]
-		}
+		pkgID, repoID := attrib.pkgFor(sym.Symbol.QualifiedName)
 		if pkgID == 0 {
 			continue
 		}
-		repoID := repoForPackage(pkgPath, repoByModule)
 
 		var fieldsJSON any
 		if len(sym.Symbol.Fields) > 0 {
@@ -777,27 +949,40 @@ func writeSymbols(ctx context.Context, tx *sql.Tx, symbols []resolve.ResolvedSym
 	return nil
 }
 
-func writeEdges(ctx context.Context, tx *sql.Tx, edges []resolve.ResolvedEdge, pkgCache, repoByModule map[string]int64) error {
-	edgeInsert := `INSERT INTO edges (from_ref, to_ref, edge_type, pos_file, pos_line, repo_id) VALUES (?, ?, ?, ?, ?, ?)`
-
-	pkgPaths := make([]string, 0, len(pkgCache))
-	for p := range pkgCache {
-		pkgPaths = append(pkgPaths, p)
-	}
+func writeEdges(ctx context.Context, tx *sql.Tx, edges []resolve.ResolvedEdge, attrib *pkgAttribution) error {
+	// One row per (repo_id, from_ref, to_ref, edge_type): re-indexing the same
+	// pair converges instead of inserting duplicates. On conflict the existing
+	// sites array is merged with the incoming one, deduping identical sites and
+	// keeping the first (primary) position first.
+	edgeUpsert := `INSERT INTO edges (from_ref, to_ref, edge_type, pos_file, pos_line, sites, repo_id) VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(COALESCE(repo_id, 0), from_ref, to_ref, edge_type)
+DO UPDATE SET
+	sites = (SELECT json_group_array(json(value)) FROM (
+		SELECT value FROM json_each(edges.sites)
+		UNION
+		SELECT value FROM json_each(excluded.sites)
+	))`
 
 	for _, edge := range edges {
-		pkgPath := packageForRef(edge.Edge.FromRef, pkgPaths)
-		repoID := repoForPackage(pkgPath, repoByModule)
-		_, err := tx.ExecContext(ctx, edgeInsert,
+		_, repoID := attrib.pkgFor(edge.Edge.FromRef)
+
+		pos := edge.Edge.Pos
+		sitesJSON, err := jsonMarshal([]Site{{File: pos.File, Line: pos.Line}})
+		if err != nil {
+			return fmt.Errorf("marshaling sites for %s -> %s: %w", edge.Edge.FromRef, edge.Edge.ToRef, err)
+		}
+
+		_, err = tx.ExecContext(ctx, edgeUpsert,
 			edge.Edge.FromRef,
 			edge.Edge.ToRef,
 			edge.Edge.EdgeType,
-			edge.Edge.Pos.File,
-			edge.Edge.Pos.Line,
+			pos.File,
+			pos.Line,
+			sitesJSON,
 			nullableRepo(repoID),
 		)
 		if err != nil {
-			return fmt.Errorf("inserting edge %s -> %s: %w", edge.Edge.FromRef, edge.Edge.ToRef, err)
+			return fmt.Errorf("upserting edge %s -> %s: %w", edge.Edge.FromRef, edge.Edge.ToRef, err)
 		}
 	}
 	return nil
@@ -818,13 +1003,47 @@ func repoForPackage(pkgPath string, repoByModule map[string]int64) int64 {
 	return 0
 }
 
-func (s *Store) populateFTS() error {
+func (s *Store) populateFTS(ctx context.Context, tx *sql.Tx) error {
 	// symbols_fts is an external-content table; 'rebuild' re-indexes it from the
-	// symbols table and is safe on both fresh and existing databases.
-	_, err := s.db.ExecContext(context.Background(), `INSERT INTO symbols_fts(symbols_fts) VALUES('rebuild')`)
+	// symbols table and is safe on both fresh and existing databases. Running it
+	// inside the index transaction keeps symbols and the FTS index consistent.
+	_, err := tx.ExecContext(ctx, `INSERT INTO symbols_fts(symbols_fts) VALUES('rebuild')`)
 	return err
 }
 
+// likeEscape is the escape character used in every LIKE predicate that receives
+// user input. SQLite's LIKE has no default escape, so an explicit ESCAPE clause
+// is required for user-supplied wildcards to be matched literally.
+const likeEscape = `\`
+
+// escapeLike escapes the LIKE wildcard characters plus the escape character
+// itself so that user input is matched literally. Escape order matters: the
+// escape character must be escaped first, otherwise a user-supplied `\` would
+// escape the escaping we add for `%`/`_`.
+func escapeLike(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `%`, `\%`)
+	s = strings.ReplaceAll(s, `_`, `\_`)
+	return s
+}
+
+// likePattern wraps a user pattern in the %...% contains form with LIKE special
+// characters escaped, matching the escaped value literally.
+func likePattern(user string) string {
+	return "%" + escapeLike(user) + "%"
+}
+
+// likeMatch builds a LIKE predicate with an explicit escape clause for a given
+// column. The argument is produced by likePattern/escapeLike.
+func likeMatch(column string) string {
+	return column + " LIKE ? ESCAPE '" + likeEscape + "'"
+}
+
+// sanitizeFTSQuery converts a user pattern into an FTS5 expression in which
+// every term is a phrase (embedded `"` doubled), joined with implicit AND.
+// FTS5 operator characters in the user input are inert literals inside the
+// phrases. A term that is punctuation-only (e.g. `-`) is dropped rather than
+// quoted, since an empty quoted string is a MATCH error.
 func sanitizeFTSQuery(pattern string) string {
 	pattern = strings.TrimSpace(pattern)
 	if pattern == "" {
@@ -834,19 +1053,31 @@ func sanitizeFTSQuery(pattern string) string {
 	terms := strings.Fields(pattern)
 	var quoted []string
 	for _, t := range terms {
-		t = strings.ReplaceAll(t, `"`, "")
-		t = strings.ReplaceAll(t, "(", "")
-		t = strings.ReplaceAll(t, ")", "")
-		t = strings.ReplaceAll(t, "*", "")
-		t = strings.TrimSpace(t)
-		if t != "" {
-			quoted = append(quoted, `"`+t+`"`)
+		t = strings.ReplaceAll(t, `"`, `""`)
+		if isPunctuationOnly(t) {
+			continue
 		}
+		quoted = append(quoted, `"`+t+`"`)
 	}
 	if len(quoted) == 0 {
 		return ""
 	}
-	return strings.Join(quoted, " OR ")
+	return strings.Join(quoted, " ")
+}
+
+// isPunctuationOnly reports whether s consists entirely of non-letter,
+// non-digit characters. Such terms are dropped by sanitizeFTSQuery because
+// quoting them yields an empty phrase, which is a MATCH error.
+func isPunctuationOnly(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return true
 }
 
 type Package struct {
@@ -893,13 +1124,22 @@ type FileMatch struct {
 	LineNumber    int
 }
 
+// Site is one occurrence location of an edge: the repo-relative file path and
+// line at which the edge was observed during indexing.
+type Site struct {
+	File string `json:"file"`
+	Line int    `json:"line"`
+}
+
 type Edge struct {
-	FromRef  string
-	ToRef    string
-	EdgeType string
-	PosFile  string
-	Repo     string `json:"repo,omitempty"`
-	PosLine  int
+	FromRef   string
+	ToRef     string
+	EdgeType  string
+	PosFile   string
+	Repo      string `json:"repo,omitempty"`
+	Sites     []Site
+	PosLine   int
+	SiteCount int
 }
 
 // ContractDirection describes the wire relationship between producer and consumer.
@@ -1118,6 +1358,7 @@ func (s *Store) SymbolsByPackage(pkgPath string, includeTests bool) ([]Symbol, e
 }
 
 func (s *Store) SymbolByName(qualifiedName string) (*Symbol, error) {
+	qualifiedName = NormalizeQualifiedName(qualifiedName)
 	var sym Symbol
 	var repoID sql.NullInt64
 	var repo sql.NullString
@@ -1139,19 +1380,140 @@ func (s *Store) SymbolByName(qualifiedName string) (*Symbol, error) {
 }
 
 func (s *Store) EdgesFrom(ref string) ([]Edge, error) {
-	return s.queryEdges("from_ref = ?", ref)
+	return s.queryEdges("from_ref = ?", NormalizeQualifiedName(ref))
 }
 
 func (s *Store) EdgesTo(ref string) ([]Edge, error) {
-	return s.queryEdges("to_ref = ?", ref)
+	return s.queryEdges("to_ref = ?", NormalizeQualifiedName(ref))
 }
 
 func (s *Store) EdgesByType(edgeType string) ([]Edge, error) {
 	return s.queryEdges("edge_type = ?", edgeType)
 }
 
+// edgesInBatchSize is the chunk size for IN (...) lists in EdgesForNodes and
+// other multi-ref queries, kept well under SQLite's default variable limit
+// (999) so a bounded collection of refs never overflows the binding capacity.
+const edgesInBatchSize = 500
+
+// EdgesForNodes returns every edge whose from_ref (outgoing=true) or to_ref
+// (outgoing=false) is one of refs, optionally restricted to the given edge
+// types. The IN list is chunked into edgesInBatchSize entries, so the number of
+// queries is O(len(refs)/500) regardless of graph fanout, which keeps deep
+// traversals at O(depth) round-trips instead of one query per visited node.
+func (s *Store) EdgesForNodes(refs, edgeTypes []string, outgoing bool) ([]Edge, error) {
+	return s.edgesForNodes(context.Background(), refs, edgeTypes, outgoing)
+}
+
+func (s *Store) edgesForNodes(ctx context.Context, refs, edgeTypes []string, outgoing bool) ([]Edge, error) {
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	col := "from_ref"
+	if !outgoing {
+		col = "to_ref"
+	}
+
+	typeClause := ""
+	var typeArgs []any
+	if len(edgeTypes) > 0 {
+		typeClause = " AND e.edge_type IN (" + inPlaceholders(len(edgeTypes)) + ")"
+		for _, t := range edgeTypes {
+			typeArgs = append(typeArgs, t)
+		}
+	}
+
+	var out []Edge
+	for _, batch := range chunks(refs, edgesInBatchSize) {
+		where := "e." + col + " IN (" + inPlaceholders(len(batch)) + ")" + typeClause
+		args := make([]any, 0, len(batch)+len(typeArgs))
+		for _, r := range batch {
+			args = append(args, NormalizeQualifiedName(r))
+		}
+		args = append(args, typeArgs...)
+
+		rows, err := s.db.QueryContext(ctx,
+			"SELECT e.from_ref, e.to_ref, e.edge_type, e.pos_file, e.pos_line, e.sites, r.module_path FROM edges e LEFT JOIN repos r ON r.id = e.repo_id WHERE "+where,
+			args...)
+		if err != nil {
+			return nil, err
+		}
+		batchEdges, err := scanEdges(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, batchEdges...)
+	}
+	return out, nil
+}
+
+// inPlaceholders returns a comma-separated list of n SQL placeholders.
+func inPlaceholders(n int) string {
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
+// chunks splits a slice into non-empty batches of at most size elements.
+func chunks[T any](items []T, size int) [][]T {
+	if size <= 0 {
+		return [][]T{items}
+	}
+	var out [][]T
+	for start := 0; start < len(items); start += size {
+		end := min(start+size, len(items))
+		out = append(out, items[start:end])
+	}
+	return out
+}
+
+// SymbolEdges returns symbol-to-symbol edges of the given edge types
+// (calls, references, satisfies, embeds, ...), each attributed with its repo.
+// Edges whose from- or to-endpoint is not an indexed symbol are excluded.
+func (s *Store) SymbolEdges(edgeTypes []string) ([]Edge, error) {
+	if len(edgeTypes) == 0 {
+		return []Edge{}, nil
+	}
+	placeholders := strings.Repeat("?,", len(edgeTypes))
+	placeholders = placeholders[:len(placeholders)-1]
+	args := make([]any, len(edgeTypes))
+	for i, t := range edgeTypes {
+		args[i] = t
+	}
+	where := "e.edge_type IN (" + placeholders + ") AND EXISTS (SELECT 1 FROM symbols f WHERE f.qualified_name = e.from_ref) AND EXISTS (SELECT 1 FROM symbols t WHERE t.qualified_name = e.to_ref)"
+	return s.queryEdges(where, args...)
+}
+
 func (s *Store) AllEdges() ([]Edge, error) {
-	return s.queryEdges(sqlAllRows, "")
+	return s.queryEdges(sqlAllRows)
+}
+
+// CountEdges returns the total number of edges without materializing them.
+func (s *Store) CountEdges() (int, error) {
+	var n int
+	err := s.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM edges`).Scan(&n)
+	return n, err
+}
+
+// ImportCounts returns, for every source package path, how many import edges
+// leave it. Built with one grouped query so callers such as Overview avoid one
+// edge query per package.
+func (s *Store) ImportCounts() (map[string]int, error) {
+	rows, err := s.db.QueryContext(context.Background(),
+		`SELECT from_ref, COUNT(*) FROM edges WHERE edge_type = ? GROUP BY from_ref`, edgeTypeImports)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	counts := make(map[string]int)
+	for rows.Next() {
+		var from string
+		var n int
+		if err := rows.Scan(&from, &n); err != nil {
+			return nil, err
+		}
+		counts[from] = n
+	}
+	return counts, rows.Err()
 }
 
 // WriteContracts replaces all contract intelligence data for a repo atomically.
@@ -1161,48 +1523,59 @@ func (s *Store) AllEdges() ([]Edge, error) {
 // timestamp is recorded so staleness checks can compare it to per-repo indexes.
 func (s *Store) WriteContractsAll(contracts []Contract, runtimeContracts []RuntimeContract, drifts []DriftReport, indexedAt string) error {
 	ctx := context.Background()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	for _, stmt := range []string{
-		`DELETE FROM contracts`,
-		`DELETE FROM runtime_contracts`,
-		`DELETE FROM drift`,
-	} {
-		if _, err := tx.ExecContext(ctx, stmt); err != nil {
-			return err
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		for _, stmt := range []string{
+			`DELETE FROM contracts`,
+			`DELETE FROM runtime_contracts`,
+			`DELETE FROM drift`,
+		} {
+			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				return err
+			}
 		}
-	}
 
-	if err := insertContracts(ctx, tx, contracts, indexedAt); err != nil {
-		return err
-	}
-	if err := insertRuntimeContracts(ctx, tx, runtimeContracts, indexedAt); err != nil {
-		return err
-	}
-	if err := insertDriftReports(ctx, tx, drifts, indexedAt); err != nil {
-		return err
-	}
-
-	// Record the analysis time at nanosecond precision so staleness comparisons
-	// against per-repo index times (same precision) are correct; parsing the
-	// caller's RFC3339 string would truncate to whole seconds and make every
-	// repo look perpetually stale.
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	return s.SetContractAnalysisTime(time.Now().UTC())
-}
-
-func insertContracts(ctx context.Context, tx *sql.Tx, contracts []Contract, indexedAt string) error {
-	for _, c := range contracts {
-		repoID, err := repoIDForRef(ctx, tx, c.FromRef)
+		// Resolve repo attribution once from the package table into memory;
+		// per-row attribution is then a plain map probe instead of a SELECT per
+		// contract row.
+		repoByPath, err := readPackageRepoMap(ctx, tx)
 		if err != nil {
 			return err
 		}
+
+		if err := insertContracts(ctx, tx, contracts, indexedAt, repoByPath); err != nil {
+			return err
+		}
+		if err := insertRuntimeContracts(ctx, tx, runtimeContracts, indexedAt, repoByPath); err != nil {
+			return err
+		}
+		if err := insertDriftReports(ctx, tx, drifts, indexedAt, repoByPath); err != nil {
+			return err
+		}
+
+		// Record the analysis time at nanosecond precision so staleness comparisons
+		// against per-repo index times (same precision) are correct; parsing the
+		// caller's RFC3339 string would truncate to whole seconds and make every
+		// repo look perpetually stale. Written in the same transaction as the rows
+		// so a failure leaves neither, not a half-applied analysis.
+		if err := s.maybeFail("contract.meta", ""); err != nil {
+			return err
+		}
+		return s.setContractAnalysisTimeInTx(ctx, tx, time.Now().UTC())
+	})
+}
+
+// setContractAnalysisTimeInTx records the global contract-analysis time inside
+// the caller's transaction.
+func (s *Store) setContractAnalysisTimeInTx(ctx context.Context, tx *sql.Tx, t time.Time) error {
+	_, err := tx.ExecContext(ctx,
+		`INSERT OR REPLACE INTO meta (key, value) VALUES ('contract_indexed_at', ?)`,
+		t.Format(time.RFC3339Nano))
+	return err
+}
+
+func insertContracts(ctx context.Context, tx *sql.Tx, contracts []Contract, indexedAt string, repoByPath map[string]int64) error {
+	for _, c := range contracts {
+		repoID := repoIDForRefMapped(c.FromRef, repoByPath)
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO contracts (from_ref, to_ref, direction, confidence, severity, suggested, evidence, indexed_at, repo_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			c.FromRef, c.ToRef, string(c.Direction), c.Confidence, string(c.Severity), c.Suggested, c.Evidence, indexedAt, nullableRepo(repoID)); err != nil {
@@ -1212,12 +1585,9 @@ func insertContracts(ctx context.Context, tx *sql.Tx, contracts []Contract, inde
 	return nil
 }
 
-func insertRuntimeContracts(ctx context.Context, tx *sql.Tx, runtimeContracts []RuntimeContract, indexedAt string) error {
+func insertRuntimeContracts(ctx context.Context, tx *sql.Tx, runtimeContracts []RuntimeContract, indexedAt string, repoByPath map[string]int64) error {
 	for _, rc := range runtimeContracts {
-		repoID, err := repoIDForRef(ctx, tx, rc.FromRef)
-		if err != nil {
-			return err
-		}
+		repoID := repoIDForRefMapped(rc.FromRef, repoByPath)
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO runtime_contracts (kind, pattern, from_ref, to_ref, direction, evidence, indexed_at, repo_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 			string(rc.Kind), rc.Pattern, rc.FromRef, rc.ToRef, string(rc.Direction), rc.Evidence, indexedAt, nullableRepo(repoID)); err != nil {
@@ -1227,16 +1597,13 @@ func insertRuntimeContracts(ctx context.Context, tx *sql.Tx, runtimeContracts []
 	return nil
 }
 
-func insertDriftReports(ctx context.Context, tx *sql.Tx, drifts []DriftReport, indexedAt string) error {
+func insertDriftReports(ctx context.Context, tx *sql.Tx, drifts []DriftReport, indexedAt string, repoByPath map[string]int64) error {
 	for _, d := range drifts {
 		fieldsJSON, err := jsonMarshal(d.Fields)
 		if err != nil {
 			return err
 		}
-		repoID, err := repoIDForRef(ctx, tx, d.FromRef)
-		if err != nil {
-			return err
-		}
+		repoID := repoIDForRefMapped(d.FromRef, repoByPath)
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO drift (from_ref, to_ref, severity, fields_json, indexed_at, repo_id) VALUES (?, ?, ?, ?, ?, ?)`,
 			d.FromRef, d.ToRef, string(d.Severity), fieldsJSON, indexedAt, nullableRepo(repoID)); err != nil {
@@ -1246,24 +1613,42 @@ func insertDriftReports(ctx context.Context, tx *sql.Tx, drifts []DriftReport, i
 	return nil
 }
 
-// repoIDForRef resolves the repo owning a qualified reference by the longest
-// matching package path. Returns 0 (NULL) when no repo is attributed.
-func repoIDForRef(ctx context.Context, tx *sql.Tx, ref string) (int64, error) {
-	var repoID sql.NullInt64
-	err := tx.QueryRowContext(ctx, `
-		SELECT p.repo_id
-		FROM packages p
-		WHERE ? = p.path OR ? LIKE p.path || '.%'
-		ORDER BY length(p.path) DESC
-		LIMIT 1
-	`, ref, ref).Scan(&repoID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, nil
-	}
+// readPackageRepoMap loads every indexed package's repo attribution into a map
+// so contract rows can resolve their repo in memory instead of one SELECT per
+// row.
+func readPackageRepoMap(ctx context.Context, tx *sql.Tx) (map[string]int64, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT path, repo_id FROM packages`)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return repoID.Int64, nil
+	defer func() { _ = rows.Close() }()
+
+	m := make(map[string]int64)
+	for rows.Next() {
+		var path string
+		var repoID sql.NullInt64
+		if err := rows.Scan(&path, &repoID); err != nil {
+			return nil, err
+		}
+		if repoID.Valid {
+			m[path] = repoID.Int64
+		}
+	}
+	return m, rows.Err()
+}
+
+// repoIDForRefMapped resolves the repo owning a qualified reference from an
+// in-memory package-path map, matching the SQL longest-package-match semantics
+// (exact path, else longest dotted-prefix) without a per-row query.
+func repoIDForRefMapped(ref string, repoByPath map[string]int64) int64 {
+	if id, ok := repoByPath[ref]; ok {
+		return id
+	}
+	path := longestPackagePrefix(ref, repoByPath)
+	if path == "" {
+		return 0
+	}
+	return repoByPath[path]
 }
 
 // QueryContracts returns contracts matching the given filter.
@@ -1486,10 +1871,10 @@ func (s *Store) ContractAnalysisTime() (time.Time, bool, error) {
 
 // SetContractAnalysisTime records when the global contract analysis ran.
 func (s *Store) SetContractAnalysisTime(t time.Time) error {
-	_, err := s.db.ExecContext(context.Background(),
-		`INSERT OR REPLACE INTO meta (key, value) VALUES ('contract_indexed_at', ?)`,
-		t.Format(time.RFC3339Nano))
-	return err
+	ctx := context.Background()
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		return s.setContractAnalysisTimeInTx(ctx, tx, t)
+	})
 }
 
 // MissingRepoContracts returns contracts that reference a repo that is not indexed.
@@ -1508,21 +1893,32 @@ func (s *Store) MissingRepoContracts() ([]string, error) {
 	return missing, nil
 }
 
-func (s *Store) queryEdges(where string, arg any) ([]Edge, error) {
-	rows, err := s.db.QueryContext(context.Background(), "SELECT e.from_ref, e.to_ref, e.edge_type, e.pos_file, e.pos_line, r.module_path FROM edges e LEFT JOIN repos r ON r.id = e.repo_id WHERE "+where, arg)
+func (s *Store) queryEdges(where string, args ...any) ([]Edge, error) {
+	rows, err := s.db.QueryContext(context.Background(), "SELECT e.from_ref, e.to_ref, e.edge_type, e.pos_file, e.pos_line, e.sites, r.module_path FROM edges e LEFT JOIN repos r ON r.id = e.repo_id WHERE "+where, args...)
 	if err != nil {
 		return nil, err
 	}
+	return scanEdges(rows)
+}
+
+func scanEdges(rows *sql.Rows) ([]Edge, error) {
 	defer func() { _ = rows.Close() }()
 
 	var edges []Edge
 	for rows.Next() {
 		var e Edge
 		var repo sql.NullString
-		if err := rows.Scan(&e.FromRef, &e.ToRef, &e.EdgeType, &e.PosFile, &e.PosLine, &repo); err != nil {
+		var sitesJSON sql.NullString
+		if err := rows.Scan(&e.FromRef, &e.ToRef, &e.EdgeType, &e.PosFile, &e.PosLine, &sitesJSON, &repo); err != nil {
 			return nil, err
 		}
 		e.Repo = repo.String
+		if sitesJSON.Valid && sitesJSON.String != "" {
+			if err := jsonUnmarshal(sitesJSON.String, &e.Sites); err != nil {
+				return nil, err
+			}
+		}
+		e.SiteCount = len(e.Sites)
 		edges = append(edges, e)
 	}
 	if err := rows.Err(); err != nil {
@@ -1535,9 +1931,10 @@ func (s *Store) SearchSymbolsByFile(filePattern, kind string, exported *bool, in
 	query := `SELECT ` + symbolColumns + `
 		` +
 		symbolFrom + `
-		WHERE s.pos_file LIKE ?
+		WHERE ` +
+		likeMatch("s.pos_file") + `
 	`
-	args := []any{"%" + filePattern + "%"}
+	args := []any{likePattern(filePattern)}
 
 	if kind != "" {
 		query += " AND s.kind = ?"
@@ -1602,9 +1999,10 @@ func (s *Store) SearchByQualifiedNamePrefix(prefix string, includeTests bool) ([
 	query := `SELECT ` + symbolColumns + `
 		` +
 		symbolFrom + `
-		WHERE s.qualified_name LIKE ?
+		WHERE ` +
+		likeMatch("s.qualified_name") + `
 	`
-	args := []any{prefix + "%"}
+	args := []any{escapeLike(prefix) + "%"}
 
 	if !includeTests {
 		query += andIsTestFalse
@@ -1618,50 +2016,78 @@ func (s *Store) SearchByQualifiedNamePrefix(prefix string, includeTests bool) ([
 	return scanSymbols(rows)
 }
 
-func (s *Store) TransitiveImports(pkgPath string) ([]Edge, error) {
-	visited := make(map[string]bool)
-	result := make([]Edge, 0)
-	queue := []string{pkgPath}
+// BuildImportAdjacency groups import edges into an adjacency map keyed by the
+// source package path. Transitive-import walks then visit each edge once via
+// the map instead of rescanning the full edge set for every visited node
+// (O(V·E) -> O(V+E) per walk).
+const edgeTypeImports = "imports"
+
+func BuildImportAdjacency(edges []Edge) map[string][]Edge {
+	adj := make(map[string][]Edge)
+	for _, e := range edges {
+		if e.EdgeType != edgeTypeImports {
+			continue
+		}
+		adj[e.FromRef] = append(adj[e.FromRef], e)
+	}
+	return adj
+}
+
+// ImportFrontierBFS walks an import adjacency map breadth-first from start,
+// appending every edge whose next() returns a non-empty neighbor. next decides
+// both the neighbor to enqueue and whether an edge belongs in the result: an
+// edge is skipped entirely when next returns "". The visited set is shared with
+// next (as the second argument) so callers can dedupe by resolved targets. The
+// frontier replaces the per-node full-edge scan, bounding each walk to O(V+E).
+func ImportFrontierBFS(adj map[string][]Edge, start string, next func(e Edge, visited map[string]bool) string) []Edge {
+	if _, ok := adj[start]; !ok {
+		return nil
+	}
+	var out []Edge
+	visited := map[string]bool{start: true}
+	queue := []string{start}
 
 	for len(queue) > 0 {
 		current := queue[0]
 		queue = queue[1:]
-
-		if visited[current] {
-			continue
-		}
-		visited[current] = true
-
-		edges, err := s.EdgesFrom(current)
-		if err != nil {
-			return nil, err
-		}
-
-		for _, e := range edges {
-			if e.EdgeType == "imports" {
-				result = append(result, e)
-				if !visited[e.ToRef] {
-					queue = append(queue, e.ToRef)
-				}
+		for _, e := range adj[current] {
+			target := next(e, visited)
+			if target == "" {
+				continue
+			}
+			out = append(out, e)
+			if !visited[target] {
+				visited[target] = true
+				queue = append(queue, target)
 			}
 		}
 	}
+	return out
+}
 
-	return result, nil
+func (s *Store) TransitiveImports(pkgPath string) ([]Edge, error) {
+	edges, err := s.EdgesByType(edgeTypeImports)
+	if err != nil {
+		return nil, err
+	}
+	adj := BuildImportAdjacency(edges)
+	return ImportFrontierBFS(adj, pkgPath, func(e Edge, _ map[string]bool) string {
+		return e.ToRef
+	}), nil
 }
 
 func (s *Store) SearchByType(typeName string, includeTests bool) ([]Symbol, error) {
 	query := `SELECT ` + symbolColumns + `
 		` +
 		symbolFrom + `
-		WHERE s.signature LIKE '%' || ? || ' %'
-		   OR s.signature LIKE '%' || ? || ')%'
-		   OR s.signature LIKE '%' || ? || ',%'
-		   OR s.signature LIKE '%.' || ? || ' %'
-		   OR s.signature LIKE '%.' || ? || ')%'
-		   OR s.signature LIKE '%.' || ? || ',%'
-	`
-	args := []any{typeName, typeName, typeName, typeName, typeName, typeName}
+		WHERE s.signature LIKE '%' || ? || ' %' ESCAPE '\'
+		   OR s.signature LIKE '%' || ? || ')%' ESCAPE '\'
+		   OR s.signature LIKE '%' || ? || ',%' ESCAPE '\'
+	` // The three '%.' || ? variants are subsumed: '%' matches the dot boundary,
+	// so "<type> " / "<type>)" / "<type>," already match after a '.'. Keeping a
+	// minimal clause set lets the planner reuse one LIKE index/scan predicate.
+	escaped := escapeLike(typeName)
+	args := []any{escaped, escaped, escaped}
 
 	if !includeTests {
 		query += andIsTestFalse
@@ -1826,15 +2252,20 @@ func (s *Store) KnownModulePaths() ([]string, error) {
 
 // SetRepoIndexedAt records when a member repo was last indexed. The global
 // indexed_at meta key is also refreshed so single-repo health checks keep
-// working on workspace databases.
+// working on workspace databases. Both statements run in one transaction so a
+// failure can never leave the per-repo and global timestamps disagreeing.
 func (s *Store) SetRepoIndexedAt(modulePath string, t time.Time) error {
 	ctx := context.Background()
-	_, err := s.db.ExecContext(ctx, `UPDATE repos SET indexed_at = ? WHERE module_path = ?`, t.Format(time.RFC3339Nano), modulePath)
-	if err != nil {
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE repos SET indexed_at = ? WHERE module_path = ?`, t.Format(time.RFC3339Nano), modulePath); err != nil {
+			return err
+		}
+		if err := s.maybeFail("repo.meta", ""); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO meta (key, value) VALUES ('indexed_at', ?)`, t.Format(time.RFC3339Nano))
 		return err
-	}
-	_, err = s.db.ExecContext(ctx, `INSERT OR REPLACE INTO meta (key, value) VALUES ('indexed_at', ?)`, t.Format(time.RFC3339Nano))
-	return err
+	})
 }
 
 // RepoIndexedAt returns the last index time for a member, or ok=false when the
@@ -1853,7 +2284,7 @@ func (s *Store) RepoIndexedAt(modulePath string) (time.Time, bool, error) {
 	}
 	t, err := time.Parse(time.RFC3339Nano, val)
 	if err != nil {
-		return time.Time{}, false, nil
+		return time.Time{}, false, fmt.Errorf("repo %s: parse indexed_at %q: %w", modulePath, val, err)
 	}
 	return t, true, nil
 }
@@ -1879,6 +2310,22 @@ func (s *Store) IsRepoStale(modulePath string) (bool, error) {
 	var dir string
 	if err := s.db.QueryRowContext(context.Background(), `SELECT dir FROM repos WHERE module_path = ?`, modulePath).Scan(&dir); err != nil {
 		return false, err
+	}
+	if dir == "" {
+		return false, nil
+	}
+
+	// Same dirty-state logic as StaleReason: uncommitted .go edits make the
+	// index stale unless the exact state is already recorded.
+	dirty, fp, derr := vcs.GitDirtyDiff(dir, "HEAD")
+	if derr == nil {
+		stored, sok := s.dirtyFingerprint(modulePath)
+		if sok && stored == fp && !hasNewerGoFiles(dir, indexedAt) {
+			return false, nil
+		}
+		if dirty {
+			return true, nil
+		}
 	}
 	return hasNewerGoFiles(dir, indexedAt), nil
 }
@@ -1922,18 +2369,21 @@ type HealthInfo struct {
 	SymbolCount  int
 }
 
-func (s *Store) Health() HealthInfo {
+// Health reports the current index metadata, or an error when the metadata is
+// unreadable or corrupt. A corrupted database therefore surfaces as an error
+// instead of a healthy-looking "indexed at epoch, 0 packages".
+func (s *Store) Health() (HealthInfo, error) {
 	var h HealthInfo
 	rows, err := s.db.QueryContext(context.Background(),
 		`SELECT key, value FROM meta WHERE key IN ('indexed_at','repo_path','git_head','package_count','symbol_count')`)
 	if err != nil {
-		return h
+		return h, err
 	}
 	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var k, v string
 		if err := rows.Scan(&k, &v); err != nil {
-			continue
+			return h, err
 		}
 		switch k {
 		case "indexed_at":
@@ -1943,40 +2393,157 @@ func (s *Store) Health() HealthInfo {
 		case "git_head":
 			h.GitHead = v
 		case "package_count":
-			h.PackageCount, _ = strconv.Atoi(v)
+			n, aerr := strconv.Atoi(v)
+			if aerr != nil {
+				return h, fmt.Errorf("health: package_count %q: %w", v, aerr)
+			}
+			h.PackageCount = n
 		case "symbol_count":
-			h.SymbolCount, _ = strconv.Atoi(v)
+			n, aerr := strconv.Atoi(v)
+			if aerr != nil {
+				return h, fmt.Errorf("health: symbol_count %q: %w", v, aerr)
+			}
+			h.SymbolCount = n
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return h
+		return h, err
 	}
-	return h
+	return h, nil
 }
 
 func (s *Store) WriteFiles(files map[string]string) error {
-	return s.WriteFilesRepo(files, nil)
+	_, err := s.writeFiles(context.Background(), nil, files, nil, fileScope{})
+	return err
 }
 
 // WriteFilesRepo writes file contents, attributing each file to a repo via
-// repoIDFor when provided (workspace mode); single-repo mode passes nil.
+// repoIDFor when provided (workspace mode); single-repo mode passes nil. It
+// opens and commits its own transaction around the batched upsert.
 func (s *Store) WriteFilesRepo(files map[string]string, repoIDFor func(path string) int64) error {
-	ctx := context.Background()
+	_, err := s.writeFiles(context.Background(), nil, files, repoIDFor, fileScope{})
+	return err
+}
+
+// fileScope describes which file rows a write manages for stale-row removal.
+// repoID > 0 restricts cleanup to one workspace member (ReplaceRepo); repoID 0
+// means the write owns every file row (single-repo and workspace full writes).
+type fileScope struct {
+	repoID int64
+}
+
+// fileWriteDirty reports whether a write changed the file-content index: any
+// newly inserted path, any content update, or any deleted stale row. repo_id
+// changes alone do not dirty the content index, which indexes path + content.
+// For the index to stay consistent when a rebuild is skipped, unchanged rows
+// must keep their rowid — hence the in-place upsert below instead of
+// INSERT OR REPLACE.
+//
+// writeFiles writes file contents inside the caller's transaction, or opens and
+// commits its own when tx is nil. All files are applied through a single
+// prepared upsert, so a failure partway through the set leaves the files table
+// completely untouched (none of the batch is visible).
+func (s *Store) writeFiles(ctx context.Context, tx *sql.Tx, files map[string]string, repoIDFor func(path string) int64, scope fileScope) (bool, error) {
+	own := tx == nil
+	if own {
+		var err error
+		tx, err = s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return false, err
+		}
+		defer func() { _ = tx.Rollback() }()
+	}
+
+	dirty := false
+
+	upsert, err := tx.PrepareContext(ctx, `
+		INSERT INTO files (path, content, repo_id) VALUES (?, ?, ?)
+		ON CONFLICT(path) DO UPDATE SET content = excluded.content, repo_id = excluded.repo_id
+		  WHERE files.content IS NOT excluded.content
+		     OR COALESCE(files.repo_id, 0) IS NOT COALESCE(excluded.repo_id, 0)`)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = upsert.Close() }()
+
 	for path, content := range files {
 		var repoID any
 		if repoIDFor != nil {
 			repoID = nullableRepo(repoIDFor(path))
 		}
-		_, err := s.db.ExecContext(ctx, `INSERT OR REPLACE INTO files (path, content, repo_id) VALUES (?, ?, ?)`, path, content, repoID)
+		if err := s.maybeFail("files", path); err != nil {
+			return false, fmt.Errorf("writing file %s: %w", path, err)
+		}
+		res, err := upsert.ExecContext(ctx, path, content, repoID)
 		if err != nil {
-			return fmt.Errorf("writing file %s: %w", path, err)
+			return false, fmt.Errorf("writing file %s: %w", path, err)
+		}
+		if n, err := res.RowsAffected(); err == nil && n > 0 {
+			dirty = true
 		}
 	}
-	return nil
+
+	staleDirty, err := s.deleteStaleFiles(ctx, tx, files, scope)
+	if err != nil {
+		return false, err
+	}
+	dirty = dirty || staleDirty
+
+	if own {
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
+	}
+	return dirty, nil
 }
 
-func (s *Store) populateFileContentFTS() error {
-	_, err := s.db.ExecContext(context.Background(), `INSERT INTO file_content_fts(file_content_fts) VALUES('rebuild')`)
+// deleteStaleFiles removes file rows managed by a write whose path is no longer
+// present in the incoming set. Unchanged rows were not rewritten by the upsert,
+// so their rowids are untouched and the FTS content index stays valid without a
+// rebuild.
+func (s *Store) deleteStaleFiles(ctx context.Context, tx *sql.Tx, files map[string]string, scope fileScope) (bool, error) {
+	if len(files) == 0 {
+		return false, nil
+	}
+
+	paths := make([]string, 0, len(files))
+	for p := range files {
+		paths = append(paths, p)
+	}
+
+	scopeCond := ""
+	var scopeArg any
+	if scope.repoID > 0 {
+		scopeCond = " AND repo_id = ?"
+		scopeArg = scope.repoID
+	}
+
+	dirty := false
+	for _, batch := range chunks(paths, edgesInBatchSize) {
+		query := `DELETE FROM files WHERE path NOT IN (` + inPlaceholders(len(batch)) + `)` + scopeCond
+		args := make([]any, 0, len(batch)+1)
+		for _, p := range batch {
+			args = append(args, p)
+		}
+		if scope.repoID > 0 {
+			args = append(args, scopeArg)
+		}
+		if err := s.maybeFail("files", "stale"); err != nil {
+			return false, err
+		}
+		res, err := tx.ExecContext(ctx, query, args...)
+		if err != nil {
+			return false, fmt.Errorf("removing stale file rows: %w", err)
+		}
+		if n, err := res.RowsAffected(); err == nil && n > 0 {
+			dirty = true
+		}
+	}
+	return dirty, nil
+}
+
+func (s *Store) populateFileContentFTS(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO file_content_fts(file_content_fts) VALUES('rebuild')`)
 	return err
 }
 
@@ -1984,7 +2551,13 @@ func (s *Store) SearchFileContent(pattern, filePattern string, isRegex bool, con
 	var query string
 	var args []any
 
+	var re *regexp.Regexp
 	if isRegex {
+		compiled, err := regexp.Compile(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("invalid regex %q: %w", pattern, err)
+		}
+		re = compiled
 		query = `SELECT path, content FROM files WHERE content REGEXP ?`
 		args = []any{pattern}
 	} else {
@@ -1992,22 +2565,31 @@ func (s *Store) SearchFileContent(pattern, filePattern string, isRegex bool, con
 		if sanitized == "" {
 			return nil, nil
 		}
-		query = `SELECT f.path, f.content FROM file_content_fts fts JOIN files f ON f.rowid = fts.rowid WHERE file_content_fts MATCH ?`
-		args = []any{sanitized}
+		// The FTS MATCH is a whole-content candidate prefilter; the raw pattern
+		// must still occur verbatim in the content so a row selected here always
+		// yields at least one line from the per-line extractMatches walk. Without
+		// this, a multi-term pattern whose terms sit on different lines would
+		// select the row but then produce zero matches.
+		query = `SELECT f.path, f.content FROM file_content_fts fts JOIN files f ON f.rowid = fts.rowid WHERE file_content_fts MATCH ? AND instr(f.content, ?) > 0`
+		args = []any{sanitized, pattern}
 	}
 
 	if filePattern != "" {
 		if isRegex {
 			query += " AND path REGEXP ?"
+			args = append(args, filePattern)
 		} else {
-			query += " AND f.path LIKE ?"
-			args = append(args, "%"+filePattern+"%")
+			query += " AND " + likeMatch("f.path")
+			args = append(args, likePattern(filePattern))
 		}
 	}
 
 	rows, err := s.db.QueryContext(context.Background(), query, args...)
 	if err != nil {
-		return nil, err
+		if isRegex {
+			return nil, fmt.Errorf("regex search for %q failed: %w", pattern, err)
+		}
+		return nil, fmt.Errorf("file content search failed: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -2017,7 +2599,7 @@ func (s *Store) SearchFileContent(pattern, filePattern string, isRegex bool, con
 		if err := rows.Scan(&filePath, &content); err != nil {
 			return nil, err
 		}
-		fileMatches := extractMatches(filePath, content, pattern, isRegex, contextLines)
+		fileMatches := extractMatches(filePath, content, pattern, re, isRegex, contextLines)
 		matches = append(matches, fileMatches...)
 	}
 	if err := rows.Err(); err != nil {
@@ -2026,16 +2608,12 @@ func (s *Store) SearchFileContent(pattern, filePattern string, isRegex bool, con
 	return matches, nil
 }
 
-func extractMatches(filePath, content, pattern string, isRegex bool, contextLines int) []FileMatch {
+func extractMatches(filePath, content, pattern string, re *regexp.Regexp, isRegex bool, contextLines int) []FileMatch {
 	lines := strings.Split(content, "\n")
 	var matches []FileMatch
 	for i, line := range lines {
 		var matched bool
 		if isRegex {
-			re, err := compileRegex(pattern)
-			if err != nil {
-				continue
-			}
 			matched = re.MatchString(line)
 		} else {
 			matched = strings.Contains(line, pattern)
@@ -2060,10 +2638,6 @@ func extractMatches(filePath, content, pattern string, isRegex bool, contextLine
 		}
 	}
 	return matches
-}
-
-func compileRegex(pattern string) (*regexp.Regexp, error) {
-	return regexp.Compile(pattern)
 }
 
 func (s *Store) FileContent(filePath string) (string, error) {
@@ -2105,12 +2679,40 @@ func (s *Store) FileContentsByRepo() (map[string]map[string]string, error) {
 	return out, rows.Err()
 }
 
+// applyChurn applies git-churn counts to every symbol in the given files using
+// a single UPDATE backed by a temporary staging table. The statement count is
+// independent of the number of changed files; the pos_file lookup is serviced
+// by the idx_symbols_pos_file index.
 func applyChurn(ctx context.Context, tx *sql.Tx, churn map[string]int) error {
+	if len(churn) == 0 {
+		return nil
+	}
+
+	const stagingTable = "_codemap_churn"
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE `+stagingTable+` (file_path TEXT PRIMARY KEY, count INTEGER NOT NULL)`); err != nil {
+		return fmt.Errorf("creating churn staging table: %w", err)
+	}
+	defer func() { _, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS `+stagingTable) }()
+
+	stmt, err := tx.PrepareContext(ctx, `INSERT OR REPLACE INTO `+stagingTable+` (file_path, count) VALUES (?, ?)`)
+	if err != nil {
+		return fmt.Errorf("preparing churn staging insert: %w", err)
+	}
+	defer func() { _ = stmt.Close() }()
+
 	for filePath, count := range churn {
-		_, err := tx.ExecContext(ctx, `UPDATE symbols SET churn_count = ? WHERE pos_file = ?`, count, filePath)
-		if err != nil {
-			return fmt.Errorf("applying churn to %s: %w", filePath, err)
+		if _, err := stmt.ExecContext(ctx, filePath, count); err != nil {
+			return fmt.Errorf("staging churn for %s: %w", filePath, err)
 		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE symbols
+		SET churn_count = (SELECT c.count FROM `+
+		stagingTable+` c WHERE c.file_path = symbols.pos_file)
+		WHERE pos_file IN (SELECT file_path FROM `+
+		stagingTable+`)`); err != nil {
+		return fmt.Errorf("applying batched churn: %w", err)
 	}
 	return nil
 }
@@ -2124,28 +2726,162 @@ func (s *Store) IndexedAt() (time.Time, error) {
 	return time.Parse(time.RFC3339Nano, val)
 }
 
+// IsStale reports whether the database at dbPath should be rebuilt for the
+// repo at repoPath. A database is stale when it was never indexed, was indexed
+// for a different repo path or git HEAD, holds uncommitted .go edits relative
+// to HEAD, or has .go files newer than its index timestamp.
 func IsStale(dbPath, repoPath string) (bool, error) {
+	stale, _, err := StaleReason(dbPath, repoPath)
+	return stale, err
+}
+
+// StaleReason reports whether dbPath is stale for repoPath and why. It composes
+// the same checks IsStale performs but surfaces the deciding factor so callers
+// can distinguish "uncommitted .go changes", "a .go file is newer than the
+// index", "indexed on another HEAD/path", "never indexed", and "index current".
+// Repos where git is unavailable or the repo is not under git fall back to the
+// mtime comparison only.
+func StaleReason(dbPath, repoPath string) (bool, string, error) {
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		return true, nil
+		return true, "database does not exist; never indexed", nil
 	}
 
-	indexedAt, ok := readIndexedAt(dbPath)
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return true, fmt.Sprintf("open %s: %v", dbPath, err), nil
+	}
+	defer func() { _ = db.Close() }()
+
+	indexedAt, ok, err := readIndexedAtDB(db)
+	if err != nil {
+		return true, fmt.Sprintf("indexed_at meta unreadable: %v", err), nil
+	}
 	if !ok {
-		return true, nil
+		return true, "no indexed_at meta (never indexed)", nil
 	}
 
-	if mismatch, known := repoIdentityMismatch(dbPath, repoPath); known && mismatch {
-		return true, nil
+	if mismatch, known := repoIdentityMismatchDB(db, repoPath); known && mismatch {
+		return true, "indexed for a different repo path or git HEAD than the served repo", nil
 	}
 
-	return hasNewerGoFiles(repoPath, indexedAt), nil
+	// Uncommitted edits do not change HEAD, so mtime-based checks can miss them
+	// (e.g. git apply preserving timestamps). Diffing against HEAD catches a
+	// diverged working tree deterministically — unless that exact dirty state
+	// has already been indexed (recorded via the dirty_fingerprint meta key),
+	// in which case the index already reflects the working tree.
+	dirty, fp, derr := vcs.GitDirtyDiff(repoPath, "HEAD")
+	if derr == nil {
+		stored, ok := readMetaDB(db, dirtyFingerprintKey)
+		if ok && stored == fp && !hasNewerGoFiles(repoPath, indexedAt) {
+			return false, "index reflects the current working tree", nil
+		}
+		if dirty {
+			return true, "uncommitted .go changes not covered by the current index", nil
+		}
+	}
+
+	if hasNewerGoFiles(repoPath, indexedAt) {
+		return true, "a .go file is newer than the last index", nil
+	}
+
+	return false, "index is current", nil
+}
+
+// dirtyFingerprintKey records the working-tree .go diff a database was indexed
+// from. Scoped per module (key "dirty_fingerprint" for single-repo databases,
+// "dirty_fingerprint:<module>" for workspace members).
+const dirtyFingerprintKey = "dirty_fingerprint"
+
+func dirtyFingerprintMetaKey(modulePath string) string {
+	if modulePath == "" {
+		return dirtyFingerprintKey
+	}
+	return dirtyFingerprintKey + ":" + modulePath
+}
+
+// SetDirtyFingerprint records the working-tree .go diff fingerprint the index
+// was built from, so staleness checks can tell "already indexed this exact
+// dirty state" from "new uncommitted edits since the index".
+func (s *Store) SetDirtyFingerprint(modulePath, fp string) error {
+	_, err := s.db.ExecContext(context.Background(),
+		`INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`,
+		dirtyFingerprintMetaKey(modulePath), fp)
+	return err
+}
+
+// churnDegradedKey records why git churn was unavailable at index time, so
+// churn-sensitive tools (hotspots) can report degraded risk instead of
+// pretending empty churn is real data. An empty value means "no degradation".
+const churnDegradedKey = "churn_degraded"
+
+// SetChurnDegraded records why git churn was degraded (or clears it when reason
+// is empty) for the current index.
+func (s *Store) SetChurnDegraded(reason string) error {
+	_, err := s.db.ExecContext(context.Background(),
+		`INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`, churnDegradedKey, reason)
+	return err
+}
+
+// RecordChurnDegradation persists the churn-gathering failure as degraded
+// churn. Empty repos (ErrNoCommits) are legitimate and produce no marker.
+func (s *Store) RecordChurnDegradation(churnErr error) error {
+	if churnErr == nil || errors.Is(churnErr, vcs.ErrNoCommits) {
+		return nil
+	}
+	return s.SetChurnDegraded("git churn unavailable: " + churnErr.Error())
+}
+
+// ChurnDegraded returns the recorded churn-degradation reason, or "" when the
+// index was built with real churn data.
+func (s *Store) ChurnDegraded() (string, error) {
+	var val string
+	err := s.db.QueryRowContext(context.Background(),
+		`SELECT value FROM meta WHERE key = ?`, churnDegradedKey).Scan(&val)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return val, nil
+}
+
+// RecordDirtyFingerprint captures the working-tree .go diff fingerprint of dir
+// into this database's meta for modulePath ("" for single-repo databases), so
+// staleness checks know the index already reflects this exact dirty state.
+// Failures are silently ignored: the worst case is one extra reindex.
+func (s *Store) RecordDirtyFingerprint(dir, modulePath string) {
+	if _, fp, err := vcs.GitDirtyDiff(dir, "HEAD"); err == nil {
+		_ = s.SetDirtyFingerprint(modulePath, fp)
+	}
+}
+
+// dirtyFingerprint reads the fingerprint recorded when this module was indexed.
+func (s *Store) dirtyFingerprint(modulePath string) (string, bool) {
+	var val string
+	err := s.db.QueryRowContext(context.Background(),
+		`SELECT value FROM meta WHERE key = ?`, dirtyFingerprintMetaKey(modulePath)).Scan(&val)
+	if err != nil {
+		return "", false
+	}
+	return val, true
 }
 
 // repoIdentityMismatch reports whether the DB was indexed for a different repo
 // path or git HEAD than repoPath. known is false for legacy DBs (no meta) or
 // when git is unavailable, so callers fall back to mtime-only staleness.
 func repoIdentityMismatch(dbPath, repoPath string) (mismatch, known bool) {
-	metaRepo, ok := readMeta(dbPath, "repo_path")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return true, true
+	}
+	defer func() { _ = db.Close() }()
+	return repoIdentityMismatchDB(db, repoPath)
+}
+
+// repoIdentityMismatchDB is repoIdentityMismatch against an already-open handle.
+func repoIdentityMismatchDB(db *sql.DB, repoPath string) (mismatch, known bool) {
+	metaRepo, ok := readMetaDB(db, "repo_path")
 	if !ok {
 		return false, false
 	}
@@ -2156,7 +2892,7 @@ func repoIdentityMismatch(dbPath, repoPath string) (mismatch, known bool) {
 	if filepath.Clean(metaRepo) != filepath.Clean(absRepo) {
 		return true, true
 	}
-	metaHead, ok := readMeta(dbPath, "git_head")
+	metaHead, ok := readMetaDB(db, "git_head")
 	if !ok {
 		return false, false
 	}
@@ -2167,13 +2903,7 @@ func repoIdentityMismatch(dbPath, repoPath string) (mismatch, known bool) {
 	return metaHead != head, true
 }
 
-func readMeta(dbPath, key string) (string, bool) {
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		return "", false
-	}
-	defer func() { _ = db.Close() }()
-
+func readMetaDB(db *sql.DB, key string) (string, bool) {
 	var val string
 	if err := db.QueryRowContext(context.Background(), `SELECT value FROM meta WHERE key = ?`, key).Scan(&val); err != nil {
 		return "", false
@@ -2181,23 +2911,20 @@ func readMeta(dbPath, key string) (string, bool) {
 	return val, true
 }
 
-func readIndexedAt(dbPath string) (time.Time, bool) {
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		return time.Time{}, false
-	}
-	defer func() { _ = db.Close() }()
-
+func readIndexedAtDB(db *sql.DB) (time.Time, bool, error) {
 	var val string
 	if err := db.QueryRowContext(context.Background(), `SELECT value FROM meta WHERE key = 'indexed_at'`).Scan(&val); err != nil {
-		return time.Time{}, false
+		if errors.Is(err, sql.ErrNoRows) {
+			return time.Time{}, false, nil
+		}
+		return time.Time{}, false, err
 	}
 
 	indexedAt, err := time.Parse(time.RFC3339Nano, val)
 	if err != nil {
-		return time.Time{}, false
+		return time.Time{}, false, fmt.Errorf("parse indexed_at %q: %w", val, err)
 	}
-	return indexedAt, true
+	return indexedAt, true, nil
 }
 
 func hasNewerGoFiles(repoPath string, indexedAt time.Time) bool {

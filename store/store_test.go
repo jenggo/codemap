@@ -2,12 +2,15 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"codemap/vcs"
 )
 
 func TestHealthRoundTrip(t *testing.T) {
@@ -24,7 +27,10 @@ func TestHealthRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	h := s.Health()
+	h, err := s.Health()
+	if err != nil {
+		t.Fatalf("Health: %v", err)
+	}
 	if h.RepoPath != "/repo/path" || h.GitHead != "abc123" || h.PackageCount != 5 || h.SymbolCount != 42 {
 		t.Fatalf("unexpected health: %+v", h)
 	}
@@ -108,6 +114,274 @@ func TestIsStaleOnHeadChange(t *testing.T) {
 	}
 	if !stale {
 		t.Fatal("expected stale after HEAD change")
+	}
+}
+
+// TestIsStaleOnUncommittedChanges verifies the git-diff staleness signal: an
+// uncommitted .go edit that preserves its mtime (as git apply/checkout can)
+// must still mark the database stale, because mtime-only checks would miss it.
+func TestIsStaleOnUncommittedChanges(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	head := initGitRepo(t, repo)
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := Create(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetRepoMeta(repo, head, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetIndexedAt(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	stale, reason, err := StaleReason(dbPath, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale {
+		t.Fatalf("expected fresh DB, got stale: %s", reason)
+	}
+
+	file := filepath.Join(repo, "a.go")
+	if err := os.WriteFile(file, []byte("package a\n\nvar X = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Age the file so the mtime check cannot be the deciding signal; only the
+	// git diff against HEAD can catch this edit.
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(file, past, past); err != nil {
+		t.Fatal(err)
+	}
+
+	stale, reason, err = StaleReason(dbPath, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stale {
+		t.Fatal("expected stale after uncommitted .go edit")
+	}
+	if !strings.Contains(reason, "uncommitted") {
+		t.Fatalf("expected reason to mention uncommitted changes, got %q", reason)
+	}
+}
+
+// TestHealthCorruptedDB verifies a corrupted database surfaces as a health
+// error instead of a healthy-looking empty index.
+func TestHealthCorruptedDB(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := Create(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	// Corrupt the database file underneath the open connection.
+	if err := os.WriteFile(dbPath, []byte("this is not a sqlite database at all"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.Health(); err == nil {
+		t.Fatal("expected error for corrupted database, not a healthy empty index")
+	}
+}
+
+// TestColumnExistsPropagatesError verifies a failing PRAGMA surfaces as an
+// error instead of silently reporting the column as absent.
+func TestColumnExistsPropagatesError(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := Create(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	if err := os.WriteFile(dbPath, []byte("garbage, definitely not a database"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := columnExists(s.db, "edges", "sites"); err == nil {
+		t.Fatal("expected error when PRAGMA table_info fails")
+	}
+}
+
+// TestBadTimestampSurfacesError verifies a corrupt stored timestamp is reported
+// as an error (matching IndexedAt semantics) and staleness surfaces it as the
+// reason instead of silently treating the database as "never indexed".
+func TestBadTimestampSurfacesError(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := Create(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	if err := s.SetIndexedAt(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	other, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.ExecContext(context.Background(), `UPDATE meta SET value = 'not-a-time' WHERE key = 'indexed_at'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.ExecContext(context.Background(), `INSERT OR REPLACE INTO repos (id, module_path, dir, missing, indexed_at) VALUES (1, 'example.com/x', '/tmp/x', 0, 'also-not-a-time')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.IndexedAt(); err == nil {
+		t.Fatal("expected error for corrupt indexed_at")
+	}
+	if _, _, err := s.RepoIndexedAt("example.com/x"); err == nil {
+		t.Fatal("expected error for corrupt repo indexed_at")
+	}
+
+	// Staleness surfaces the parse failure as its reason (and reindexes to
+	// heal) rather than silently looping on a "never indexed" reading.
+	stale, reason, err := StaleReason(dbPath, filepath.Join(t.TempDir(), "norepo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stale {
+		t.Fatal("expected stale for corrupt timestamp")
+	}
+	if !strings.Contains(reason, "unreadable") {
+		t.Fatalf("expected unreadable-timestamp reason, got %q", reason)
+	}
+}
+
+// TestIsStaleFingerprintPreventsReindexLoop verifies that a working tree with
+// uncommitted .go changes is only stale while its dirty state is unseen: once
+// the index records the exact dirty-state fingerprint, the index is current
+// until the working tree changes again. Without this, a legitimately dirty
+// dev tree would trigger a reindex after every query.
+func TestIsStaleFingerprintPreventsReindexLoop(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	head := initGitRepo(t, repo)
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := Create(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.SetRepoMeta(repo, head, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetIndexedAt(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	file := filepath.Join(repo, "a.go")
+	past := time.Now().Add(-time.Hour)
+	ageFile := func() {
+		t.Helper()
+		if err := os.Chtimes(file, past, past); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Unseen uncommitted edit (aged mtime so only the git-diff signal fires).
+	if err := os.WriteFile(file, []byte("package a\n\nvar X = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ageFile()
+
+	stale, reason, err := StaleReason(dbPath, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stale {
+		t.Fatal("expected stale for unseen uncommitted edit")
+	}
+	if !strings.Contains(reason, "uncommitted") {
+		t.Fatalf("expected uncommitted reason, got %q", reason)
+	}
+
+	// Record the fingerprint, as the rebuilt index writer now does.
+	_, fp, derr := vcs.GitDirtyDiff(repo, "HEAD")
+	if derr != nil {
+		t.Fatal(derr)
+	}
+	if err := s.SetDirtyFingerprint("", fp); err != nil {
+		t.Fatal(err)
+	}
+
+	stale, reason, err = StaleReason(dbPath, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale {
+		t.Fatalf("expected fresh for already-indexed dirty state, got %q", reason)
+	}
+
+	// The dirty state changes -> stale again.
+	if err := os.WriteFile(file, []byte("package a\n\nvar X = 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ageFile()
+
+	stale, reason, err = StaleReason(dbPath, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stale {
+		t.Fatal("expected stale after dirty state changed")
+	}
+	if !strings.Contains(reason, "uncommitted") {
+		t.Fatalf("expected uncommitted reason, got %q", reason)
+	}
+}
+
+// TestIsStaleOnNewerMtime verifies the mtime fallback still fires when git is
+// unavailable or clean but a .go file is newer than the last index.
+func TestIsStaleOnNewerMtime(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "nonrepo")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "a.go")
+	if err := os.WriteFile(file, []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := Create(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetIndexedAt(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bump the file's mtime into the future, strictly after the recorded
+	// indexed_at, so only the mtime signal can decide staleness.
+	future := time.Now().Add(time.Minute)
+	if err := os.Chtimes(file, future, future); err != nil {
+		t.Fatal(err)
+	}
+
+	stale, reason, err := StaleReason(dbPath, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stale {
+		t.Fatal("expected stale when .go mtime is newer than the index")
+	}
+	if !strings.Contains(reason, "never indexed") && !strings.Contains(reason, "newer than the last index") {
+		t.Fatalf("expected a meaningful staleness reason, got %q", reason)
 	}
 }
 

@@ -22,10 +22,10 @@ func handleContracts(st *store.Store, _ []query.Option, renderOpts []render.Opti
 	if repo, ok := args["repo"].(string); ok {
 		filter.Repo = repo
 	}
-	if dir, ok := args["direction"].(string); ok {
+	if dir, ok := args[keyDirection].(string); ok {
 		filter.Direction = dir
 	}
-	if sev, ok := args["severity"].(string); ok {
+	if sev, ok := args[keySeverity].(string); ok {
 		filter.Severity = sev
 	}
 	if conf, ok := args["min_confidence"].(float64); ok {
@@ -46,7 +46,7 @@ func handleContracts(st *store.Store, _ []query.Option, renderOpts []render.Opti
 
 func handleContractDrift(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
 	var severity store.DriftSeverity
-	if sev, ok := args["severity"].(string); ok {
+	if sev, ok := args[keySeverity].(string); ok {
 		severity = store.DriftSeverity(sev)
 	}
 
@@ -69,7 +69,7 @@ func handleContractDrift(st *store.Store, _ []query.Option, renderOpts []render.
 
 func handleRuntimeContracts(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
 	var kind store.RuntimeContractKind
-	if k, ok := args["kind"].(string); ok {
+	if k, ok := args[keyKind].(string); ok {
 		kind = store.RuntimeContractKind(k)
 	}
 
@@ -107,7 +107,7 @@ func handleSuppressContract(st *store.Store, _ []query.Option, renderOpts []rend
 // contractTools returns the contract intelligence MCP tool definitions.
 func contractTools() []map[string]any {
 	return []map[string]any{
-		toolDef("contracts",
+		toolDef(toolContracts,
 			"List contract edges linking producer/consumer symbols across repos. Filterable by repo, direction, severity, and confidence. Contract edges are inferred from shared message-type constants and CBOR-name-aware structural shape matching.",
 			map[string]any{
 				keyRepo:          repoProp(),

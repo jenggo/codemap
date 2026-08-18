@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -42,21 +43,37 @@ type ExtractorConfig struct {
 	// Normalize selects a built-in normalizer by name: "raw", "redis", or
 	// "subject". Empty means the raw (quote-strip) normalizer.
 	Normalize string `yaml:"normalize"`
-	// ProducerMethods are method names whose entity string-literal argument is
-	// a produced entity (write/publish side).
+	// NormalizeRules applies ordered regex-replace rules on top of Normalize,
+	// so any pattern shape (DSNs, topic ARNs, bucket names) normalizes without
+	// Go changes.
+	NormalizeRules []NormalizeRuleConfig `yaml:"normalize_rules"`
+	// ImportsMatch gates call-site extraction to files whose import block
+	// contains at least one of these substrings. Empty fires in any file. When
+	// merging into a built-in extractor of the same kind, the configured list
+	// is added to the built-in's default gate.
+	ImportsMatch []string `yaml:"imports_match"`
+	// ProducerMethods are method names whose entity string-literal arguments
+	// are produced entities (write/publish side).
 	ProducerMethods []string `yaml:"producer_methods"`
-	// ConsumerMethods are method names whose entity string-literal argument is a
-	// consumed entity (read/subscribe side).
+	// ConsumerMethods are method names whose entity string-literal arguments are
+	// consumed entities (read/subscribe side).
 	ConsumerMethods []string `yaml:"consumer_methods"`
 	// ConfigPatterns are regexes matching config literals that name a produced
 	// entity; capture group 1 is the literal.
 	ConfigPatterns []string `yaml:"config_patterns"`
-	// ArgIndex selects which string-literal argument holds the entity, 0-based.
-	// Default 0 captures the first string literal; RabbitMQ-style APIs that put
-	// a positional string (e.g. the exchange) before the routing key need 1.
+	// ArgIndex selects the first string-literal argument holding the entity,
+	// 0-based; every string-literal argument from it to the call end is
+	// captured. RabbitMQ-style APIs that put a positional string (e.g. the
+	// exchange) before the routing key need 1.
 	ArgIndex int `yaml:"arg_index"`
 	// DecodeSwitch, when true, captures `case "..."` literals as consumers.
 	DecodeSwitch bool `yaml:"decode_switch"`
+}
+
+// NormalizeRuleConfig is one ordered regex-replace normalization rule.
+type NormalizeRuleConfig struct {
+	Regex   string `yaml:"regex"`
+	Replace string `yaml:"replace"`
 }
 
 // ContractsConfig holds contract-intelligence settings.
@@ -83,38 +100,42 @@ type Config struct {
 
 // SuppressPairs converts the suppress list into a lookup map keyed by the
 // "from → to" direction written in the config.
-func (c *Config) SuppressPairs() map[string]bool {
-	pairs := c.ContractSuppressionPairs()
+func (c *Config) SuppressPairs() (map[string]bool, error) {
+	pairs, err := c.ContractSuppressionPairs()
+	if err != nil {
+		return nil, err
+	}
 	if len(pairs) == 0 {
-		return nil
+		return nil, nil
 	}
 	out := make(map[string]bool, len(pairs))
 	for _, p := range pairs {
 		out[p[0]+" → "+p[1]] = true
 	}
-	return out
+	return out, nil
 }
 
 // ContractSuppressionPairs returns the parsed from/to pairs from the
-// contracts.suppress list.
-func (c *Config) ContractSuppressionPairs() [][2]string {
+// contracts.suppress list. A malformed entry (missing the U+2192 '→'
+// separator, or an empty side) is an error naming the offending entry.
+func (c *Config) ContractSuppressionPairs() ([][2]string, error) {
 	if len(c.Contracts.Suppress) == 0 {
-		return nil
+		return nil, nil
 	}
 	var out [][2]string
-	for _, entry := range c.Contracts.Suppress {
+	for i, entry := range c.Contracts.Suppress {
 		from, to, ok := strings.Cut(entry, "→")
 		if !ok {
-			continue
+			return nil, fmt.Errorf("workspace config %s: contracts.suppress[%d] %q is missing the separator '→' (U+2192); expected e.g. \"a.b.C → d.e.F\"", c.Path, i, entry)
 		}
 		from = strings.TrimSpace(from)
 		to = strings.TrimSpace(to)
 		if from == "" || to == "" {
-			continue
+			return nil, fmt.Errorf("workspace config %s: contracts.suppress[%d] %q has an empty side", c.Path, i, entry)
 		}
 		out = append(out, [2]string{from, to})
 	}
-	return out
+	return out, nil
 }
 
 const configFileName = "codemap.yaml"
@@ -253,43 +274,106 @@ func (c *Config) Existing() []Member {
 }
 
 // ContractConfig builds a contract analysis config from the workspace,
-// carrying over contracts.suppress pairs and any custom runtime extractors
-// declared under contracts.extractors.
-func (c *Config) ContractConfig() contract.Config {
+// carrying over contracts.suppress pairs (validated) and any custom runtime
+// extractors declared under contracts.extractors, merged over the built-ins.
+// Configuration errors (negative arg_index, unknown kind, malformed suppress
+// separator, invalid normalize_rules) are returned rather than silently
+// degrading; non-fatal issues (unknown normalize name) become warnings on the
+// returned config.
+func (c *Config) ContractConfig() (contract.Config, error) {
 	cfg := contract.DefaultConfig()
-	if pairs := c.SuppressPairs(); len(pairs) > 0 {
-		cfg.SuppressPairs = pairs
+	pairs, err := c.ContractSuppressionPairs()
+	if err != nil {
+		return cfg, err
 	}
-	if exts := runtimeExtractors(c.Contracts.Extractors); len(exts) > 0 {
-		cfg.RuntimeExtractors = append(cfg.RuntimeExtractors, exts...)
+	if len(pairs) > 0 {
+		cfg.SuppressPairs = make(map[string]bool, len(pairs))
+		for _, p := range pairs {
+			cfg.SuppressPairs[p[0]+" → "+p[1]] = true
+		}
 	}
-	return cfg
+	if len(c.Contracts.Extractors) > 0 {
+		exts, warnings, err := runtimeExtractors(c.Contracts.Extractors)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.Warnings = append(cfg.Warnings, warnings...)
+		cfg.RuntimeExtractors = contract.MergeRuntimeExtractors(cfg.RuntimeExtractors, exts)
+	}
+	return cfg, nil
 }
 
 // runtimeExtractors converts codemap.yaml extractor declarations into
-// contract.RuntimeExtractor values. Unknown normalizer names fall back to the
-// raw (quote-strip) normalizer.
-func runtimeExtractors(ecs []ExtractorConfig) []contract.RuntimeExtractor {
-	if len(ecs) == 0 {
-		return nil
-	}
-	out := make([]contract.RuntimeExtractor, 0, len(ecs))
+// contract.RuntimeExtractor values. Validation is loud: a negative arg_index,
+// an empty kind, or an invalid normalize_rules regex is an error naming the
+// extractor (or rule index); an unknown normalize name produces a warning while
+// falling back to the raw (quote-strip) normalizer.
+func runtimeExtractors(ecs []ExtractorConfig) ([]contract.RuntimeExtractor, []string, error) {
+	var out []contract.RuntimeExtractor
+	var warnings []string
 	for _, ec := range ecs {
-		normalize := contract.NamedNormalizers[ec.Normalize]
-		if normalize == nil {
-			normalize = contract.NormalizeRaw
+		name := ec.Name
+		if name == "" {
+			name = ec.Kind
 		}
+		if strings.TrimSpace(ec.Kind) == "" {
+			return nil, warnings, fmt.Errorf("contracts.extractors: extractor %q has an empty kind", name)
+		}
+		if ec.ArgIndex < 0 {
+			return nil, warnings, fmt.Errorf("contracts.extractors: extractor %q has a negative arg_index (%d); arg_index must be >= 0", name, ec.ArgIndex)
+		}
+
+		var normalize func(string) string
+		var rules []contract.NormalizeRule
+		if ec.Normalize != "" || len(ec.NormalizeRules) > 0 {
+			base := contract.NamedNormalizers[ec.Normalize]
+			if base == nil && ec.Normalize != "" && ec.Normalize != "raw" {
+				warnings = append(warnings, fmt.Sprintf("extractor %q: unknown normalize %q, falling back to raw", name, ec.Normalize))
+			}
+			if base == nil {
+				base = contract.NormalizeRaw
+			}
+			compiled, err := compileNormalizeRules(ec.NormalizeRules, name)
+			if err != nil {
+				return nil, warnings, err
+			}
+			rules = compiled
+			normalize = contract.NormalizeWithRules(base, rules)
+		}
+
 		out = append(out, contract.RuntimeExtractor{
 			Kind:            store.RuntimeContractKind(ec.Kind),
-			Name:            ec.Name,
+			Name:            name,
 			ProducerMethods: ec.ProducerMethods,
 			ConsumerMethods: ec.ConsumerMethods,
 			ArgIndex:        ec.ArgIndex,
 			ConfigPatterns:  ec.ConfigPatterns,
 			ConstPrefix:     ec.ConstPrefix,
 			DecodeSwitch:    ec.DecodeSwitch,
+			ImportsMatch:    ec.ImportsMatch,
 			Normalize:       normalize,
+			NormalizeRules:  rules,
 		})
 	}
-	return out
+	return out, warnings, nil
+}
+
+// compileNormalizeRules eagerly compiles an extractor's normalize_rules,
+// erroring on an invalid regex with the rule index and extractor named.
+func compileNormalizeRules(rules []NormalizeRuleConfig, extractorName string) ([]contract.NormalizeRule, error) {
+	if len(rules) == 0 {
+		return nil, nil
+	}
+	out := make([]contract.NormalizeRule, 0, len(rules))
+	for i, r := range rules {
+		if strings.TrimSpace(r.Regex) == "" {
+			return nil, fmt.Errorf("contracts.extractors: extractor %q normalize_rules[%d] has an empty regex", extractorName, i)
+		}
+		re, err := regexp.Compile(r.Regex)
+		if err != nil {
+			return nil, fmt.Errorf("contracts.extractors: extractor %q normalize_rules[%d]: invalid regex %q: %w", extractorName, i, r.Regex, err)
+		}
+		out = append(out, contract.NormalizeRule{Re: re, Replace: r.Replace})
+	}
+	return out, nil
 }

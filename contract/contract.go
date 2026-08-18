@@ -32,8 +32,11 @@ type Config struct {
 	SuppressPairs map[string]bool
 	// RuntimeExtractors drives runtime-contract detection. When empty, the
 	// built-in extractors (redis, jetstream, ws_type) are used; entries are
-	// appended to the defaults to add new infrastructures.
+	// merged with the defaults to add or override infrastructures.
 	RuntimeExtractors []RuntimeExtractor
+	// Warnings collects non-fatal configuration issues (e.g. an unknown
+	// `normalize` name falling back to raw).
+	Warnings []string
 	// ConfidenceThreshold is the minimum confidence for non-suggested edges.
 	ConfidenceThreshold float64
 }
@@ -240,31 +243,4 @@ func associatedStruct(analysis *Analysis, repo, constQN string) (StructInfo, boo
 		}
 	}
 	return StructInfo{}, false
-}
-
-// constantsInPackage returns the set of string-constant values declared in the
-// given package of a repo.
-func constantsInPackage(analysis *Analysis, repo, pkg string) map[string]bool {
-	out := make(map[string]bool)
-	for qn, value := range analysis.ConstantsByRepo[repo] {
-		if qn == pkg || strings.HasPrefix(qn, pkg+".") {
-			out[value] = true
-		}
-	}
-	return out
-}
-
-// haveSharedConstant reports whether two structs' packages share a message type
-// string constant (i.e. they are already linked by Signal A).
-func haveSharedConstant(analysis *Analysis, a, b StructInfo) bool {
-	aConsts := constantsInPackage(analysis, a.Repo, a.PackagePath)
-	if len(aConsts) == 0 {
-		return false
-	}
-	for value := range aConsts {
-		if _, ok := constantsInPackage(analysis, b.Repo, b.PackagePath)[value]; ok {
-			return true
-		}
-	}
-	return false
 }

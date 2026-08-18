@@ -3,10 +3,14 @@ package mcp
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"codemap/contract"
@@ -20,21 +24,88 @@ import (
 )
 
 type Server struct {
-	store          *store.Store
+	store *store.Store
+
+	// Freshness/backoff memoization prevents repeated git/tree-walk and go list.
+	freshness     map[string]freshnessEntry
+	failedIndexes map[string]failedIndex
+
+	// Test/override seams.
+	handlers       map[string]toolHandler
+	stalenessCheck func(dbPath, repoPath string) (bool, error)
+	indexFn        func(absPath string) error
 	dbPath         string
 	repoPath       string
 	warnings       []string
 	reindexed      []string
-	contractCfg    contract.Config
+
+	// Filesystem allowlist roots (explicitly configured; derived otherwise).
+	allowedPaths []string
+
+	contractCfg        contract.Config
+	freshnessTTL       time.Duration
+	failedIndexBackoff time.Duration
+
+	// State mutated during dispatch; guarded by mu.
+	mu             sync.Mutex
 	hasContractCfg bool
 }
 
+// freshnessEntry memoizes one staleness-check result with its timestamp.
+type freshnessEntry struct {
+	checkedAt time.Time
+}
+
+// failedIndex records a failed auto-index attempt with its error and time.
+type failedIndex struct {
+	at  time.Time
+	err string
+}
+
+const (
+	defaultFreshnessTTL       = 3 * time.Second
+	defaultFailedIndexBackoff = 30 * time.Second
+)
+
 func New(s *store.Store) *Server {
-	return &Server{store: s, repoPath: "."}
+	return &Server{
+		store:              s,
+		repoPath:           ".",
+		freshness:          make(map[string]freshnessEntry),
+		failedIndexes:      make(map[string]failedIndex),
+		freshnessTTL:       defaultFreshnessTTL,
+		failedIndexBackoff: defaultFailedIndexBackoff,
+	}
 }
 
 func NewLazy(dbPath string) *Server {
-	return &Server{dbPath: dbPath, repoPath: "."}
+	return &Server{
+		dbPath:             dbPath,
+		repoPath:           ".",
+		freshness:          make(map[string]freshnessEntry),
+		failedIndexes:      make(map[string]failedIndex),
+		freshnessTTL:       defaultFreshnessTTL,
+		failedIndexBackoff: defaultFailedIndexBackoff,
+	}
+}
+
+// ttl returns the configured freshness TTL; zero means the default, negative
+// disables caching (every request rechecks).
+func (s *Server) ttl() time.Duration {
+	if s.freshnessTTL < 0 {
+		return -1
+	}
+	if s.freshnessTTL == 0 {
+		return defaultFreshnessTTL
+	}
+	return s.freshnessTTL
+}
+
+func (s *Server) backoff() time.Duration {
+	if s.failedIndexBackoff <= 0 {
+		return defaultFailedIndexBackoff
+	}
+	return s.failedIndexBackoff
 }
 
 // contractConfig returns the contract analysis config: the workspace-declared
@@ -47,25 +118,29 @@ func (s *Server) contractConfig() contract.Config {
 }
 
 // contractConfigFromWorkspace builds a contract analysis config from a parsed
-// workspace config (suppress pairs + custom runtime extractors).
-func contractConfigFromWorkspace(cfg *workspace.Config) contract.Config {
+// workspace config (suppress pairs + custom runtime extractors). Config errors
+// (negative arg_index, malformed suppress separator, invalid normalize_rules)
+// surface to the caller instead of silently degrading.
+func contractConfigFromWorkspace(cfg *workspace.Config) (contract.Config, error) {
 	return cfg.ContractConfig()
 }
 
 func (s *Server) getStore() (*store.Store, error) {
+	s.mu.Lock()
 	s.reindexed = nil
+	s.mu.Unlock()
 	dbPath := s.resolveDBPath()
 
 	if s.store == nil {
 		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-			if err := s.autoIndex(s.repoPath); err != nil {
+			if err := s.autoIndexMemoized(s.repoPath); err != nil {
 				return nil, fmt.Errorf("auto-index failed: %w", err)
 			}
 			return s.store, nil
 		}
 		st, err := store.Open(dbPath)
 		if err != nil {
-			if err := s.autoIndex(s.repoPath); err != nil {
+			if err := s.autoIndexMemoized(s.repoPath); err != nil {
 				return nil, fmt.Errorf("auto-index failed: %w", err)
 			}
 			return s.store, nil
@@ -82,31 +157,149 @@ func (s *Server) getStore() (*store.Store, error) {
 // refreshStale re-indexes any stale repo before the query answers. Workspace
 // databases reindex per member; single-repo databases keep the legacy
 // full-rebuild path. Repos reindexed this call are recorded for the response.
+// Results are memoized per database for the freshness TTL so the git/tree-walk
+// work runs at most once per window.
 func (s *Server) refreshStale(dbPath string) error {
 	repos, err := s.store.ListRepos()
 	if err == nil && len(repos) > 0 {
-		reindexed, rerr := workspace.ReindexStale(dbPath)
-		if rerr != nil {
-			return rerr
-		}
-		s.reindexed = append(s.reindexed, reindexed...)
+		return s.refreshWorkspaceStale(dbPath)
+	}
+	return s.refreshSingleStale(dbPath)
+}
 
-		// Reanalyze stale contract data.
-		contractReanalyzed, cerr := contract.ReanalyzeStaleContracts(s.store, s.contractConfig())
-		if cerr == nil && len(contractReanalyzed) > 0 {
-			for _, repo := range contractReanalyzed {
-				s.reindexed = append(s.reindexed, repo+" (contracts)")
-			}
-		}
-
+func (s *Server) refreshWorkspaceStale(dbPath string) error {
+	key := "workspace:" + dbPath
+	if s.freshnessValid(key) {
 		return nil
 	}
 
-	stale, _ := store.IsStale(dbPath, s.repoPath)
+	reindexed, rerr := workspace.ReindexStale(dbPath)
+	if rerr != nil {
+		return rerr
+	}
+
+	s.mu.Lock()
+	s.freshnessEntries()[key] = freshnessEntry{checkedAt: time.Now()}
+	if len(reindexed) > 0 {
+		s.reindexed = append(s.reindexed, reindexed...)
+	}
+	// Reanalyze stale contract data (non-fatal).
+	contractReanalyzed, cerr := contract.ReanalyzeStaleContracts(s.store, s.contractConfig())
+	if cerr == nil && len(contractReanalyzed) > 0 {
+		for _, repo := range contractReanalyzed {
+			s.reindexed = append(s.reindexed, repo+" (contracts)")
+		}
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Server) refreshSingleStale(dbPath string) error {
+	key := "single:" + s.repoPath
+	if s.freshnessValid(key) {
+		return nil
+	}
+
+	stale, err := s.staleCheck(dbPath, s.repoPath)
+	if err != nil {
+		return err
+	}
+	s.recordFresh(key)
 	if stale {
-		return s.autoIndex(s.repoPath)
+		// Capture why the index was considered stale *before* rebuilding, so the
+		// notice that accompanies the answer can explain it.
+		reason := "stale database"
+		if _, r, rErr := store.StaleReason(dbPath, s.repoPath); rErr == nil && r != "" {
+			reason = r
+		}
+		if err := s.autoIndexMemoized(s.repoPath); err != nil {
+			return err
+		}
+		// Informational notice, emitted only after the rebuild succeeds. Framed
+		// as a completed action so agents trust the result below instead of
+		// mistaking the auto-reindex for stale or failed data.
+		s.mu.Lock()
+		s.warnings = append(s.warnings,
+			fmt.Sprintf("index was stale (%s) and was auto-rebuilt before answering; results below reflect the latest code", reason))
+		s.mu.Unlock()
 	}
 	return nil
+}
+
+// staleCheck is the single-repo staleness probe, overridable in tests.
+func (s *Server) staleCheck(dbPath, repoPath string) (bool, error) {
+	if s.stalenessCheck != nil {
+		return s.stalenessCheck(dbPath, repoPath)
+	}
+	return store.IsStale(dbPath, repoPath)
+}
+
+// freshnessValid reports whether the memoized staleness result for key is still
+// inside the TTL window.
+func (s *Server) freshnessValid(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.freshnessEntries()[key]
+	return ok && time.Since(entry.checkedAt) < s.ttl()
+}
+
+// recordFresh stamps a successful staleness check for key.
+func (s *Server) recordFresh(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.freshnessEntries()[key] = freshnessEntry{checkedAt: time.Now()}
+}
+
+func (s *Server) freshnessEntries() map[string]freshnessEntry {
+	if s.freshness == nil {
+		s.freshness = make(map[string]freshnessEntry)
+	}
+	return s.freshness
+}
+
+// autoIndexMemoized runs autoIndex but remembers failures for the backoff
+// window, so a path that fails (missing toolchain, unparseable tree, timeout)
+// fails fast on repeat requests instead of re-running the expensive index.
+func (s *Server) autoIndexMemoized(path string) error {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	if fi, ok := s.failedIndexEntries()[absPath]; ok && time.Since(fi.at) < s.backoff() {
+		retryIn := (s.backoff() - time.Since(fi.at)).Round(time.Second)
+		s.mu.Unlock()
+		return fmt.Errorf("auto-index for %s previously failed (%s); retrying in %s",
+			absPath, fi.err, retryIn)
+	}
+	s.mu.Unlock()
+
+	if err := s.doIndex(absPath); err != nil {
+		s.mu.Lock()
+		s.failedIndexEntries()[absPath] = failedIndex{at: time.Now(), err: err.Error()}
+		s.mu.Unlock()
+		return err
+	}
+	s.mu.Lock()
+	delete(s.failedIndexEntries(), absPath)
+	s.mu.Unlock()
+	return nil
+}
+
+// doIndex is the index entry point, overridable in tests.
+func (s *Server) doIndex(absPath string) error {
+	if s.indexFn != nil {
+		return s.indexFn(absPath)
+	}
+	return s.autoIndex(absPath)
+}
+
+func (s *Server) failedIndexEntries() map[string]failedIndex {
+	if s.failedIndexes == nil {
+		s.failedIndexes = make(map[string]failedIndex)
+	}
+	return s.failedIndexes
 }
 
 func (s *Server) resolveDBPath() string {
@@ -127,8 +320,10 @@ func (s *Server) autoIndex(path string) error {
 		return fmt.Errorf("parse error: %w", err)
 	}
 	if len(parseResult.Errors) > 0 {
+		s.mu.Lock()
 		s.warnings = append(s.warnings,
 			fmt.Sprintf("%d package(s) failed to load during index; the index may be incomplete. Run 'index' to see details", len(parseResult.Errors)))
+		s.mu.Unlock()
 	}
 
 	resolveResult := resolve.Run(parseResult)
@@ -151,6 +346,7 @@ func (s *Server) autoIndex(path string) error {
 		_ = newStore.Close()
 		return fmt.Errorf("set repo meta error: %w", err)
 	}
+	newStore.RecordDirtyFingerprint(absPath, "")
 
 	if s.store != nil {
 		_ = s.store.Close()
@@ -172,12 +368,38 @@ func (s *Server) Run() error {
 		if line == "" {
 			continue
 		}
-		s.dispatchLine(line)
+		s.runLine(line)
 	}
 	return scanner.Err()
 }
 
+// runLine dispatches one request line, recovering from any panic raised by a
+// handler so a single bad request can never take down the server loop.
+func (s *Server) runLine(line string) {
+	st := &dispatchState{}
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "codemap: panic while dispatching request: %v\n%s", r, debug.Stack())
+			if st.hasID {
+				s.sendError(st.id, -32603, fmt.Sprintf("Internal error: %v", r))
+			}
+		}
+	}()
+	s.dispatchLineState(line, st)
+}
+
+// dispatchState tracks the request id so a panic mid-dispatch can still be
+// reported against the request that triggered it.
+type dispatchState struct {
+	id    json.RawMessage
+	hasID bool
+}
+
 func (s *Server) dispatchLine(line string) {
+	s.dispatchLineState(line, &dispatchState{})
+}
+
+func (s *Server) dispatchLineState(line string, st *dispatchState) {
 	var msg map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(line), &msg); err != nil {
 		s.sendError(nil, -32700, "Parse error")
@@ -191,6 +413,10 @@ func (s *Server) dispatchLine(line string) {
 	}
 
 	id, hasID := msg["id"]
+	if hasID {
+		st.id = id
+		st.hasID = true
+	}
 
 	switch methodStr {
 	case "initialize":
@@ -237,6 +463,7 @@ func (s *Server) handleToolsCall(id json.RawMessage, msg map[string]json.RawMess
 	}
 
 	result, isErr := s.handleTool(toolCall.Name, toolCall.Arguments)
+	s.mu.Lock()
 	var notices []string
 	if len(s.reindexed) > 0 {
 		notices = append(notices, "reindexed: ["+strings.Join(s.reindexed, ", ")+"]")
@@ -245,6 +472,7 @@ func (s *Server) handleToolsCall(id json.RawMessage, msg map[string]json.RawMess
 		notices = append(notices, strings.Join(s.warnings, "\n"))
 		s.warnings = nil
 	}
+	s.mu.Unlock()
 	if len(notices) > 0 {
 		result = strings.Join(notices, "\n") + "\n\n" + result
 	}
@@ -266,6 +494,18 @@ func (s *Server) handleTool(name string, args map[string]any) (string, bool) {
 	if name == "schema" {
 		return handleSchema(), false
 	}
+	if name == "changed_symbols" {
+		dir := "."
+		if v, ok := args["repo_dir"].(string); ok && v != "" {
+			dir = v
+		}
+		if _, err := s.allowedTarget(dir); err != nil {
+			return fmt.Sprintf("Error: %v", err), true
+		}
+	}
+	if err := validateToolArgs(name, args); err != nil {
+		return fmt.Sprintf("Error: %v", err), true
+	}
 
 	st, err := s.getStore()
 	if err != nil {
@@ -274,7 +514,7 @@ func (s *Server) handleTool(name string, args map[string]any) (string, bool) {
 
 	opts, renderOpts := s.buildOptions(args)
 
-	handler, ok := queryHandlers()[name]
+	handler, ok := s.toolHandlers()[name]
 	if !ok {
 		return fmt.Sprintf("Error: unknown tool %s", name), true
 	}
@@ -287,12 +527,19 @@ func (s *Server) handleTool(name string, args map[string]any) (string, bool) {
 	return result, isErr
 }
 
+func (s *Server) toolHandlers() map[string]toolHandler {
+	if s.handlers != nil {
+		return s.handlers
+	}
+	return queryHandlers()
+}
+
 func queryHandlers() map[string]toolHandler {
 	return map[string]toolHandler{
 		"overview":                  handleOverview,
 		"show":                      handleShow,
-		"callers_of":                handleCallersOf,
-		"callees_of":                handleCalleesOf,
+		toolCallersOf:               handleCallersOf,
+		toolCalleesOf:               handleCalleesOf,
 		"search":                    handleSearch,
 		keyToolPackage:              handlePackage,
 		"methods_of":                handleMethodsOf,
@@ -308,9 +555,9 @@ func queryHandlers() map[string]toolHandler {
 		"method_search":             handleMethodSearch,
 		"interface_impls":           handleInterfaceImpls,
 		"unused":                    handleUnused,
-		"cycles":                    handleCycles,
+		toolCycles:                  handleCycles,
 		"symbols_in_file":           handleSymbolsInFile,
-		"blast_radius":              handleBlastRadius,
+		toolBlastRadius:             handleBlastRadius,
 		"get_symbol_body":           handleSymbolBody,
 		"dependency_layers":         handleDependencyLayers,
 		"dependency_flow":           handleDependencyFlow,
@@ -323,7 +570,7 @@ func queryHandlers() map[string]toolHandler {
 		"health":                    handleHealth,
 		"codemap_health":            handleHealth,
 		"workspace_changed_symbols": handleWorkspaceChangedSymbols,
-		"contracts":                 handleContracts,
+		toolContracts:               handleContracts,
 		"contract_drift":            handleContractDrift,
 		"runtime_contracts":         handleRuntimeContracts,
 		"suppress_contract":         handleSuppressContract,
@@ -385,7 +632,7 @@ func handleCallersOf(st *store.Store, opts []query.Option, renderOpts []render.O
 		return errQualifiedNameRequired, true
 	}
 	opts = appendEdgeTypeFilter(args, opts)
-	if v, ok := args["depth"].(float64); ok && v > 0 {
+	if v, ok := args[keyDepth].(float64); ok && v > 0 {
 		opts = append(opts, query.WithDepth(int(v)))
 	}
 	edges, err := query.CallersOf(st, qn, opts...)
@@ -401,7 +648,7 @@ func handleCalleesOf(st *store.Store, opts []query.Option, renderOpts []render.O
 		return errQualifiedNameRequired, true
 	}
 	opts = appendEdgeTypeFilter(args, opts)
-	if v, ok := args["depth"].(float64); ok && v > 0 {
+	if v, ok := args[keyDepth].(float64); ok && v > 0 {
 		opts = append(opts, query.WithDepth(int(v)))
 	}
 	edges, err := query.CalleesOf(st, qn, opts...)
@@ -412,7 +659,10 @@ func handleCalleesOf(st *store.Store, opts []query.Option, renderOpts []render.O
 }
 
 func healthNotice(st *store.Store) string {
-	h := st.Health()
+	h, err := st.Health()
+	if err != nil {
+		return fmt.Sprintf("No results. Index health: error reading index metadata: %v", err)
+	}
 	return fmt.Sprintf("No results. Index health: indexed_at=%s repo=%s head=%s %d packages, %d symbols",
 		h.IndexedAt, h.RepoPath, h.GitHead, h.PackageCount, h.SymbolCount)
 }
@@ -422,7 +672,7 @@ func handleSearch(st *store.Store, opts []query.Option, renderOpts []render.Opti
 	if pattern == "" {
 		return errPatternRequired, true
 	}
-	if v, ok := args["kind"].(string); ok && v != "" {
+	if v, ok := args[keyKind].(string); ok && v != "" {
 		opts = append(opts, query.WithKind(v))
 	}
 	if b, ok := args["exported"].(bool); ok {
@@ -580,6 +830,11 @@ func handleFindPath(st *store.Store, opts []query.Option, renderOpts []render.Op
 	}
 	path, err := query.FindPath(st, from, to, maxDepth, opts...)
 	if err != nil {
+		// Absence is a result, not a failure: report it without the isError
+		// flag so agents do not mistake "no path exists" for a query error.
+		if errors.Is(err, query.ErrNoPath) {
+			return fmt.Sprintf("No path found from %s to %s", from, to), false
+		}
 		return fmt.Sprintf("Error: %v", err), true
 	}
 	data, err := json.Marshal(path)
@@ -666,7 +921,7 @@ func handleBlastRadius(st *store.Store, opts []query.Option, renderOpts []render
 		return errQualifiedNameRequired, true
 	}
 	depth := 3
-	if v, ok := args["depth"].(float64); ok && v > 0 {
+	if v, ok := args[keyDepth].(float64); ok && v > 0 {
 		depth = int(v)
 	}
 	result, err := query.BlastRadiusWithContracts(st, qn, depth, opts...)
@@ -686,7 +941,7 @@ func handleSymbolBody(st *store.Store, _ []query.Option, renderOpts []render.Opt
 		return errQualifiedNameRequired, true
 	}
 	contextLines := 0
-	if v, ok := args["context_lines"].(float64); ok && v > 0 {
+	if v, ok := args[keyContextLines].(float64); ok && v > 0 {
 		contextLines = int(v)
 	}
 	includeDoc := true
@@ -802,7 +1057,10 @@ func handleHealth(st *store.Store, _ []query.Option, _ []render.Option, _ map[st
 		return fmt.Sprintf("Error: %v", err), true
 	}
 	if len(repos) == 0 {
-		h := st.Health()
+		h, herr := st.Health()
+		if herr != nil {
+			return fmt.Sprintf("Error: health check failed: %v", herr), true
+		}
 		out := fmt.Sprintf("indexed_at=%s repo=%s head=%s %d packages, %d symbols",
 			h.IndexedAt, h.RepoPath, h.GitHead, h.PackageCount, h.SymbolCount)
 		return out, false
@@ -851,7 +1109,7 @@ func (s *Server) handleWorkspaceIndex(absPath string) (string, bool) {
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err), true
 	}
-	wsDBPath := filepath.Join(absPath, ".codemap", "codemap.db")
+	wsDBPath := s.dbHomeFor(absPath)
 	summaries, err := workspace.IndexAll(cfg, wsDBPath)
 	if err != nil {
 		return fmt.Sprintf("Error: workspace index: %v", err), true
@@ -871,9 +1129,17 @@ func (s *Server) handleWorkspaceIndex(absPath string) (string, bool) {
 	s.dbPath = wsDBPath
 	s.repoPath = absPath
 
-	s.contractCfg = contractConfigFromWorkspace(cfg)
+	ccfg, ccfgErr := contractConfigFromWorkspace(cfg)
+	if ccfgErr != nil {
+		return fmt.Sprintf("Error: contract config: %v", ccfgErr), true
+	}
+	s.contractCfg = ccfg
 	s.hasContractCfg = true
-	for _, p := range cfg.ContractSuppressionPairs() {
+	suppressPairs, pairsErr := cfg.ContractSuppressionPairs()
+	if pairsErr != nil {
+		return fmt.Sprintf("Error: contract suppression: %v", pairsErr), true
+	}
+	for _, p := range suppressPairs {
 		if err := st.SuppressContracts(p[0], p[1]); err != nil {
 			return fmt.Sprintf("Error: recording contract suppression: %v", err), true
 		}
@@ -889,13 +1155,25 @@ func (s *Server) handleWorkspaceIndex(absPath string) (string, bool) {
 	return strings.TrimSpace(b.String()), false
 }
 
+// finalizeIndexMeta records the working-tree fingerprint and any churn
+// degradation on a freshly written index so staleness and hotspot checks have
+// honest metadata.
+func (s *Server) finalizeIndexMeta(newStore *store.Store, absPath string, churnErr error) error {
+	newStore.RecordDirtyFingerprint(absPath, "")
+	if err := newStore.RecordChurnDegradation(churnErr); err != nil {
+		_ = newStore.Close()
+		return fmt.Errorf("set churn degradation: %w", err)
+	}
+	return nil
+}
+
 func (s *Server) handleIndex(args map[string]any) (string, bool) {
 	path := "."
 	if v, ok := args["path"].(string); ok && v != "" {
 		path = v
 	}
 
-	absPath, err := filepath.Abs(path)
+	absPath, err := s.allowedTarget(path)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err), true
 	}
@@ -905,34 +1183,44 @@ func (s *Server) handleIndex(args map[string]any) (string, bool) {
 		return s.handleWorkspaceIndex(absPath)
 	}
 
+	msg, err := s.indexSingleRepo(absPath)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err), true
+	}
+	return msg, false
+}
+
+// indexSingleRepo parses, resolves, and writes a single-repo index, swapping it
+// into the served store and reporting the resulting package/symbol/edge counts.
+func (s *Server) indexSingleRepo(absPath string) (string, error) {
 	parseResult, err := parse.Run(absPath)
 	if err != nil {
-		return fmt.Sprintf("Error: parse error: %v", err), true
+		return "", fmt.Errorf("parse error: %w", err)
 	}
-
 	resolveResult := resolve.Run(parseResult)
 
-	dbPath := filepath.Join(absPath, ".codemap", "codemap.db")
+	dbPath := s.dbHomeFor(absPath)
 	newStore, err := store.Create(dbPath)
 	if err != nil {
-		return fmt.Sprintf("Error: store error: %v", err), true
+		return "", fmt.Errorf("store error: %w", err)
 	}
 
-	churn, _ := vcs.GitFileChurn(absPath, "HEAD")
+	churn, churnErr := vcs.GitFileChurn(absPath, "HEAD")
 
 	if err := newStore.Write(resolveResult, parse.FileContents(parseResult), churn); err != nil {
 		_ = newStore.Close()
-		return fmt.Sprintf("Error: write error: %v", err), true
+		return "", fmt.Errorf("write error: %w", err)
 	}
-
 	if err := newStore.SetIndexedAt(time.Now()); err != nil {
 		_ = newStore.Close()
-		return fmt.Sprintf("Error: set indexed_at error: %v", err), true
+		return "", fmt.Errorf("set indexed_at error: %w", err)
 	}
-
 	if err := newStore.SetRepoMeta(absPath, gitHead(absPath), len(resolveResult.Packages), len(resolveResult.Symbols)); err != nil {
 		_ = newStore.Close()
-		return fmt.Sprintf("Error: set repo meta error: %v", err), true
+		return "", fmt.Errorf("set repo meta error: %w", err)
+	}
+	if err := s.finalizeIndexMeta(newStore, absPath, churnErr); err != nil {
+		return "", err
 	}
 
 	if s.store != nil {
@@ -949,7 +1237,7 @@ func (s *Server) handleIndex(args map[string]any) (string, bool) {
 	if len(parseResult.Errors) > 0 {
 		msg += fmt.Sprintf("; %d package(s) failed to load", len(parseResult.Errors))
 	}
-	return msg, false
+	return msg, nil
 }
 
 func requiredString(args map[string]any, key string) string {
@@ -957,8 +1245,253 @@ func requiredString(args map[string]any, key string) string {
 	return v
 }
 
+// allowedTarget resolves path to an absolute, symlink-real path and requires it
+// to be a known workspace member root or the served repo root. Anything else is
+// rejected so a client cannot read, parse, or write to arbitrary directories.
+func (s *Server) allowedTarget(path string) (string, error) {
+	realPath := evalRoot(path)
+	for _, root := range s.allowedRoots() {
+		if filepath.Clean(realPath) == filepath.Clean(root) {
+			return realPath, nil
+		}
+	}
+	return "", fmt.Errorf("path %s is outside the allowed index roots (%s)",
+		path, strings.Join(s.allowedRoots(), ", "))
+}
+
+// allowedRoots returns the directories the index/changed_symbols tools may
+// target: explicitly configured roots (allowedPaths), the served repo root,
+// and the workspace root plus member roots from the nearest codemap.yaml.
+func (s *Server) allowedRoots() []string {
+	roots := make([]string, 0, 4)
+	seen := make(map[string]bool)
+	add := func(p string) {
+		if p == "" {
+			return
+		}
+		if r := evalRoot(p); r != "" && !seen[r] {
+			seen[r] = true
+			roots = append(roots, r)
+		}
+	}
+	for _, p := range s.allowedPaths {
+		add(p)
+	}
+	if s.repoPath != "" {
+		add(s.repoPath)
+	}
+	if cfgPath := workspace.DefaultPath(s.repoPath); cfgPath != "" {
+		if cfg, err := workspace.Load(cfgPath); err == nil {
+			add(cfg.Root)
+			for _, m := range cfg.Members {
+				add(m.Dir)
+			}
+		}
+	}
+	return roots
+}
+
+// dbHomeFor derives the DB write location for an allowed index target: the
+// configured DB home when one is active, otherwise the target's .codemap dir.
+func (s *Server) dbHomeFor(absPath string) string {
+	if s.dbPath != "" {
+		return s.dbPath
+	}
+	return filepath.Join(absPath, ".codemap", "codemap.db")
+}
+
+// evalRoot absolutizes p and resolves symlinks so path comparisons happen on
+// the real filesystem paths.
+func evalRoot(p string) string {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return ""
+	}
+	if realPath, err := filepath.EvalSymlinks(abs); err == nil {
+		return realPath
+	}
+	return filepath.Clean(abs)
+}
+
+// --- input validation ---
+
+const edgeTypeImports = "imports"
+
+const (
+	toolBlastRadius = "blast_radius"
+	toolCallersOf   = "callers_of"
+	toolCalleesOf   = "callees_of"
+	toolContracts   = "contracts"
+	toolCycles      = "cycles"
+)
+
+var (
+	validEdgeTypes    = []string{"calls", "references", "satisfies", "embeds", edgeTypeImports}
+	validKinds        = []string{"function", "method", "type", "interface", "const", "var"}
+	validSeverities   = []string{"compatible", "breaking", "unknown"}
+	validDirections   = []string{"producer", "consumer", "shared"}
+	validRuntimeKinds = []string{"redis", "jetstream", "ws_type"}
+	validHeuristics   = []string{"main", "test", "uncalled_exported", "handler_sig", "handler_name"}
+)
+
+// intArgSpec documents one validated integer argument for a tool.
+type intArgSpec struct {
+	key string
+	min int
+	max int
+}
+
+// floatArgSpec documents one validated float argument for a tool.
+type floatArgSpec struct {
+	key  string
+	minF float64
+	maxF float64
+}
+
+// enumArgSpec documents one validated enum argument; slice=true applies the
+// check to each element of a []string argument.
+type enumArgSpec struct {
+	key     string
+	allowed []string
+	slice   bool
+}
+
+var toolIntArgs = map[string][]intArgSpec{
+	toolCallersOf:           {{key: keyDepth, min: 1, max: 100}},
+	toolCalleesOf:           {{key: keyDepth, min: 1, max: 100}},
+	toolBlastRadius:         {{key: keyDepth, min: 1, max: 100}},
+	"find_path":             {{key: "max_depth", min: 1, max: 100}},
+	"get_hotspots":          {{key: keyTopN, min: 1, max: 500}, {key: "min_complexity", min: 0, max: 1_000_000}, {key: "min_churn", min: 0, max: 1_000_000}},
+	"get_symbol_importance": {{key: keyTopN, min: 1, max: 500}, {key: "scope", min: 0, max: 1_000_000}},
+	"dependency_layers":     {{key: "top_hubs", min: 1, max: 500}},
+	"search_text":           {{key: keyContextLines, min: 0, max: 500}},
+	"get_symbol_body":       {{key: keyContextLines, min: 0, max: 500}},
+	"get_context_bundle":    {{key: "token_budget", min: 1, max: 1_000_000}},
+}
+
+var toolFloatArgs = map[string][]floatArgSpec{
+	toolContracts: {{key: "min_confidence", minF: 0, maxF: 1}},
+}
+
+var toolEnumArgs = map[string][]enumArgSpec{
+	toolCallersOf:       {{key: keyEdgeTypes, allowed: validEdgeTypes, slice: true}},
+	toolCalleesOf:       {{key: keyEdgeTypes, allowed: validEdgeTypes, slice: true}},
+	"search":            {{key: keyKind, allowed: validKinds}},
+	"edges_by_type":     {{key: "edge_type", allowed: validEdgeTypes}},
+	toolCycles:          {{key: "edge_type", allowed: validEdgeTypes}},
+	toolContracts:       {{key: keyDirection, allowed: validDirections}, {key: keySeverity, allowed: validSeverities}},
+	"contract_drift":    {{key: keySeverity, allowed: validSeverities}},
+	"runtime_contracts": {{key: keyKind, allowed: validRuntimeKinds}},
+	"entry_points":      {{key: "heuristics", allowed: validHeuristics, slice: true}},
+}
+
+// validateToolArgs rejects out-of-range numerics and unknown enum values before
+// any traversal or search work runs.
+func validateToolArgs(tool string, args map[string]any) error {
+	for _, spec := range toolIntArgs[tool] {
+		if err := validateIntArg(tool, spec.key, args, spec.min, spec.max); err != nil {
+			return err
+		}
+	}
+	for _, spec := range toolFloatArgs[tool] {
+		if err := validateFloatArg(tool, spec.key, args, spec.minF, spec.maxF); err != nil {
+			return err
+		}
+	}
+	for _, spec := range toolEnumArgs[tool] {
+		if spec.slice {
+			if err := validateStringEnumSlice(tool, spec.key, args, spec.allowed); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := validateStringArg(tool, spec.key, args, spec.allowed); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateInt is the shared integer-range validator.
+func validateInt(tool, name string, v float64, lo, hi int) (int, error) {
+	iv := int(v)
+	if float64(iv) != v {
+		return 0, fmt.Errorf("%s %s must be an integer, got %v", tool, name, v)
+	}
+	if iv < lo || iv > hi {
+		return 0, fmt.Errorf("%s %s must be between %d and %d, got %d", tool, name, lo, hi, iv)
+	}
+	return iv, nil
+}
+
+// validateIntArg validates an optional integer argument against a range.
+func validateIntArg(tool, name string, args map[string]any, lo, hi int) error {
+	raw, ok := args[name]
+	if !ok {
+		return nil
+	}
+	v, ok := raw.(float64)
+	if !ok {
+		return fmt.Errorf("%s %s must be a number, got %v", tool, name, raw)
+	}
+	_, err := validateInt(tool, name, v, lo, hi)
+	return err
+}
+
+// validateFloatArg validates an optional float argument against a range.
+func validateFloatArg(tool, name string, args map[string]any, lo, hi float64) error {
+	raw, ok := args[name]
+	if !ok {
+		return nil
+	}
+	v, ok := raw.(float64)
+	if !ok {
+		return fmt.Errorf("%s %s must be a number, got %v", tool, name, raw)
+	}
+	if v < lo || v > hi {
+		return fmt.Errorf("%s %s must be between %v and %v, got %v", tool, name, lo, hi, v)
+	}
+	return nil
+}
+
+// validateEnum is the shared enum validator; it names the allowed values so the
+// caller can fix the argument without a second round trip.
+func validateEnum(tool, name, value string, allowed []string) error {
+	if slices.Contains(allowed, value) {
+		return nil
+	}
+	return fmt.Errorf("%s %s must be one of [%s], got %q", tool, name, strings.Join(allowed, ", "), value)
+}
+
+// validateStringArg validates an optional string enum argument.
+func validateStringArg(tool, name string, args map[string]any, allowed []string) error {
+	v, ok := args[name].(string)
+	if !ok || v == "" {
+		return nil
+	}
+	return validateEnum(tool, name, v, allowed)
+}
+
+// validateStringEnumSlice validates each string in an optional []string arg.
+func validateStringEnumSlice(tool, name string, args map[string]any, allowed []string) error {
+	arr, ok := args[name].([]any)
+	if !ok {
+		return nil
+	}
+	for _, item := range arr {
+		s, ok := item.(string)
+		if !ok {
+			continue
+		}
+		if err := validateEnum(tool, name, s, allowed); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func appendEdgeTypeFilter(args map[string]any, opts []query.Option) []query.Option {
-	v, ok := args["edge_types"]
+	v, ok := args[keyEdgeTypes]
 	if !ok {
 		return opts
 	}
@@ -1009,6 +1542,9 @@ const (
 	keyToolPackage   = "package"
 	keyEvidence      = "evidence"
 	keyIndexedAt     = "indexed_at"
+	keyTopN          = "top_n"
+	keyContextLines  = "context_lines"
+	keyEdgeTypes     = "edge_types"
 )
 
 const (
@@ -1035,11 +1571,17 @@ var returnTypeSchemas = map[string]any{
 		keyExported:      "bool — whether the symbol is exported (capitalized)",
 	},
 	"EdgeDetail": map[string]any{
-		keyFromRef:  descSourceSymbolQN,
-		keyToRef:    descTargetSymbolQN,
-		keyEdgeType: "string — relationship type: calls, references, satisfies, embeds, imports",
-		keyPosFile:  "string — source file where edge occurs",
-		keyPosLine:  "int — line number where edge occurs",
+		keyFromRef:   descSourceSymbolQN,
+		keyToRef:     descTargetSymbolQN,
+		keyEdgeType:  "string — relationship type: calls, references, satisfies, embeds, imports",
+		keyPosFile:   "string — primary occurrence file (first site)",
+		keyPosLine:   "int — primary occurrence line (first site)",
+		"sites":      "[]Site — aggregated distinct occurrence locations of this edge ({file, line} objects); primary position is sites[0]",
+		"site_count": "int — number of distinct occurrence locations (equals len(sites))",
+	},
+	"Site": map[string]any{
+		"file": "string — repo-relative file path where the edge occurs",
+		"line": "int — line number where the edge occurs",
 	},
 	"SearchResult": map[string]any{
 		keyQualifiedName: descFullyQualifiedName,
@@ -1069,11 +1611,11 @@ var returnTypeSchemas = map[string]any{
 		"import_count":     "int — number of imports",
 	},
 	"EdgeTypes": map[string]any{
-		"calls":      "A calls B — function/method A invokes function/method B",
-		"references": "A references B — symbol A uses symbol B in a non-call context (field access, variable read, type usage)",
-		"satisfies":  "A satisfies B — type A implements interface B (found via callers_of on interfaces)",
-		"embeds":     "A embeds B — struct A embeds struct/interface B",
-		"imports":    "A imports B — package A imports package B",
+		"calls":         "A calls B — function/method A invokes function/method B",
+		"references":    "A references B — symbol A uses symbol B in a non-call context (field access, variable read, type usage)",
+		"satisfies":     "A satisfies B — type A implements interface B (found via callers_of on interfaces)",
+		"embeds":        "A embeds B — struct A embeds struct/interface B",
+		edgeTypeImports: "A imports B — package A imports package B",
 	},
 	"SymbolBodyResult": map[string]any{
 		keyQualifiedName: "string — fully qualified symbol name",
@@ -1093,7 +1635,7 @@ var returnTypeSchemas = map[string]any{
 		"change_type":    "string — modified | added | removed",
 		keyPosFile:       descSourceFilePath,
 		keyPosLine:       "int — start line",
-		"blast_radius":   "*BlastRadius — optional blast radius (present when with_blast_radius=true)",
+		toolBlastRadius:  "*BlastRadius — optional blast radius (present when with_blast_radius=true)",
 		keyBody:          "string — optional source body (present when include_bodies=true)",
 	},
 	"ChangedSymbolsSummary": map[string]any{
@@ -1121,7 +1663,7 @@ var returnTypeSchemas = map[string]any{
 	},
 	"FlowResult": map[string]any{
 		keyToolPackage:       "string — package path",
-		"imports":            "[]EdgeDetail — immediate intra-project imports",
+		edgeTypeImports:      "[]EdgeDetail — immediate intra-project imports",
 		"importers":          "[]EdgeDetail — immediate intra-project importers",
 		"transitive_imports": "[]EdgeDetail — transitive intra-project imports",
 	},
@@ -1169,9 +1711,9 @@ var returnTypeSchemas = map[string]any{
 		"id":         "int — contract ID",
 		keyFromRef:   descSourceSymbolQN,
 		keyToRef:     descTargetSymbolQN,
-		"direction":  "string — producer, consumer, or shared",
+		keyDirection: "string — producer, consumer, or shared",
 		"confidence": "float64 — confidence score (0-1)",
-		"severity":   "string — compatible, breaking, or unknown",
+		keySeverity:  "string — compatible, breaking, or unknown",
 		"suggested":  "bool — true if below confidence threshold",
 		keyEvidence:  descEvidence,
 		keyIndexedAt: descIndexedAt,
@@ -1181,7 +1723,7 @@ var returnTypeSchemas = map[string]any{
 		"id":         "int — drift report ID",
 		keyFromRef:   descSourceSymbolQN,
 		keyToRef:     descTargetSymbolQN,
-		"severity":   "string — compatible, breaking, or unknown",
+		keySeverity:  "string — compatible, breaking, or unknown",
 		"fields":     "[]DriftField — field-level divergence details",
 		keyEvidence:  descEvidence,
 		keyIndexedAt: descIndexedAt,
@@ -1197,11 +1739,11 @@ var returnTypeSchemas = map[string]any{
 	},
 	"RuntimeContract": map[string]any{
 		"id":         "int — runtime contract ID",
-		"kind":       "string — redis, jetstream, or ws_type",
+		keyKind:      "string — redis, jetstream, or ws_type",
 		"pattern":    "string — normalized pattern",
 		keyFromRef:   descSourceSymbolQN,
 		keyToRef:     descTargetSymbolQN,
-		"direction":  "string — producer, consumer, or shared",
+		keyDirection: "string — producer, consumer, or shared",
 		keyEvidence:  descEvidence,
 		keyIndexedAt: descIndexedAt,
 		keyRepo:      descRepoModulePath,
@@ -1248,6 +1790,9 @@ func (s *Server) handleToolsList(id json.RawMessage) {
 
 func handleSearchText(st *store.Store, qOpts []query.Option, rOpts []render.Option, args map[string]any) (string, bool) {
 	pattern := requiredString(args, "pattern")
+	if strings.TrimSpace(pattern) == "" {
+		return "Error: pattern is required", true
+	}
 	filePattern := ""
 	if v, ok := args["file_pattern"].(string); ok {
 		filePattern = v
@@ -1257,7 +1802,7 @@ func handleSearchText(st *store.Store, qOpts []query.Option, rOpts []render.Opti
 		isRegex = v
 	}
 	contextLines := 0
-	if v, ok := args["context_lines"].(float64); ok {
+	if v, ok := args[keyContextLines].(float64); ok {
 		contextLines = int(v)
 	}
 	matches, err := query.SearchText(st, pattern, filePattern, isRegex, contextLines)
@@ -1285,7 +1830,7 @@ func handleContextBundle(st *store.Store, qOpts []query.Option, rOpts []render.O
 
 func handleHotspots(st *store.Store, qOpts []query.Option, rOpts []render.Option, args map[string]any) (string, bool) {
 	topN := 10
-	if v, ok := args["top_n"].(float64); ok {
+	if v, ok := args[keyTopN].(float64); ok {
 		topN = int(v)
 	}
 	minComplexity := 0
@@ -1305,14 +1850,14 @@ func handleHotspots(st *store.Store, qOpts []query.Option, rOpts []render.Option
 
 func handleSymbolImportance(st *store.Store, qOpts []query.Option, rOpts []render.Option, args map[string]any) (string, bool) {
 	topN := 10
-	if v, ok := args["top_n"].(float64); ok {
+	if v, ok := args[keyTopN].(float64); ok {
 		topN = int(v)
 	}
 	scope := 0
 	if v, ok := args["scope"].(float64); ok {
 		scope = int(v)
 	}
-	entries, err := query.SymbolImportance(st, topN, scope)
+	entries, err := query.SymbolImportance(st, topN, scope, qOpts...)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err), true
 	}
@@ -1345,27 +1890,27 @@ func indexTools() []map[string]any {
 				"full_docs":     boolProp("Show full documentation instead of first sentence"),
 			}),
 		toolDef("show",
-			"Get full details for a Go symbol: file path, line number, type signature, documentation, and all call relationships (who calls it and what it calls). Use instead of reading source files when you need symbol context and relationships. Requires a fully qualified name like 'fmt.Println' or 'encoding/json.Decoder.Decode'.",
+			"Get full details for a Go symbol: file path, line number, type signature, documentation, and all call relationships (who calls it and what it calls). Incoming and outgoing edges are deduplicated per (from, to, type) pair and include aggregated sites and site counts. Use instead of reading source files when you need symbol context and relationships. Requires a fully qualified name like 'fmt.Println' or 'encoding/json.Decoder.Decode'.",
 			map[string]any{
 				keyQualifiedName: stringProp("Fully qualified symbol name (e.g., cli/codemap/extract.Run)"),
 				"full_docs":      boolProp("Show full documentation instead of first sentence"),
 				keyRepo:          repoProp(),
 			},
 			"qualified_name"),
-		toolDef("callers_of",
-			"Find all callers of a Go function, method, or type: returns caller names, file paths, line numbers, and edge types (calls, references, satisfies, embeds, imports). For interfaces, this returns types that implement the interface (satisfies edges). Use instead of grep for tracing call sites and understanding where a symbol is used.",
+		toolDef(toolCallersOf,
+			"Find all callers of a Go function, method, or type: returns caller names, file paths, line numbers, edge types (calls, references, satisfies, embeds, imports), aggregated sites, and site counts. Edges are deduplicated per (from, to, type) pair; each edge carries an aggregated list of distinct call sites. For interfaces, this returns types that implement the interface (satisfies edges). Use instead of grep for tracing call sites and understanding where a symbol is used.",
 			map[string]any{
 				keyQualifiedName: stringProp("Fully qualified symbol name"),
-				"edge_types":     stringArrayProp("Optional filter for specific edge types (e.g., calls, references, satisfies, embeds, imports)"),
+				keyEdgeTypes:     stringArrayProp("Optional filter for specific edge types (e.g., calls, references, satisfies, embeds, imports)"),
 				keyDepth:         intProp("Traversal depth for transitive callers (default: 1 = direct only)"),
 				keyRepo:          repoProp(),
 			},
 			"qualified_name"),
-		toolDef("callees_of",
-			"Find all functions and methods called by a Go symbol: returns callee names, file paths, line numbers, and edge types (calls, references, satisfies, embeds, imports). For types, this returns embedded types and implemented interfaces. Use to trace dependencies and understand what a function relies on.",
+		toolDef(toolCalleesOf,
+			"Find all functions and methods called by a Go symbol: returns callee names, file paths, line numbers, edge types (calls, references, satisfies, embeds, imports), aggregated sites, and site counts. Edges are deduplicated per (from, to, type) pair; each edge carries an aggregated list of distinct call sites. For types, this returns embedded types and implemented interfaces. Use to trace dependencies and understand what a function relies on.",
 			map[string]any{
 				keyQualifiedName: stringProp("Fully qualified symbol name"),
-				"edge_types":     stringArrayProp("Optional filter for specific edge types (e.g., calls, references, satisfies, embeds, imports)"),
+				keyEdgeTypes:     stringArrayProp("Optional filter for specific edge types (e.g., calls, references, satisfies, embeds, imports)"),
 				keyDepth:         intProp("Traversal depth for transitive callees (default: 1 = direct only)"),
 				keyRepo:          repoProp(),
 			},
@@ -1413,7 +1958,7 @@ func symbolTools() []map[string]any {
 			map[string]any{
 				keyPattern:      stringProp("Search pattern (case-insensitive substring match)"),
 				keyIncludeTests: boolProp("Include test packages and symbols"),
-				"kind":          stringProp("Filter by symbol kind (e.g., function, method, type, const, var, interface)"),
+				keyKind:         stringProp("Filter by symbol kind (e.g., function, method, type, const, var, interface)"),
 				"exported":      boolProp("Filter by exported status"),
 				"file":          stringProp("Filter by file path (substring match on pos_file, e.g., 'server.go' or 'mcp/')"),
 				keyRepo:         repoProp(),
@@ -1444,7 +1989,7 @@ func graphTools() []map[string]any {
 			},
 			"package_path"),
 		toolDef("edges_by_type",
-			"List all edges of a specific relationship type (calls, references, satisfies, embeds, imports) across the entire indexed codebase. Use to trace a specific category of relationships globally.",
+			"List all edges of a specific relationship type (calls, references, satisfies, embeds, imports) across the entire indexed codebase. Edges are deduplicated per (from, to, type) pair and include aggregated sites and site counts. Use to trace a specific category of relationships globally.",
 			map[string]any{
 				keyEdgeType: stringProp("Edge type to filter by (e.g., calls, references, satisfies, embeds, imports)"),
 			},
@@ -1458,7 +2003,7 @@ func graphTools() []map[string]any {
 				keyPattern:      stringProp("Search pattern (FTS5 query or regex)"),
 				"file_pattern":  stringProp("File path filter pattern (substring match, optional)"),
 				"is_regex":      boolProp("Use regex mode instead of FTS5 (default false)"),
-				"context_lines": intProp("Number of context lines around each match (default 0)"),
+				keyContextLines: intProp("Number of context lines around each match (default 0)"),
 			},
 			"pattern"),
 		toolDef("get_context_bundle",
@@ -1471,15 +2016,15 @@ func graphTools() []map[string]any {
 		toolDef("get_hotspots",
 			"Find code hotspots by combining cyclomatic complexity with git churn. Returns symbols ranked by risk score (complexity * log(churn+1)). Use to identify risky code for refactoring.",
 			map[string]any{
-				"top_n":          intProp("Number of hotspots to return (default 10)"),
+				keyTopN:          intProp("Number of hotspots to return (default 10)"),
 				"min_complexity": intProp("Minimum complexity threshold (default 0)"),
 				"min_churn":      intProp("Minimum churn count threshold (default 0)"),
 			}),
 		toolDef("get_symbol_importance",
-			"Compute symbol importance using PageRank on the import/call graph. Returns symbols ranked by their structural importance in the codebase.",
+			"Compute symbol importance using PageRank over symbol-to-symbol edges (calls + references + satisfies). Ranks symbols by real call-graph centrality; hub symbols outrank leaves. The `scope` parameter is reserved and has no effect.",
 			map[string]any{
-				"top_n": intProp("Number of results to return (default 10)"),
-				"scope": intProp("Scope filter (0=all, default 0)"),
+				keyTopN: intProp("Number of results to return (default 10)"),
+				"scope": intProp("Reserved; accepted for compatibility, has no effect"),
 			}),
 	}
 }
@@ -1530,13 +2075,13 @@ func analysisTools() []map[string]any {
 			map[string]any{
 				keyIncludeTests: boolProp("Include test packages and symbols"),
 			}),
-		toolDef("cycles",
-			"Detect cycles in a specific edge type graph (e.g., imports, calls). Returns all cycles found as paths. Use to find circular dependencies or call cycles.",
+		toolDef(toolCycles,
+			"Detect cycles in a specific edge type graph (e.g., imports, calls). Returns every distinct cycle as a canonicalized path, rotated to its smallest node, in deterministic sorted order. Results are capped at 1000 distinct cycles; when the cap is hit the last returned cycle carries a `truncated` flag. Use to find circular dependencies or call cycles.",
 			map[string]any{
 				keyEdgeType: stringProp("Edge type to check for cycles (e.g., 'imports', 'calls')"),
 			},
 			"edge_type"),
-		toolDef("blast_radius",
+		toolDef(toolBlastRadius,
 			"Analyze the impact of changing a symbol: direct callers, transitive callers, interface implementations, embedders, and type users. Returns a summary of impact metrics. Use before refactoring to understand blast radius.",
 			map[string]any{
 				keyQualifiedName: stringProp("Symbol qualified name"),
@@ -1624,7 +2169,7 @@ func sourceTools() []map[string]any {
 			"Get the source text of a single Go symbol (function, method, type, const, or var) by qualified name. Re-parses the file at query time to extract the exact declaration span, with optional doc comment and context-line padding. Replaces read(whole_file) for 'show me this one symbol' lookups with ~20x token reduction.",
 			map[string]any{
 				keyQualifiedName: stringProp("Fully qualified symbol name (e.g., cli/codemap/extract.Run)"),
-				"context_lines":  intProp("Number of file lines to include before and after the declaration as context (default 0)"),
+				keyContextLines:  intProp("Number of file lines to include before and after the declaration as context (default 0)"),
 				"include_doc":    boolProp("Prepend the leading doc comment to the body (default true)"),
 			},
 			"qualified_name"),

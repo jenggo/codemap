@@ -214,6 +214,7 @@ func TestSearchTextWorksAfterMCPIndex(t *testing.T) {
 	}
 
 	s := NewLazy("")
+	s.allowedPaths = []string{dst}
 	out := captureStdout(func() {
 		s.dispatchLine(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"index","arguments":{"path":%q}}}`, dst))
 	})

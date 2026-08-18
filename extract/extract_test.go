@@ -7,62 +7,67 @@ import (
 	"testing"
 )
 
-func parseFunc(t *testing.T, code string) *ast.FuncDecl {
+// singleFuncComplexity runs the extractor over code and returns the complexity
+// recorded for its single function symbol. This exercises the production walk,
+// where complexity is computed inline rather than by a standalone inspect.
+func singleFuncComplexity(t *testing.T, code string) int {
 	t.Helper()
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "test.go", code, 0)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	for _, decl := range f.Decls {
-		if fd, ok := decl.(*ast.FuncDecl); ok {
-			return fd
+	res := Run("main", map[string]*ast.File{"test.go": f}, fset, false)
+
+	var funcSyms []Symbol
+	for _, s := range res.Symbols {
+		if s.Kind == "function" {
+			funcSyms = append(funcSyms, s)
 		}
 	}
-	t.Fatal("no FuncDecl found")
-	return nil
+	if len(funcSyms) != 1 {
+		t.Fatalf("expected exactly 1 function symbol, got %d (%d total symbols)", len(funcSyms), len(res.Symbols))
+	}
+	return funcSyms[0].Complexity
 }
 
 func TestComputeComplexity_Simple(t *testing.T) {
-	fd := parseFunc(t, `package main
+	c := singleFuncComplexity(t, `package main
 func simple() {}
 `)
-	c := computeComplexity(fd)
 	if c != 1 {
 		t.Errorf("expected 1, got %d", c)
 	}
 }
 
 func TestComputeComplexity_If(t *testing.T) {
-	fd := parseFunc(t, `package main
+	c := singleFuncComplexity(t, `package main
 func withIf(x int) {
 	if x > 0 {
 		return
 	}
 }
 `)
-	c := computeComplexity(fd)
 	if c != 2 {
 		t.Errorf("expected 2, got %d", c)
 	}
 }
 
 func TestComputeComplexity_For(t *testing.T) {
-	fd := parseFunc(t, `package main
+	c := singleFuncComplexity(t, `package main
 func withFor() {
 	for i := 0; i < 10; i++ {
 		_ = i
 	}
 }
 `)
-	c := computeComplexity(fd)
 	if c != 2 {
 		t.Errorf("expected 2, got %d", c)
 	}
 }
 
 func TestComputeComplexity_Switch(t *testing.T) {
-	fd := parseFunc(t, `package main
+	c := singleFuncComplexity(t, `package main
 func withSwitch(x int) {
 	switch x {
 	case 1:
@@ -71,7 +76,6 @@ func withSwitch(x int) {
 	}
 }
 `)
-	c := computeComplexity(fd)
 	// base=1, 3 cases=3 → 4 (standard McCabe: switch itself not counted)
 	if c != 4 {
 		t.Errorf("expected 4 (1 base + 3 cases), got %d", c)
@@ -79,37 +83,65 @@ func withSwitch(x int) {
 }
 
 func TestComputeComplexity_LogicalOps(t *testing.T) {
-	fd := parseFunc(t, `package main
+	c := singleFuncComplexity(t, `package main
 func withLogic(a, b bool) {
 	if a && b || a {
 	}
 }
 `)
-	c := computeComplexity(fd)
 	if c != 4 {
 		t.Errorf("expected 4, got %d", c)
 	}
 }
 
 func TestComputeComplexity_NilBody(t *testing.T) {
-	code := `package main
+	c := singleFuncComplexity(t, `package main
 func empty()
-`
+`)
+	if c != 1 {
+		t.Errorf("expected 1 for nil body, got %d", c)
+	}
+}
+
+// TestComputeComplexity_NestedFuncLitCountsIntoOwner verifies complexity inside
+// a func literal nested in a function body still counts toward the enclosing
+// function, while a package-scope func literal does not leak into a preceding
+// function's count.
+func TestComputeComplexity_NestedFuncLitCountsIntoOwner(t *testing.T) {
 	fset := token.NewFileSet()
+	code := `package main
+func first() {
+	var _ = func(x int) {
+		if x > 0 {
+		}
+	}
+}
+var g = func(x int) {
+	if x > 0 {
+	}
+}
+`
 	f, err := parser.ParseFile(fset, "test.go", code, 0)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	for _, decl := range f.Decls {
-		if fd, ok := decl.(*ast.FuncDecl); ok {
-			c := computeComplexity(fd)
-			if c != 1 {
-				t.Errorf("expected 1 for nil body, got %d", c)
+	res := Run("main", map[string]*ast.File{"test.go": f}, fset, false)
+
+	for _, s := range res.Symbols {
+		switch s.Name {
+		case "first":
+			// 1 base + 1 if inside the nested func literal.
+			if s.Complexity != 2 {
+				t.Errorf("first() complexity = %d, want 2 (nested func lit counted)", s.Complexity)
 			}
-			return
+		case "g":
+			// g is a var of function type; its body's `if` must NOT leak into
+			// first()'s count (already asserted above).
+			if s.Kind != "var" {
+				t.Errorf("g() symbol kind = %q, want var", s.Kind)
+			}
 		}
 	}
-	t.Fatal("no FuncDecl found")
 }
 
 func TestWireNameGenericTags(t *testing.T) {
