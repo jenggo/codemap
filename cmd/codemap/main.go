@@ -237,6 +237,10 @@ func dispatchCommand(cmd string, args []string, flags parsedFlags, queryOpts []q
 		cmdIndex(path, flags.dbPath, flags.workspace, flags.discover)
 	case "init", "inject":
 		cmdInit()
+	case "update-agents":
+		if err := initcmd.UpdateAgents(); err != nil {
+			return err
+		}
 	case "serve":
 		cmdServe(flags.dbPath)
 	case "workspace":
@@ -343,6 +347,15 @@ func cmdIndex(path, dbPath string, workspace, discover bool) {
 	}
 	defer func() { _ = s.Close() }()
 
+	writeIndexStore(s, absPath, parseResult, resolveResult)
+
+	fmt.Printf("Indexed %d packages, %d symbols, %d edges\n",
+		len(resolveResult.Packages),
+		len(resolveResult.Symbols),
+		len(resolveResult.Edges))
+}
+
+func writeIndexStore(s *store.Store, absPath string, parseResult *parse.Result, resolveResult *resolve.Result) {
 	churn, churnErr := vcs.GitFileChurn(absPath, "HEAD")
 
 	if err := s.Write(resolveResult, parse.FileContents(parseResult), churn); err != nil {
@@ -356,7 +369,11 @@ func cmdIndex(path, dbPath string, workspace, discover bool) {
 	}
 
 	head, _ := vcs.GitHead(absPath)
-	if err := s.SetRepoMeta(absPath, head, len(resolveResult.Packages), len(resolveResult.Symbols)); err != nil {
+	indexedVia := "go-list"
+	if parseResult.Fallback {
+		indexedVia = "dir-walk"
+	}
+	if err := s.SetRepoMetaWith(absPath, head, len(resolveResult.Packages), len(resolveResult.Symbols), indexedVia); err != nil {
 		fmt.Fprintf(os.Stderr, "Set repo meta error: %v\n", err)
 		return
 	}
@@ -365,11 +382,6 @@ func cmdIndex(path, dbPath string, workspace, discover bool) {
 		fmt.Fprintf(os.Stderr, "Set churn degradation error: %v\n", err)
 		return
 	}
-
-	fmt.Printf("Indexed %d packages, %d symbols, %d edges\n",
-		len(resolveResult.Packages),
-		len(resolveResult.Symbols),
-		len(resolveResult.Edges))
 }
 
 func cmdIndexWorkspace(path, dbPath string, discover bool) {

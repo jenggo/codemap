@@ -1,6 +1,6 @@
 {
   "packages": 1,
-  "symbols": 6,
+  "symbols": 8,
   "edges": 14,
   "overview": [
     {
@@ -58,6 +58,16 @@
           "Exported": true
         },
         {
+          "QualifiedName": "codemap/testdata/interfaces.Reader.Read",
+          "Kind": "method",
+          "Receiver": "Reader",
+          "Signature": "func (p []byte) (n int, err error)",
+          "Doc": "",
+          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/interfaces/interfaces.go",
+          "PosLine": 5,
+          "Exported": true
+        },
+        {
           "QualifiedName": "codemap/testdata/interfaces.Writer",
           "Kind": "interface",
           "Receiver": "",
@@ -65,6 +75,16 @@
           "Doc": "Writer defines an interface for writing data.\n",
           "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/interfaces/interfaces.go",
           "PosLine": 9,
+          "Exported": true
+        },
+        {
+          "QualifiedName": "codemap/testdata/interfaces.Writer.Write",
+          "Kind": "method",
+          "Receiver": "Writer",
+          "Signature": "func (p []byte) (n int, err error)",
+          "Doc": "",
+          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/interfaces/interfaces.go",
+          "PosLine": 10,
           "Exported": true
         }
       ],
@@ -76,7 +96,7 @@
       "Path": "codemap/testdata/interfaces",
       "Name": "interfaces",
       "Dir": "/home/jenggo/go/src/cli/codemap/testdata/interfaces",
-      "SymCount": 6,
+      "SymCount": 8,
       "IsTest": false
     }
   ]

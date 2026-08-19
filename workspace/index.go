@@ -3,6 +3,8 @@ package workspace
 import (
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/token"
 	"maps"
 	"os"
 	"sort"
@@ -27,7 +29,9 @@ type IndexSummary struct {
 
 // IndexAll indexes every member of the workspace into dbPath, attributing
 // packages/symbols/edges/files to their repo. Missing members are registered
-// but not parsed; queries for them will report "repo not indexed".
+// but not parsed; queries for them will report "repo not indexed". A member
+// that fails to parse is reported in the summary but does not block other
+// members from being indexed.
 func IndexAll(cfg *Config, dbPath string) ([]IndexSummary, error) {
 	specs := make([]store.RepoSpec, 0, len(cfg.Members))
 	roots := make([]parse.WorkspaceRoot, 0, len(cfg.Members))
@@ -38,12 +42,9 @@ func IndexAll(cfg *Config, dbPath string) ([]IndexSummary, error) {
 		}
 	}
 
-	parseResult, err := parse.RunWorkspace(roots)
-	if err != nil {
-		return nil, fmt.Errorf("workspace parse: %w", err)
-	}
+	merged, parseErrors := parseWorkspace(roots)
 
-	resolveResult := resolve.Run(parseResult)
+	resolveResult := resolve.Run(merged)
 	churn, churnErr := mergedChurn(cfg.Existing())
 
 	s, err := store.Create(dbPath)
@@ -52,29 +53,92 @@ func IndexAll(cfg *Config, dbPath string) ([]IndexSummary, error) {
 	}
 	defer func() { _ = s.Close() }()
 
-	if err := s.WriteWorkspace(resolveResult, parse.FileContents(parseResult), churn, specs); err != nil {
-		return nil, fmt.Errorf("workspace write: %w", err)
+	indexedVia := "go-list"
+	if merged.Fallback {
+		indexedVia = "dir-walk"
+	}
+	if err := writeWorkspaceStore(s, cfg, resolveResult, parse.FileContents(merged), churn, churnErr, specs, indexedVia); err != nil {
+		return nil, err
 	}
 
+	summaries := buildSummaries(cfg, resolveResult)
+	overlayParseErrors(summaries, parseErrors)
+	return summaries, nil
+}
+
+// parseWorkspace tries combined parsing; on failure falls back to per-member.
+func parseWorkspace(roots []parse.WorkspaceRoot) (*parse.Result, []string) {
+	type parseFail struct{ module string }
+	var fails []parseFail
+
+	merged, err := parse.RunWorkspace(roots)
+	if err == nil {
+		return merged, nil
+	}
+
+	merged = &parse.Result{
+		Files: make(map[string]*ast.File),
+		Fset:  token.NewFileSet(),
+	}
+	for _, root := range roots {
+		pr, perr := parse.RunWorkspace([]parse.WorkspaceRoot{root})
+		if perr != nil {
+			fails = append(fails, parseFail{module: root.ModulePath})
+			continue
+		}
+		merged.Packages = append(merged.Packages, pr.Packages...)
+		maps.Copy(merged.Files, pr.Files)
+		merged.Errors = append(merged.Errors, pr.Errors...)
+		merged.Fallback = merged.Fallback || pr.Fallback
+	}
+
+	modules := make([]string, len(fails))
+	for i, f := range fails {
+		modules[i] = f.module
+	}
+	return merged, modules
+}
+
+func writeWorkspaceStore(s *store.Store, cfg *Config, resolveResult *resolve.Result, contents map[string]string, churn map[string]int, churnErr error, specs []store.RepoSpec, indexedVia string) error {
+	if err := s.WriteWorkspace(resolveResult, contents, churn, specs); err != nil {
+		return fmt.Errorf("workspace write: %w", err)
+	}
+	if err := s.SetIndexedVia(indexedVia); err != nil {
+		return fmt.Errorf("set indexed_via: %w", err)
+	}
 	now := time.Now()
 	for _, m := range cfg.Existing() {
 		if err := s.SetRepoIndexedAt(m.Module, now); err != nil {
-			return nil, fmt.Errorf("set indexed_at for %s: %w", m.Module, err)
+			return fmt.Errorf("set indexed_at for %s: %w", m.Module, err)
 		}
 		s.RecordDirtyFingerprint(m.Dir, m.Module)
 	}
 	if err := s.SetChurnDegraded(churnReason(churnErr)); err != nil {
-		return nil, fmt.Errorf("set churn degradation: %w", err)
+		return fmt.Errorf("set churn degradation: %w", err)
 	}
 	for _, m := range cfg.Members {
 		if m.Missing {
 			if err := s.SetRepoMissing(m.Module, true); err != nil {
-				return nil, err
+				return err
 			}
 		}
 	}
+	return nil
+}
 
-	return buildSummaries(cfg, resolveResult), nil
+func overlayParseErrors(summaries []IndexSummary, failedModules []string) {
+	failed := make(map[string]bool, len(failedModules))
+	for _, m := range failedModules {
+		failed[m] = true
+	}
+	for i := range summaries {
+		if failed[summaries[i].Repo] {
+			summaries[i].State = "parse_error"
+			summaries[i].Symbols = 0
+			summaries[i].Edges = 0
+			summaries[i].Packages = 0
+		}
+	}
 }
 
 // ReindexRepo re-indexes a single member (parse + write) into an existing

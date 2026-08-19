@@ -117,8 +117,8 @@ func getExportedNamedTypes(pkg *types.Package) map[string]*types.Named {
 		if !obj.Exported() {
 			continue
 		}
-		named, ok := obj.Type().(*types.Named)
-		if !ok {
+		named := underlyingNamed(obj.Type())
+		if named == nil {
 			continue
 		}
 		result[name] = named
@@ -129,6 +129,14 @@ func getExportedNamedTypes(pkg *types.Package) map[string]*types.Named {
 func isInterfaceNamed(named *types.Named) bool {
 	_, ok := named.Underlying().(*types.Interface)
 	return ok
+}
+
+// underlyingNamed unwraps *types.Alias (Go 1.22+) to the underlying *types.Named.
+// Returns nil if the type is not a Named or Alias-wrapping-Named.
+func underlyingNamed(t types.Type) *types.Named {
+	unaliased := types.Unalias(t)
+	named, _ := unaliased.(*types.Named)
+	return named
 }
 
 func resolveCrossPackageSatisfaction(typePackages []*types.Package, result *Result) {
@@ -229,8 +237,11 @@ func processPackage(conf *types.Config, ctx *parseContext, pkgInfo parse.Package
 
 	resolveCallSites(fileMap, ctx.fset, info, pkgInfo.ImportPath, result)
 	resolveReferences(fileMap, ctx.fset, info, pkgInfo.ImportPath, result)
-	resolveInterfaceSatisfaction(typePkg, pkgInfo.ImportPath, result)
-	resolveStructEmbedding(typePkg, pkgInfo.ImportPath, result)
+	if typePkg != nil {
+		resolveInterfaceSatisfaction(typePkg, pkgInfo.ImportPath, result)
+		resolveStructEmbedding(typePkg, pkgInfo.ImportPath, result)
+	}
+	resolveCgoRefs(fileMap, ctx.fset, pkgInfo.ImportPath, result)
 
 	return typePkg
 }
@@ -246,6 +257,11 @@ func resolveCallSites(files map[string]*ast.File, fset *token.FileSet, info *typ
 					currentFunc = pkgPath + "." + recvTypeString(node.Recv.List[0].Type) + "." + node.Name.Name
 				} else {
 					currentFunc = pkgPath + "." + node.Name.Name
+				}
+
+			case *ast.GenDecl:
+				if name := genDeclCurrentName(node, pkgPath); name != "" {
+					currentFunc = name
 				}
 
 			case *ast.CallExpr:
@@ -327,10 +343,16 @@ func addReferenceEdge(from, to string, pos token.Position, result *Result) {
 	})
 }
 
-func resolveSelectorRef(node *ast.SelectorExpr, currentFunc string, fset *token.FileSet, info *types.Info, result *Result) {
-	if currentFunc == "" {
+func resolveSelectorRef(node *ast.SelectorExpr, currentDecl string, fset *token.FileSet, info *types.Info, result *Result) {
+	if currentDecl == "" {
 		return
 	}
+	// Method values (f := svc.Get), field accesses (svc.x), and method
+	// expressions (T.M) are all present in info.Selections. The Sel ident
+	// of these expressions is handled by resolveIdentRef, so skip here to
+	// avoid double-emit. Callee selections (svc.Get()) are skipped by the
+	// calleeNodes filter in resolveReferences and produce calls edges via
+	// resolveCallExpr.
 	if _, ok := info.Selections[node]; ok {
 		return
 	}
@@ -342,13 +364,13 @@ func resolveSelectorRef(node *ast.SelectorExpr, currentFunc string, fset *token.
 		return
 	}
 	toRef := objectQualifiedName(obj)
-	if toRef != "" && toRef != currentFunc {
-		addReferenceEdge(currentFunc, toRef, fset.Position(node.Pos()), result)
+	if toRef != "" && toRef != currentDecl {
+		addReferenceEdge(currentDecl, toRef, fset.Position(node.Pos()), result)
 	}
 }
 
-func resolveIdentRef(node *ast.Ident, currentFunc string, fset *token.FileSet, info *types.Info, result *Result) {
-	if currentFunc == "" {
+func resolveIdentRef(node *ast.Ident, currentDecl string, fset *token.FileSet, info *types.Info, result *Result) {
+	if currentDecl == "" {
 		return
 	}
 	obj, ok := info.Uses[node]
@@ -359,50 +381,60 @@ func resolveIdentRef(node *ast.Ident, currentFunc string, fset *token.FileSet, i
 		return
 	}
 	toRef := objectQualifiedName(obj)
-	if toRef != "" && toRef != currentFunc {
-		addReferenceEdge(currentFunc, toRef, fset.Position(node.Pos()), result)
+	if toRef != "" && toRef != currentDecl {
+		addReferenceEdge(currentDecl, toRef, fset.Position(node.Pos()), result)
 	}
 }
 
 func resolveReferences(files map[string]*ast.File, fset *token.FileSet, info *types.Info, pkgPath string, result *Result) {
 	for _, astFile := range files {
-		var currentFunc string
+		var currentDecl string
 
-		// Nodes that are the callee of a call expression already produce a
-		// `calls` edge (resolveCallSites runs first). Emitting a `references`
-		// edge for the same expression would double-count the call site in every
-		// edge-based metric, so callee identifiers and selector expressions are
-		// skipped here. Method values (`f := obj.Get`) and non-call selectors
-		// (field access, type references) are not call callees and still emit
-		// `references`. A single pre-order walk suffices because the CallExpr is
-		// visited before its callee children, so the callee set is complete
-		// when the children are reached — the former separate collection pass
-		// is gone (one walk per reference-exposed declaration instead of two).
+		// First pass: collect all nodes that are part of a call-expression's
+		// callee (the function being called and all its descendants). These
+		// nodes already produce `calls` edges via resolveCallSites, so they
+		// must be skipped during the reference walk.
 		calleeNodes := make(map[ast.Node]bool)
+		ast.Inspect(astFile, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok {
+				markCallees(call.Fun, calleeNodes)
+			}
+			return true
+		})
+
+		// Second pass: walk the AST to emit reference edges.
 		ast.Inspect(astFile, func(n ast.Node) bool {
 			switch node := n.(type) {
 			case *ast.FuncDecl:
-				currentFunc = funcDeclName(node, pkgPath)
-			case *ast.CallExpr:
-				switch fun := node.Fun.(type) {
-				case *ast.SelectorExpr:
-					calleeNodes[fun] = true
-					calleeNodes[fun.Sel] = true
-				case *ast.Ident:
-					calleeNodes[fun] = true
+				currentDecl = funcDeclName(node, pkgPath)
+			case *ast.GenDecl:
+				if name := genDeclCurrentName(node, pkgPath); name != "" {
+					currentDecl = name
 				}
 			case *ast.SelectorExpr:
 				if !calleeNodes[node] {
-					resolveSelectorRef(node, currentFunc, fset, info, result)
+					resolveSelectorRef(node, currentDecl, fset, info, result)
 				}
 			case *ast.Ident:
 				if !calleeNodes[node] {
-					resolveIdentRef(node, currentFunc, fset, info, result)
+					resolveIdentRef(node, currentDecl, fset, info, result)
 				}
 			}
 			return true
 		})
 	}
+}
+
+// markCallees marks a call-expression's function node and all its
+// descendant idents/selector-exprs as callee nodes so that
+// resolveReferences skips them.
+func markCallees(fun ast.Node, calleeNodes map[ast.Node]bool) {
+	ast.Inspect(fun, func(n ast.Node) bool {
+		if n != nil {
+			calleeNodes[n] = true
+		}
+		return true
+	})
 }
 
 func funcDeclName(fd *ast.FuncDecl, pkgPath string) string {
@@ -412,6 +444,22 @@ func funcDeclName(fd *ast.FuncDecl, pkgPath string) string {
 	return pkgPath + "." + fd.Name.Name
 }
 
+// genDeclCurrentName returns the current declaration name from a GenDecl spec.
+// For ValueSpec it returns the last name; for TypeSpec it returns the type name.
+func genDeclCurrentName(node *ast.GenDecl, pkgPath string) string {
+	for _, spec := range node.Specs {
+		switch s := spec.(type) {
+		case *ast.ValueSpec:
+			if len(s.Names) > 0 {
+				return pkgPath + "." + s.Names[len(s.Names)-1].Name
+			}
+		case *ast.TypeSpec:
+			return pkgPath + "." + s.Name.Name
+		}
+	}
+	return ""
+}
+
 func recvTypeString(expr ast.Expr) string {
 	switch t := expr.(type) {
 	case *ast.Ident:
@@ -419,6 +467,8 @@ func recvTypeString(expr ast.Expr) string {
 	case *ast.StarExpr:
 		return recvTypeString(t.X)
 	case *ast.IndexExpr:
+		return recvTypeString(t.X)
+	case *ast.IndexListExpr:
 		return recvTypeString(t.X)
 	default:
 		return ""
@@ -473,8 +523,8 @@ func funcQualifiedName(fn *types.Func, pkgPath string) string {
 	if ptr, ok := recvType.(*types.Pointer); ok {
 		recvType = ptr.Elem()
 	}
-	named, ok := recvType.(*types.Named)
-	if !ok {
+	named := underlyingNamed(recvType)
+	if named == nil {
 		return pkgPath + "." + fn.Name()
 	}
 	return pkgPath + "." + named.Obj().Name() + "." + fn.Name()
@@ -496,8 +546,8 @@ func exportedNonInterfaceNamed(scope *types.Scope, name string) (*types.Named, b
 	if !obj.Exported() {
 		return nil, false
 	}
-	named, ok := obj.Type().(*types.Named)
-	if !ok {
+	named := underlyingNamed(obj.Type())
+	if named == nil {
 		return nil, false
 	}
 	if isInterfaceNamed(named) {
@@ -511,8 +561,8 @@ func exportedInterfaceNamed(scope *types.Scope, name string) (*types.Named, bool
 	if !obj.Exported() {
 		return nil, false
 	}
-	named, ok := obj.Type().(*types.Named)
-	if !ok {
+	named := underlyingNamed(obj.Type())
+	if named == nil {
 		return nil, false
 	}
 	if !isInterfaceNamed(named) {
@@ -550,37 +600,63 @@ func resolveStructEmbedding(pkg *types.Package, pkgPath string, result *Result) 
 		if !obj.Exported() {
 			continue
 		}
-		named, ok := obj.Type().(*types.Named)
-		if !ok {
+		named := underlyingNamed(obj.Type())
+		if named == nil {
 			continue
 		}
-		st, ok := named.Underlying().(*types.Struct)
-		if !ok {
-			continue
+		switch u := named.Underlying().(type) {
+		case *types.Struct:
+			collectStructEmbeds(pkgPath, name, u, result)
+		case *types.Interface:
+			collectInterfaceEmbeds(pkgPath, name, u, result)
 		}
+	}
+}
 
-		for field := range st.Fields() {
-			if !field.Embedded() {
-				continue
-			}
-			fieldNamed, ok := field.Type().(*types.Named)
-			if !ok {
-				continue
-			}
-			embeddedPkg := fieldNamed.Obj().Pkg()
-			embeddedPkgPath := ""
-			if embeddedPkg != nil {
-				embeddedPkgPath = embeddedPkg.Path()
-			}
-			result.Edges = append(result.Edges, ResolvedEdge{
-				Edge: extract.Edge{
-					FromRef:  pkgPath + "." + name,
-					ToRef:    embeddedPkgPath + "." + fieldNamed.Obj().Name(),
-					EdgeType: "embeds",
-					Pos:      extract.Position{File: "", Line: 0},
-				},
-			})
+func collectStructEmbeds(pkgPath, name string, st *types.Struct, result *Result) {
+	for field := range st.Fields() {
+		if !field.Embedded() {
+			continue
 		}
+		fieldNamed := underlyingNamed(field.Type())
+		if fieldNamed == nil {
+			continue
+		}
+		embPkg := fieldNamed.Obj().Pkg()
+		embPkgPath := ""
+		if embPkg != nil {
+			embPkgPath = embPkg.Path()
+		}
+		result.Edges = append(result.Edges, ResolvedEdge{
+			Edge: extract.Edge{
+				FromRef:  pkgPath + "." + name,
+				ToRef:    embPkgPath + "." + fieldNamed.Obj().Name(),
+				EdgeType: "embeds",
+				Pos:      extract.Position{File: "", Line: 0},
+			},
+		})
+	}
+}
+
+func collectInterfaceEmbeds(pkgPath, name string, iface *types.Interface, result *Result) {
+	for embType := range iface.EmbeddedTypes() {
+		embNamed, ok := embType.(*types.Named)
+		if !ok {
+			continue
+		}
+		embPkg := embNamed.Obj().Pkg()
+		embPkgPath := ""
+		if embPkg != nil {
+			embPkgPath = embPkg.Path()
+		}
+		result.Edges = append(result.Edges, ResolvedEdge{
+			Edge: extract.Edge{
+				FromRef:  pkgPath + "." + name,
+				ToRef:    embPkgPath + "." + embNamed.Obj().Name(),
+				EdgeType: "embeds",
+				Pos:      extract.Position{File: "", Line: 0},
+			},
+		})
 	}
 }
 
@@ -689,4 +765,68 @@ func (i *importer) importExternal(path string) (*types.Package, error) {
 	i.memo[path] = pkg
 	i.mu.Unlock()
 	return pkg, nil
+}
+
+// resolveCgoRefs detects cgo files (those importing "C"), emits a per-file
+// warning, maps C.foo selector expressions to cgo/foo pseudo-symbols with
+// references edges, and inserts cgo/* symbol rows so show/search can explain
+// them.
+func resolveCgoRefs(files map[string]*ast.File, fset *token.FileSet, pkgPath string, result *Result) {
+	cgoNames := make(map[string]bool)
+
+	for filePath, astFile := range files {
+		if !isCgoFile(astFile) {
+			continue
+		}
+		result.Warnings = append(result.Warnings,
+			fmt.Sprintf("cgo: file %s uses cgo; C.foo references are mapped to cgo/foo pseudo-symbols", filePath))
+		walkCgoFile(astFile, fset, pkgPath, cgoNames, result)
+	}
+
+	for name := range cgoNames {
+		result.Symbols = append(result.Symbols, ResolvedSymbol{
+			Symbol: extract.Symbol{
+				QualifiedName: name,
+				Name:          name,
+				Kind:          "function",
+				Exported:      true,
+			},
+		})
+	}
+}
+
+func walkCgoFile(astFile *ast.File, fset *token.FileSet, pkgPath string, cgoNames map[string]bool, result *Result) {
+	var currentDecl string
+	ast.Inspect(astFile, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.FuncDecl:
+			currentDecl = funcDeclName(node, pkgPath)
+		case *ast.GenDecl:
+			if name := genDeclCurrentName(node, pkgPath); name != "" {
+				currentDecl = name
+			}
+		case *ast.SelectorExpr:
+			ident, ok := node.X.(*ast.Ident)
+			if !ok || ident.Name != "C" {
+				return true
+			}
+			if currentDecl == "" {
+				currentDecl = pkgPath
+			}
+			cgoName := "cgo/" + node.Sel.Name
+			cgoNames[cgoName] = true
+			addReferenceEdge(currentDecl, cgoName, fset.Position(node.Pos()), result)
+		}
+		return true
+	})
+}
+
+// isCgoFile reports whether an AST file imports the "C" pseudo-package.
+func isCgoFile(f *ast.File) bool {
+	for _, imp := range f.Imports {
+		if imp.Path.Value == `"C"` {
+			return true
+		}
+	}
+	return false
 }

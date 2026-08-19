@@ -237,6 +237,24 @@ func TestChangedSymbolsDefaultRepoDirAllowed(t *testing.T) {
 	}
 }
 
+func TestChangedSymbolsCompactFormat(t *testing.T) {
+	s := newTestServer(t)
+	// The compact option must switch the renderer to one-line-per-symbol without
+	// requiring a functional git diff — an empty/error result still uses the
+	// compact summary line, proving the option is honored.
+	s.allowedPaths = []string{"."}
+	resp := toolResult(t, s, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"changed_symbols","arguments":{"compact":true}}}`)
+	text := resultText(t, resp)
+	// A stale-index notice may be prepended by the server; the compact summary
+	// line must still be present and must not be the full JSON record.
+	if !strings.Contains(text, "files=") {
+		t.Fatalf("compact changed_symbols should contain the summary line, got %q", text)
+	}
+	if strings.Contains(text, `"symbols"`) {
+		t.Fatalf("compact output should not be the full TOON/JSON record, got %q", text)
+	}
+}
+
 func TestIndexAcceptsAllowedTarget(t *testing.T) {
 	src := "../testdata/simple"
 	dst := filepath.Join(t.TempDir(), "simple")

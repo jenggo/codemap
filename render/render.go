@@ -1032,8 +1032,21 @@ func renderChangedSymbolsText(r *query.ChangedSymbolsResult) string {
 }
 
 func renderChangedSymbolsCompact(r *query.ChangedSymbolsResult) string {
-	return fmt.Sprintf("files=%d modified=%d added=%d removed=%d",
+	var b strings.Builder
+	fmt.Fprintf(&b, "files=%d modified=%d added=%d removed=%d\n",
 		r.Summary.FilesChanged, r.Summary.Modified, r.Summary.Added, r.Summary.Removed)
+	for _, sym := range r.Symbols {
+		repo := ""
+		if sym.Repo != "" {
+			repo = " [" + sym.Repo + "]"
+		}
+		fmt.Fprintf(&b, "%s %s (%s)%s %s:%d", sym.ChangeType, sym.QualifiedName, sym.Kind, repo, sym.PosFile, sym.PosLine)
+		if sym.BlastRadius != nil {
+			fmt.Fprintf(&b, " blast(d=%d,t=%d)", sym.BlastRadius.DirectCallers, sym.BlastRadius.TransitiveCallers)
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 func indentEach(s, prefix string) string {

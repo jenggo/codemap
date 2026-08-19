@@ -5,7 +5,48 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
+
+// ToolsAndTipsBlock is the single source of truth for the codemap tool list and
+// usage tips shared by AGENTS.md and the opencode navigation doc. Both documents
+// embed this one block so a tool/tip edit updates both at once. Kept exported so
+// it is the canonical reference text.
+const ToolsAndTipsBlock = `## Available Tools
+
+| Tool | Returns / Does | When to use |
+|---|---|---|
+| ` + "`index`" + ` | Force a full re-index | Indexing is automatic otherwise |
+| ` + "`overview`" + ` | Each package's exports + signatures | Understanding project structure |
+| ` + "`search`" + ` | Qualified names, file:line, signatures, docs | Finding symbols by name |
+| ` + "`show`" + ` | Signature, docs, file:line, incoming+outgoing edges | Understanding a single symbol |
+| ` + "`callers_of`" + ` | Caller names, file:line, edge types | Tracing who calls a function |
+| ` + "`callees_of`" + ` | Callee names, file:line, edge types | Tracing a symbol's dependencies |
+| ` + "`package`" + ` | All symbols with signatures and docs | Inspecting a package's API |
+| ` + "`methods_of`" + ` | Method names, signatures, file:line | Finding a type's method set |
+| ` + "`list_packages`" + ` | Import paths, names, symbol counts | Discovering packages |
+| ` + "`importers_of`" + ` | Importing packages with file:line | Finding downstream dependents |
+| ` + "`imports_of`" + ` | Imported packages with file:line | Finding upstream dependencies |
+| ` + "`edges_by_type`" + ` | All edges of a given type | Bulk relationship analysis |
+| ` + "`all_edges`" + ` | Every edge in the codebase | Full graph export |
+| ` + "`search_text`" + ` | Matching file paths, line numbers, context | Full-text search across indexed files |
+| ` + "`get_context_bundle`" + ` | Symbol body, callees, callers, same-file symbols | LLM context preparation |
+| ` + "`get_hotspots`" + ` | Symbols ranked by complexity x churn risk | Finding risky code for refactoring |
+| ` + "`get_symbol_importance`" + ` | Symbols ranked by PageRank centrality | Identifying architecturally critical code |
+| ` + "`changed_symbols`" + ` | Symbols changed in the working tree | One line per symbol with ` + "`compact: true`" + ` |
+| ` + "`workspace_changed_symbols`" + ` | Workspace-wide changed symbols | One line per symbol with ` + "`compact: true`" + ` |
+
+## Tips
+
+- Qualified names use ` + "`package/path.SymbolName`" + ` format
+- ` + "`include_tests: true`" + ` includes test packages/symbols
+- ` + "`full_docs: true`" + ` shows complete documentation instead of the first sentence
+- ` + "`include_unexported: true`" + ` includes private symbols (package tool)
+- ` + "`methods_of`" + ` takes a short type name (e.g., ` + "`Store`" + `, not the full path)
+- Search is case-insensitive substring match
+- ` + "`search`" + ` returns exported and unexported symbols by default; ` + "`exported: true`" + ` filters to exported-only, ` + "`exported: false`" + ` to unexported-only
+- Indexing is automatic and fast (~50ms). Re-indexes when Go files change.
+`
 
 const agentsContent = `# AGENTS.md
 
@@ -30,33 +71,7 @@ This project uses ` + "`codemap`" + ` MCP tools for Go codebase analysis. These 
 | Find code hotspots | ` + "`get_hotspots`" + ` | manual review |
 | Rank symbol importance | ` + "`get_symbol_importance`" + ` | guessing |
 
-## Available Tools
-
-- ` + "`index`" + ` — Force a full re-index. Indexing happens automatically on first tool call.
-- ` + "`overview`" + ` — Architecture summary: packages, exported symbols, import counts.
-- ` + "`search`" + ` — Search symbols by name. Returns qualified names, file paths, line numbers, signatures.
-- ` + "`show`" + ` — Full symbol detail: signature, docs, file:line, incoming/outgoing edges.
-- ` + "`callers_of`" + ` — Who calls this symbol? Returns caller names, file paths, line numbers.
-- ` + "`callees_of`" + ` — What does this symbol call? Returns callee names, file paths, line numbers.
-- ` + "`package`" + ` — All symbols in a package with signatures and docs.
-- ` + "`methods_of`" + ` — All methods on a type (short name like ` + "`Store`" + `).
-- ` + "`list_packages`" + ` — All indexed packages with paths and symbol counts.
-- ` + "`importers_of`" + ` — Packages that import the given package.
-- ` + "`imports_of`" + ` — Packages imported by the given package.
-- ` + "`edges_by_type`" + ` — All edges of a specific type (calls, references, satisfies, embeds, imports).
-- ` + "`all_edges`" + ` — Every relationship edge in the index.
-- ` + "`search_text`" + ` — Full-text search across file contents (FTS5 or regex).
-- ` + "`get_context_bundle`" + ` — Bundle a symbol with callees, callers, and same-file symbols for LLM context.
-- ` + "`get_hotspots`" + ` — Find code hotspots by combining complexity with git churn.
-- ` + "`get_symbol_importance`" + ` — Compute symbol importance using PageRank on the call graph.
-
-## Tips
-
-- Qualified names use ` + "`package/path.SymbolName`" + ` format
-- Set ` + "`include_tests: true`" + ` to include test packages/symbols
-- Set ` + "`full_docs: true`" + ` to see complete documentation
-- Search is case-insensitive substring match
-- Indexing is automatic and fast (~50ms). Re-indexes when Go files change.
+` + ToolsAndTipsBlock + `
 `
 
 const opencodeNavContent = `<!-- Context: codemap/navigation | Priority: high | Version: 1.2 -->
@@ -87,36 +102,7 @@ Indexing is **automatic** — the first tool call triggers indexing if needed (~
 | Find code hotspots | ` + "`get_hotspots`" + ` | manual review |
 | Rank symbol importance | ` + "`get_symbol_importance`" + ` | guessing |
 
-## Available Tools
-
-| Tool | Returns | When to use |
-|---|---|---|
-| ` + "`index`" + ` | Packages, symbols, edges count | Force re-index (automatic otherwise) |
-| ` + "`overview`" + ` | Each package's exports + signatures | Understanding project structure |
-| ` + "`search`" + ` | Qualified names, file:line, signatures, docs | Finding symbols by name |
-| ` + "`show`" + ` | Signature, docs, file:line, incoming+outgoing edges | Understanding a single symbol |
-| ` + "`callers_of`" + ` | Caller names, file:line, edge types | Tracing who uses a function |
-| ` + "`callees_of`" + ` | Callee names, file:line, edge types | Tracing dependencies |
-| ` + "`package`" + ` | All symbols with signatures and docs | Inspecting a package's API |
-| ` + "`methods_of`" + ` | Method names, signatures, file:line | Finding a type's method set |
-| ` + "`list_packages`" + ` | Import paths, names, symbol counts | Discovering packages |
-| ` + "`importers_of`" + ` | Importing packages with file:line | Finding downstream dependents |
-| ` + "`imports_of`" + ` | Imported packages with file:line | Finding upstream dependencies |
-| ` + "`edges_by_type`" + ` | All edges of a given type | Bulk relationship analysis |
-| ` + "`all_edges`" + ` | Every edge in the codebase | Full graph export |
-| ` + "`search_text`" + ` | Matching file paths, line numbers, context | Full-text search across indexed files |
-| ` + "`get_context_bundle`" + ` | Symbol body, callees, callers, same-file symbols | LLM context preparation |
-| ` + "`get_hotspots`" + ` | Symbols ranked by complexity x churn risk | Finding risky code for refactoring |
-| ` + "`get_symbol_importance`" + ` | Symbols ranked by PageRank centrality | Identifying architecturally critical code |
-
-## Tips
-
-- Qualified names: ` + "`package/path.SymbolName`" + ` (e.g., ` + "`encoding/json.Decoder.Decode`" + `)
-- ` + "`include_tests: true`" + ` — include test packages/symbols
-- ` + "`full_docs: true`" + ` — full doc comments instead of first sentence only
-- ` + "`include_unexported: true`" + ` — include private symbols (package tool)
-- Search is case-insensitive substring match
-- ` + "`methods_of`" + ` takes a short type name (e.g., ` + "`Store`" + `, not the full path)
+` + ToolsAndTipsBlock + `
 `
 
 const codemapGuardPlugin = `/**
@@ -291,5 +277,70 @@ func injectAgents() error {
 	}
 
 	fmt.Printf("agents: created %s\n", agentsPath)
+	return nil
+}
+
+func UpdateAgents() error {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("getting working directory: %w", err)
+	}
+
+	agentsPath := filepath.Join(cwd, "AGENTS.md")
+	data, err := os.ReadFile(agentsPath)
+	if err != nil {
+		return fmt.Errorf("reading AGENTS.md: %w", err)
+	}
+
+	content := string(data)
+	tip := "`search` only returns exported symbols"
+	if strings.Contains(content, tip) {
+		fmt.Println("agents: codemap tip already present, skipping")
+		return nil
+	}
+
+	// Find the Tips section and append
+	lines := strings.Split(content, "\n")
+	var out []string
+	tipsFound := false
+	for _, line := range lines {
+		out = append(out, line)
+		if strings.HasPrefix(strings.TrimSpace(line), "## Tips") {
+			tipsFound = true
+		}
+	}
+
+	if !tipsFound {
+		// No Tips section, append at end
+		out = append(out, "", "## Tips", "", "- Qualified names use `package/path.SymbolName` format", fmt.Sprintf("- %s — unexported (lowercase) functions/types are not indexed. Use `package` with `include_unexported: true` to find them.", tip))
+	} else {
+		// Find the end of tips section (next ## or EOF) and insert before it
+		var final []string
+		inTips := false
+		inserted := false
+		for _, line := range out {
+			if strings.HasPrefix(strings.TrimSpace(line), "## Tips") {
+				inTips = true
+			} else if inTips && strings.HasPrefix(strings.TrimSpace(line), "## ") {
+				// Next section starts, insert before
+				if !inserted {
+					final = append(final, "", fmt.Sprintf("- %s — unexported (lowercase) functions/types are not indexed. Use `package` with `include_unexported: true` to find them.", tip))
+					inserted = true
+				}
+				inTips = false
+			}
+			final = append(final, line)
+		}
+		if !inserted && inTips {
+			final = append(final, "", fmt.Sprintf("- %s — unexported (lowercase) functions/types are not indexed. Use `package` with `include_unexported: true` to find them.", tip))
+		}
+		out = final
+	}
+
+	if err := os.WriteFile(agentsPath, []byte(strings.Join(out, "\n")), 0644); err != nil {
+		return fmt.Errorf("writing AGENTS.md: %w", err)
+	}
+
+	fmt.Printf("agents: updated %s\n", agentsPath)
 	return nil
 }

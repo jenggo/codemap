@@ -247,6 +247,7 @@ const kindMethod = "method"
 const kindVar = "var"
 const kindInterface = "interface"
 const kindType = "type"
+const kindAlias = "alias"
 
 const changeTypeModified = "modified"
 const changeTypeAdded = "added"
@@ -557,7 +558,7 @@ func kindPriority(kind string) int {
 	switch kind {
 	case kindFunction, kindMethod:
 		return 0
-	case kindInterface, kindType:
+	case kindInterface, kindType, kindAlias:
 		return 1
 	default:
 		return 2

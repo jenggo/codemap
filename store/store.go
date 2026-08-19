@@ -2164,6 +2164,12 @@ func (s *Store) SetIndexedAt(t time.Time) error {
 // SetRepoMeta records which repo and git revision an index was built from so
 // staleness checks can detect when a DB was built elsewhere or on another HEAD.
 func (s *Store) SetRepoMeta(repoPath, gitHead string, packageCount, symbolCount int) error {
+	return s.SetRepoMetaWith(repoPath, gitHead, packageCount, symbolCount, "")
+}
+
+// SetRepoMetaWith records repo identity metadata plus an explicit indexedVia
+// value (e.g. "go-list", "dir-walk"). An empty indexedVia omits the key.
+func (s *Store) SetRepoMetaWith(repoPath, gitHead string, packageCount, symbolCount int, indexedVia string) error {
 	ctx := context.Background()
 	meta := map[string]string{
 		"repo_path":     repoPath,
@@ -2171,12 +2177,27 @@ func (s *Store) SetRepoMeta(repoPath, gitHead string, packageCount, symbolCount 
 		"package_count": strconv.Itoa(packageCount),
 		"symbol_count":  strconv.Itoa(symbolCount),
 	}
+	if indexedVia != "" {
+		meta["indexed_via"] = indexedVia
+	}
 	for k, v := range meta {
 		if _, err := s.db.ExecContext(ctx, `INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`, k, v); err != nil {
 			return fmt.Errorf("setting meta %s: %w", k, err)
 		}
 	}
 	return nil
+}
+
+// SetIndexedVia records how the index was built ("go-list" or "dir-walk"),
+// touching only the indexed_via meta key so workspace writes can set it
+// without disturbing repo/git metadata.
+func (s *Store) SetIndexedVia(indexedVia string) error {
+	if indexedVia == "" {
+		return nil
+	}
+	ctx := context.Background()
+	_, err := s.db.ExecContext(ctx, `INSERT OR REPLACE INTO meta (key, value) VALUES ('indexed_via', ?)`, indexedVia)
+	return err
 }
 
 // EnsureRepo registers a workspace member by module path (canonical identity)
@@ -2365,6 +2386,7 @@ type HealthInfo struct {
 	IndexedAt    string
 	RepoPath     string
 	GitHead      string
+	IndexedVia   string // "go-list" or "dir-walk"; empty if unknown
 	PackageCount int
 	SymbolCount  int
 }
@@ -2375,7 +2397,7 @@ type HealthInfo struct {
 func (s *Store) Health() (HealthInfo, error) {
 	var h HealthInfo
 	rows, err := s.db.QueryContext(context.Background(),
-		`SELECT key, value FROM meta WHERE key IN ('indexed_at','repo_path','git_head','package_count','symbol_count')`)
+		`SELECT key, value FROM meta WHERE key IN ('indexed_at','repo_path','git_head','package_count','symbol_count','indexed_via')`)
 	if err != nil {
 		return h, err
 	}
@@ -2404,6 +2426,8 @@ func (s *Store) Health() (HealthInfo, error) {
 				return h, fmt.Errorf("health: symbol_count %q: %w", v, aerr)
 			}
 			h.SymbolCount = n
+		case "indexed_via":
+			h.IndexedVia = v
 		}
 	}
 	if err := rows.Err(); err != nil {

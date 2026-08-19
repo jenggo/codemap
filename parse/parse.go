@@ -40,6 +40,7 @@ type Result struct {
 	Files    map[string]*ast.File
 	Fset     *token.FileSet
 	Errors   []Error
+	Fallback bool // true when go list failed and the dir-walk fallback was used
 }
 
 // Run resolves the Go packages under pattern. It prefers `go list` (the same
@@ -53,7 +54,12 @@ func Run(pattern string) (*Result, error) {
 	if result, err := goList(absPattern); err == nil {
 		return result, nil
 	}
-	return runDirWalk(absPattern)
+	result, err := runDirWalk(absPattern)
+	if err != nil {
+		return nil, err
+	}
+	result.Fallback = true
+	return result, nil
 }
 
 // FileContents reads the source of every parsed file, keyed by absolute path.
@@ -138,11 +144,14 @@ func runWorkspaceRoot(result *Result, root WorkspaceRoot, rootSet, seen map[stri
 			if module == "" {
 				continue
 			}
-			_ = goListInto(result, nd, module, seen)
+			if err := goListInto(result, nd, module, seen); err != nil {
+				result.Errors = append(result.Errors, Error{File: nd, Err: err.Error()})
+			}
 		}
 		return nil
 	}
 
+	result.Fallback = true
 	return runModuleWalk(result, absRoot, root.ModulePath)
 }
 
@@ -492,6 +501,14 @@ func runDirWalk(pattern string) (*Result, error) {
 		if strings.HasPrefix(info.Name(), ".") || info.Name() == dirVendor {
 			return filepath.SkipDir
 		}
+		// Skip nested go.mod boundaries — each module is an independent
+		// compilation unit and must be indexed via its own Run call or
+		// through the workspace path, not as part of a parent walk.
+		if path != absPattern {
+			if _, serr := os.Stat(filepath.Join(path, "go.mod")); serr == nil {
+				return filepath.SkipDir
+			}
+		}
 		return processDir(result, path)
 	})
 	if err != nil {
@@ -509,7 +526,11 @@ func processDir(result *Result, dir string) error {
 
 	importPath := bpkg.ImportPath
 	if importPath == "." {
-		importPath = readModulePath(dir)
+		// When build.ImportDir cannot determine the import path, walk up
+		// to the nearest enclosing go.mod to find the module path, then
+		// append the relative directory. This disambiguates sibling
+		// directories with the same basename (e.g. lib/ vs vendor/lib/).
+		importPath = nearestModulePath(dir)
 		if importPath == "" {
 			importPath = filepath.Base(dir)
 		}
@@ -599,6 +620,38 @@ func readModulePath(dir string) string {
 		if after, ok := strings.CutPrefix(line, "module "); ok {
 			return strings.TrimSpace(after)
 		}
+	}
+	return ""
+}
+
+// nearestModulePath walks up from dir to find the nearest enclosing go.mod,
+// reads its module path, and appends the relative directory. This
+// disambiguates sibling directories with the same basename (e.g. lib/ in
+// different modules). Returns "" when no enclosing go.mod is found.
+func nearestModulePath(dir string) string {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return ""
+	}
+	candidate := abs
+	for {
+		mod := readModulePath(candidate)
+		if mod != "" {
+			rel, rerr := filepath.Rel(candidate, abs)
+			if rerr != nil {
+				return mod
+			}
+			rel = filepath.ToSlash(rel)
+			if rel == "." {
+				return mod
+			}
+			return mod + "/" + rel
+		}
+		parent := filepath.Dir(candidate)
+		if parent == candidate {
+			break
+		}
+		candidate = parent
 	}
 	return ""
 }

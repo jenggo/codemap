@@ -603,4 +603,91 @@ func TestOverviewReportsRepos(t *testing.T) {
 	}
 }
 
+// TestWorkspaceBrokenMemberDoesNotBlockOthers covers task 6.4: a three-repo
+// workspace where one member has broken Go source (unresolvable import) still
+// indexes the two good members. The broken member gets zero symbols/edges
+// because its files fail to parse, but IndexAll does not error.
+func TestWorkspaceBrokenMemberDoesNotBlockOthers(t *testing.T) {
+	root := t.TempDir()
+
+	writeFile(t, filepath.Join(root, "good1/go.mod"), "module example.com/good1\n\ngo 1.21\n")
+	writeFile(t, filepath.Join(root, "good1/valid.go"), "package good1\n\nfunc Helper() int { return 1 }\n")
+
+	writeFile(t, filepath.Join(root, "good2/go.mod"), "module example.com/good2\n\ngo 1.21\n")
+	writeFile(t, filepath.Join(root, "good2/user.go"), `package good2
+
+import "example.com/good1"
+
+func Use() int { return good1.Helper() }
+`)
+
+	// Broken: valid go.mod but source file has a syntax error (unclosed
+	// brace). go list -e reports the file in GoFiles but parser.ParseFile
+	// fails, so no AST is produced and the module gets 0 parsed files.
+	writeFile(t, filepath.Join(root, "broken/go.mod"), "module example.com/broken\n\ngo 1.21\n")
+	writeFile(t, filepath.Join(root, "broken/broken.go"), "package broken\n\nfunc Bad() int {\n")
+
+	writeFile(t, filepath.Join(root, "codemap.yaml"), `members:
+  - module: example.com/good1
+    dir: good1
+  - module: example.com/good2
+    dir: good2
+  - module: example.com/broken
+    dir: broken
+`)
+
+	cfg, err := workspace.Load(filepath.Join(root, "codemap.yaml"))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	dbPath := filepath.Join(root, ".codemap", "codemap.db")
+	summaries, err := workspace.IndexAll(cfg, dbPath)
+	if err != nil {
+		t.Fatalf("index workspace should not fail: %v", err)
+	}
+
+	if len(summaries) != 3 {
+		t.Fatalf("expected 3 summaries, got %d", len(summaries))
+	}
+
+	byRepo := make(map[string]workspace.IndexSummary)
+	for _, s := range summaries {
+		byRepo[s.Repo] = s
+	}
+
+	// Good members are indexed with symbols.
+	for _, want := range []string{"example.com/good1", "example.com/good2"} {
+		s := byRepo[want]
+		if s.State != "indexed" {
+			t.Errorf("%s state = %q, want indexed", want, s.State)
+		}
+		if s.Symbols == 0 {
+			t.Errorf("%s should have symbols after indexing", want)
+		}
+	}
+
+	// Broken member has zero symbols — its files failed to resolve but it
+	// did not block the other members.
+	broken := byRepo["example.com/broken"]
+	if broken.Symbols != 0 || broken.Edges != 0 {
+		t.Errorf("broken member should have 0 symbols/edges, got symbols=%d edges=%d",
+			broken.Symbols, broken.Edges)
+	}
+
+	// The index records how it was built (indexed_via meta). With a working
+	// go toolchain the workspace index is go-list, not the dir-walk fallback.
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	health, err := st.Health()
+	if err != nil {
+		t.Fatalf("health: %v", err)
+	}
+	if health.IndexedVia != "go-list" {
+		t.Errorf("indexed_via = %q, want go-list", health.IndexedVia)
+	}
+}
+
 var _ = fmt.Sprintf

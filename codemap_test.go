@@ -357,6 +357,54 @@ func TestSearchExportedFilter(t *testing.T) {
 	}
 }
 
+// TestSearchReturnsUnexportedByDefault verifies that a default search (no
+// export filter) returns unexported symbols too — the `helper` function in
+// testdata/simple is unexported and must be findable.
+func TestSearchReturnsUnexportedByDefault(t *testing.T) {
+	absPath, err := filepath.Abs("testdata/simple")
+	if err != nil {
+		t.Fatalf("failed to get absolute path: %v", err)
+	}
+
+	parseResult, err := parse.Run(absPath)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	resolveResult := resolve.Run(parseResult)
+
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test.db")
+
+	s, err := store.Create(dbPath)
+	if err != nil {
+		t.Fatalf("store create error: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	if err := s.Write(resolveResult, nil, nil); err != nil {
+		t.Fatalf("store write error: %v", err)
+	}
+
+	results, err := query.Search(s, "helper")
+	if err != nil {
+		t.Fatalf("search error: %v", err)
+	}
+
+	found := false
+	for _, r := range results {
+		if r.QualifiedName == "codemap/testdata/simple.helper" {
+			found = true
+			if r.Exported {
+				t.Errorf("expected helper to be unexported, got Exported=%v", r.Exported)
+			}
+		}
+	}
+	if !found {
+		t.Error("default search should return the unexported symbol codemap/testdata/simple.helper")
+	}
+}
+
 func TestSearchRelevanceOrdering(t *testing.T) {
 	absPath, err := filepath.Abs("testdata/simple")
 	if err != nil {

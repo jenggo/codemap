@@ -3,6 +3,7 @@ package parse
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -82,6 +83,99 @@ func TestDirWalkFallbackClassifiesByClause(t *testing.T) {
 	}
 	if len(testPkg.Files) != 1 || !hasFile(t, testPkg.Files, "external_test.go") {
 		t.Fatalf("dir-walk external test package should hold external_test.go, got %v", testPkg.Files)
+	}
+}
+
+// TestDirWalkFallbackSetsFlag verifies that when go list fails and the
+// dir-walk fallback is used, Result.Fallback is set to true.
+func TestDirWalkFallbackSetsFlag(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, src string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("foo.go", "package flagtest\ntype T struct{}\n")
+
+	pr, err := Run(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pr.Fallback {
+		t.Fatal("expected Fallback=true for dir-walk path, got false")
+	}
+}
+
+// TestDirWalkSkipsNestedGoMod verifies that the dir-walk fallback skips
+// directories containing a go.mod (nested module boundaries).
+func TestDirWalkSkipsNestedGoMod(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, src string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("root.go", "package root\ntype Root struct{}\n")
+	// Create a nested module boundary
+	nested := filepath.Join(dir, "nested")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write("nested/go.mod", "module example.com/nested\n")
+	write("nested/nested.go", "package nested\ntype Nested struct{}\n")
+
+	pr, err := Run(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The nested module should be skipped — only root.go should be parsed.
+	for _, pkg := range pr.Packages {
+		if pkg.ImportPath == "example.com/nested" || strings.Contains(pkg.ImportPath, "nested") {
+			t.Fatalf("expected nested module to be skipped, but found package %q", pkg.ImportPath)
+		}
+	}
+	if len(pr.Packages) != 1 {
+		t.Fatalf("expected 1 package (root), got %d: %v", len(pr.Packages), pr.Packages)
+	}
+}
+
+// TestDirWalkSiblingDisambiguation verifies that sibling directories with the
+// same base name but in different module scopes get different import paths.
+func TestDirWalkSiblingDisambiguation(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, src string) {
+		full := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Two sibling lib/ dirs under different module roots
+	write("a/go.mod", "module example.com/a\n")
+	write("a/lib/lib.go", "package lib\ntype A struct{}\n")
+
+	write("b/go.mod", "module example.com/b\n")
+	write("b/lib/lib.go", "package lib\ntype B struct{}\n")
+
+	// Test nearestModulePath directly on each lib/ dir.
+	aLib := filepath.Join(dir, "a", "lib")
+	bLib := filepath.Join(dir, "b", "lib")
+
+	aPath := nearestModulePath(aLib)
+	bPath := nearestModulePath(bLib)
+
+	if aPath != "example.com/a/lib" {
+		t.Fatalf("expected example.com/a/lib, got %q", aPath)
+	}
+	if bPath != "example.com/b/lib" {
+		t.Fatalf("expected example.com/b/lib, got %q", bPath)
+	}
+	if aPath == bPath {
+		t.Fatalf("sibling lib/ dirs should get different import paths, both got %q", aPath)
 	}
 }
 

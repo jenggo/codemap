@@ -52,14 +52,16 @@ type Result struct {
 
 func Run(pkgImportPath string, files map[string]*ast.File, fset *token.FileSet, isTest bool) *Result {
 	result := &Result{}
+	typeSpecs := collectTypeSpecs(files)
 
 	for _, astFile := range files {
 		extractor := &fileExtractor{
-			pkgPath: pkgImportPath,
-			astFile: astFile,
-			fset:    fset,
-			isTest:  isTest,
-			result:  result,
+			pkgPath:   pkgImportPath,
+			astFile:   astFile,
+			fset:      fset,
+			isTest:    isTest,
+			result:    result,
+			typeSpecs: typeSpecs,
 		}
 		extractor.extract()
 	}
@@ -67,12 +69,33 @@ func Run(pkgImportPath string, files map[string]*ast.File, fset *token.FileSet, 
 	return result
 }
 
+// collectTypeSpecs indexes every top-level type declaration by name across the
+// package's files so alias declarations can resolve their target's shape.
+func collectTypeSpecs(files map[string]*ast.File) map[string]*ast.TypeSpec {
+	specs := make(map[string]*ast.TypeSpec)
+	for _, f := range files {
+		for _, decl := range f.Decls {
+			gd, ok := decl.(*ast.GenDecl)
+			if !ok || gd.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range gd.Specs {
+				if ts, ok := spec.(*ast.TypeSpec); ok {
+					specs[ts.Name.Name] = ts
+				}
+			}
+		}
+	}
+	return specs
+}
+
 type fileExtractor struct {
-	astFile *ast.File
-	fset    *token.FileSet
-	result  *Result
-	pkgPath string
-	isTest  bool
+	astFile   *ast.File
+	fset      *token.FileSet
+	result    *Result
+	typeSpecs map[string]*ast.TypeSpec
+	pkgPath   string
+	isTest    bool
 }
 
 func (e *fileExtractor) extract() {
@@ -199,6 +222,7 @@ func tokenKind(tok token.Token) string {
 }
 
 const kindType = "type"
+const kindAlias = "alias"
 
 func (e *fileExtractor) extractTypeSpec(ts *ast.TypeSpec, kind string, doc *ast.CommentGroup) {
 	pos := e.fset.Position(ts.Pos())
@@ -206,7 +230,7 @@ func (e *fileExtractor) extractTypeSpec(ts *ast.TypeSpec, kind string, doc *ast.
 
 	actualKind := kind
 	if ts.Assign.IsValid() {
-		actualKind = kindType
+		actualKind = kindAlias
 	}
 	if _, ok := ts.Type.(*ast.InterfaceType); ok {
 		actualKind = "interface"
@@ -230,9 +254,69 @@ func (e *fileExtractor) extractTypeSpec(ts *ast.TypeSpec, kind string, doc *ast.
 	}
 	if st, ok := ts.Type.(*ast.StructType); ok {
 		sym.Fields = extractStructFields(st)
+	} else if ts.Assign.IsValid() {
+		if target := e.aliasStructTarget(ts.Type, make(map[string]bool)); target != nil {
+			sym.Fields = extractStructFields(target)
+		}
 	}
 
 	e.result.Symbols = append(e.result.Symbols, sym)
+
+	if it, ok := ts.Type.(*ast.InterfaceType); ok && it.Methods != nil {
+		e.extractInterfaceMethods(ts.Name.Name, it.Methods)
+	}
+}
+
+// aliasStructTarget follows a same-package alias chain to a struct type,
+// returning its AST when found (the shape an alias inherits from its target).
+// Chains are cycle-guarded; cross-package targets return nil.
+func (e *fileExtractor) aliasStructTarget(expr ast.Expr, seen map[string]bool) *ast.StructType {
+	ident, ok := expr.(*ast.Ident)
+	if !ok || seen[ident.Name] {
+		return nil
+	}
+	seen[ident.Name] = true
+	target := e.typeSpecs[ident.Name]
+	if target == nil {
+		return nil
+	}
+	if st, ok := target.Type.(*ast.StructType); ok {
+		return st
+	}
+	if target.Assign.IsValid() {
+		return e.aliasStructTarget(target.Type, seen)
+	}
+	return nil
+}
+
+func (e *fileExtractor) extractInterfaceMethods(ifaceName string, methods *ast.FieldList) {
+	for _, field := range methods.List {
+		ft, ok := field.Type.(*ast.FuncType)
+		if !ok {
+			continue
+		}
+		for _, name := range field.Names {
+			if !name.IsExported() {
+				continue
+			}
+			pos := e.fset.Position(name.Pos())
+			sym := Symbol{
+				QualifiedName: e.pkgPath + "." + ifaceName + "." + name.Name,
+				Name:          name.Name,
+				Kind:          "method",
+				Receiver:      ifaceName,
+				Signature:     signatureString(ft),
+				Doc:           docString(field.Comment),
+				Pos: Position{
+					File: pos.Filename,
+					Line: pos.Line,
+				},
+				Exported: true,
+				IsTest:   e.isTest,
+			}
+			e.result.Symbols = append(e.result.Symbols, sym)
+		}
+	}
 }
 
 // extractStructFields captures each field's Go name, effective CBOR name and
@@ -340,6 +424,8 @@ func typeString(expr ast.Expr) string {
 		return typeString(t.X)
 	case *ast.IndexExpr:
 		return typeString(t.X)
+	case *ast.IndexListExpr:
+		return typeString(t.X)
 	default:
 		return ""
 	}
@@ -399,6 +485,14 @@ func exprString(expr ast.Expr) string {
 		return "chan " + exprString(e.Value)
 	case *ast.FuncType:
 		return "func(...)"
+	case *ast.IndexExpr:
+		return exprString(e.X) + "[" + exprString(e.Index) + "]"
+	case *ast.IndexListExpr:
+		args := make([]string, len(e.Indices))
+		for i, idx := range e.Indices {
+			args[i] = exprString(idx)
+		}
+		return exprString(e.X) + "[" + strings.Join(args, ", ") + "]"
 	case *ast.Ellipsis:
 		return "..." + exprString(e.Elt)
 	default:

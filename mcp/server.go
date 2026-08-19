@@ -342,7 +342,11 @@ func (s *Server) autoIndex(path string) error {
 		return fmt.Errorf("set indexed_at error: %w", err)
 	}
 
-	if err := newStore.SetRepoMeta(absPath, gitHead(absPath), len(resolveResult.Packages), len(resolveResult.Symbols)); err != nil {
+	indexedVia := "go-list"
+	if parseResult.Fallback {
+		indexedVia = "dir-walk"
+	}
+	if err := newStore.SetRepoMetaWith(absPath, gitHead(absPath), len(resolveResult.Packages), len(resolveResult.Symbols), indexedVia); err != nil {
 		_ = newStore.Close()
 		return fmt.Errorf("set repo meta error: %w", err)
 	}
@@ -1024,6 +1028,9 @@ func handleChangedSymbols(st *store.Store, _ []query.Option, renderOpts []render
 	if b, ok := args["include_tests"].(bool); ok {
 		includeTests = b
 	}
+	if compact, ok := args["compact"].(bool); ok && compact {
+		renderOpts = append(renderOpts, render.WithFormat(render.FormatCompact))
+	}
 	result, err := query.ChangedSymbols(st, repoDir, ref, withBlast, includeBodies, includeTests)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err), true
@@ -1043,6 +1050,9 @@ func handleWorkspaceChangedSymbols(st *store.Store, _ []query.Option, renderOpts
 	includeTests := false
 	if b, ok := args["include_tests"].(bool); ok {
 		includeTests = b
+	}
+	if compact, ok := args["compact"].(bool); ok && compact {
+		renderOpts = append(renderOpts, render.WithFormat(render.FormatCompact))
 	}
 	result, err := query.WorkspaceChangedSymbols(st, withBlast, includeBodies, includeTests)
 	if err != nil {
@@ -1215,7 +1225,11 @@ func (s *Server) indexSingleRepo(absPath string) (string, error) {
 		_ = newStore.Close()
 		return "", fmt.Errorf("set indexed_at error: %w", err)
 	}
-	if err := newStore.SetRepoMeta(absPath, gitHead(absPath), len(resolveResult.Packages), len(resolveResult.Symbols)); err != nil {
+	indexedVia := "go-list"
+	if parseResult.Fallback {
+		indexedVia = "dir-walk"
+	}
+	if err := newStore.SetRepoMetaWith(absPath, gitHead(absPath), len(resolveResult.Packages), len(resolveResult.Symbols), indexedVia); err != nil {
 		_ = newStore.Close()
 		return "", fmt.Errorf("set repo meta error: %w", err)
 	}
@@ -1327,7 +1341,7 @@ const (
 
 var (
 	validEdgeTypes    = []string{"calls", "references", "satisfies", "embeds", edgeTypeImports}
-	validKinds        = []string{"function", "method", "type", "interface", "const", "var"}
+	validKinds        = []string{"function", "method", "type", "interface", "alias", "const", "var"}
 	validSeverities   = []string{"compatible", "breaking", "unknown"}
 	validDirections   = []string{"producer", "consumer", "shared"}
 	validRuntimeKinds = []string{"redis", "jetstream", "ws_type"}
@@ -1954,12 +1968,12 @@ func symbolTools() []map[string]any {
 			},
 			"type_name"),
 		toolDef("search",
-			"Search Go symbols (functions, types, methods, interfaces, constants, variables) by name. Returns qualified names, file paths, line numbers, signatures, and documentation. More precise than grep for finding Go symbol definitions and declarations. Use this when you know a symbol name but not its location.",
+			"Search Go symbols (functions, types, methods, interfaces, constants, variables) by name. Returns qualified names, file paths, line numbers, signatures, and documentation. More precise than grep for finding Go symbol definitions and declarations. Use this when you know a symbol name but not its location. Returns both exported and unexported symbols by default.",
 			map[string]any{
 				keyPattern:      stringProp("Search pattern (case-insensitive substring match)"),
 				keyIncludeTests: boolProp("Include test packages and symbols"),
 				keyKind:         stringProp("Filter by symbol kind (e.g., function, method, type, const, var, interface)"),
-				"exported":      boolProp("Filter by exported status"),
+				"exported":      boolProp("Filter by exported status: true for exported-only, false for unexported-only. Omit to include both."),
 				"file":          stringProp("Filter by file path (substring match on pos_file, e.g., 'server.go' or 'mcp/')"),
 				keyRepo:         repoProp(),
 			},
@@ -2180,6 +2194,7 @@ func sourceTools() []map[string]any {
 				"with_blast_radius": boolProp("Attach blast_radius to each changed symbol (default true)"),
 				"include_bodies":    boolProp("Attach source body to each changed symbol (default false)"),
 				"include_tests":     boolProp("Include test packages/symbols (default false)"),
+				"compact":           boolProp("One line per changed symbol instead of the full TOON/JSON record (default false)"),
 			}),
 		toolDef("workspace_changed_symbols",
 			"Get a workspace-wide diff of changed symbols: every member repo's changed symbols, each computed against that repo's own reference and tagged with its repo. Replaces running changed_symbols per repo manually.",
@@ -2187,6 +2202,7 @@ func sourceTools() []map[string]any {
 				"with_blast_radius": boolProp("Attach blast_radius to each changed symbol (default true)"),
 				"include_bodies":    boolProp("Attach source body to each changed symbol (default false)"),
 				"include_tests":     boolProp("Include test packages/symbols (default false)"),
+				"compact":           boolProp("One line per changed symbol instead of the full TOON/JSON record (default false)"),
 			}),
 	}
 }
