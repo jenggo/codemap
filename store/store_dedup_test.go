@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -155,6 +156,31 @@ func TestMigrateDedupUpgrade(t *testing.T) {
 
 	if !indexExists(s.db, "edges_pair") {
 		t.Fatal("expected edges_pair unique index after migration")
+	}
+}
+
+// TestMigrateFileContentFTSUpgradesTokenizer verifies opening a pre-v4 database
+// recreates file_content_fts with the trigram tokenizer so identifier-fragment
+// matches work after the upgrade.
+func TestMigrateFileContentFTSUpgradesTokenizer(t *testing.T) {
+	dir := t.TempDir()
+	path := writeV2DB(t, dir, nil)
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	var ddl string
+	if err := s.db.QueryRowContext(context.Background(), `SELECT sql FROM sqlite_master WHERE name = 'file_content_fts'`).Scan(&ddl); err != nil {
+		t.Fatalf("read file_content_fts schema: %v", err)
+	}
+	if !strings.Contains(ddl, "trigram") {
+		t.Fatalf("file_content_fts not migrated to trigram, got: %s", ddl)
+	}
+	if strings.Contains(ddl, "porter") {
+		t.Fatalf("file_content_fts still uses porter tokenizer: %s", ddl)
 	}
 }
 

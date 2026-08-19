@@ -101,7 +101,7 @@ func NormalizeQualifiedName(qn string) string {
 	return parenReceiverRe.ReplaceAllString(qn, ".$1.")
 }
 
-const schemaVersion = 3
+const schemaVersion = 4
 
 const schemaSQL = `
 CREATE TABLE IF NOT EXISTS repos (
@@ -248,7 +248,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS file_content_fts USING fts5(
     content,
     content=files,
     content_rowid=rowid,
-    tokenize='porter unicode61'
+    tokenize='trigram'
 );
 `
 
@@ -328,6 +328,19 @@ func Open(path string) (*Store, error) {
 func ensureSchema(db *sql.DB) error {
 	ctx := context.Background()
 
+	// Existing databases below the current schema version get destructive
+	// migrations (see migrateFileContentFTS). Fresh databases created by
+	// schemaSQL already carry the latest schema, so a missing version row is
+	// treated as current.
+	currentVersion, err := readSchemaVersion(ctx, db)
+	if err != nil {
+		return err
+	}
+
+	if err := migrateFromVersion(ctx, db, currentVersion); err != nil {
+		return err
+	}
+
 	if !tableExists(db, "repos") {
 		if _, err := db.ExecContext(ctx, `CREATE TABLE repos (
 			id          INTEGER PRIMARY KEY,
@@ -340,23 +353,8 @@ func ensureSchema(db *sql.DB) error {
 		}
 	}
 
-	const repoColumnDecl = "INTEGER REFERENCES repos(id)"
-	const repoIDCol = "repo_id"
-	for _, tc := range []struct{ table, column, decl string }{
-		{"packages", repoIDCol, repoColumnDecl},
-		{"symbols", repoIDCol, repoColumnDecl},
-		{"edges", repoIDCol, repoColumnDecl},
-		{"files", repoIDCol, repoColumnDecl},
-	} {
-		hasCol, err := columnExists(db, tc.table, tc.column)
-		if err != nil {
-			return fmt.Errorf("ensure schema: inspect %s.%s: %w", tc.table, tc.column, err)
-		}
-		if !hasCol {
-			if _, err := db.ExecContext(ctx, "ALTER TABLE "+tc.table+" ADD COLUMN "+tc.column+" "+tc.decl); err != nil {
-				return err
-			}
-		}
+	if err := ensureRepoIDColumns(ctx, db); err != nil {
+		return err
 	}
 
 	// Struct field info for contract shape matching (additive).
@@ -392,6 +390,83 @@ func ensureSchema(db *sql.DB) error {
 	}
 
 	return ensureContractTables(db)
+}
+
+// readSchemaVersion returns the schema version recorded in meta, or 0 when no
+// version row exists (fresh databases created by schemaSQL).
+func readSchemaVersion(ctx context.Context, db *sql.DB) (int, error) {
+	var version int
+	err := db.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = 'schema_version'`).Scan(&version)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return 0, fmt.Errorf("ensure schema: read schema_version: %w", err)
+		}
+		return 0, nil
+	}
+	return version, nil
+}
+
+// migrateFromVersion runs any migrations required to bring a database recorded
+// at version into line with the current schema. Fresh databases (version 0)
+// were created by schemaSQL and need nothing.
+func migrateFromVersion(ctx context.Context, db *sql.DB, version int) error {
+	if version <= 0 || version >= schemaVersion {
+		return nil
+	}
+	return migrateFileContentFTS(ctx, db)
+}
+
+// ensureRepoIDColumns adds the repo_id foreign-key column to single-repo tables
+// when missing (additive migration from the pre-workspace schema).
+func ensureRepoIDColumns(ctx context.Context, db *sql.DB) error {
+	const repoColumnDecl = "INTEGER REFERENCES repos(id)"
+	const repoIDCol = "repo_id"
+	for _, tc := range []struct{ table, column, decl string }{
+		{"packages", repoIDCol, repoColumnDecl},
+		{"symbols", repoIDCol, repoColumnDecl},
+		{"edges", repoIDCol, repoColumnDecl},
+		{"files", repoIDCol, repoColumnDecl},
+	} {
+		hasCol, err := columnExists(db, tc.table, tc.column)
+		if err != nil {
+			return fmt.Errorf("ensure schema: inspect %s.%s: %w", tc.table, tc.column, err)
+		}
+		if !hasCol {
+			if _, err := db.ExecContext(ctx, "ALTER TABLE "+tc.table+" ADD COLUMN "+tc.column+" "+tc.decl); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// migrateFileContentFTS recreates file_content_fts with the trigram tokenizer.
+// An FTS5 table's tokenizer is fixed at creation time, so enabling substring
+// matches inside camelCase identifiers (the porter/unicode61 tokenizer stores
+// each identifier as a single term) requires dropping the virtual table and
+// rebuilding it from the external `files` content table. Only databases whose
+// recorded schema version predates v4 run this; fresh databases already get
+// the trigram table from schemaSQL.
+func migrateFileContentFTS(ctx context.Context, db *sql.DB) error {
+	if !tableExists(db, "file_content_fts") {
+		return nil
+	}
+	if _, err := db.ExecContext(ctx, `DROP TABLE IF EXISTS file_content_fts`); err != nil {
+		return fmt.Errorf("migrate file_content_fts: drop: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, `CREATE VIRTUAL TABLE file_content_fts USING fts5(
+		path,
+		content,
+		content=files,
+		content_rowid=rowid,
+		tokenize='trigram'
+	)`); err != nil {
+		return fmt.Errorf("migrate file_content_fts: recreate with trigram: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO file_content_fts(file_content_fts) VALUES('rebuild')`); err != nil {
+		return fmt.Errorf("migrate file_content_fts: rebuild: %w", err)
+	}
+	return nil
 }
 
 // ensureContractTables creates the contract intelligence tables and indexes
@@ -1087,6 +1162,38 @@ func sanitizeFTSQuery(pattern string) string {
 	return strings.Join(quoted, " ")
 }
 
+// buildSymbolFTSQuery converts a user pattern into an FTS5 expression that
+// matches whole identifiers AND partial (prefix) identifiers. For each term it
+// emits a parenthesized OR group: the exact phrase (matching the whole token
+// anywhere in the indexed columns) OR a name-column-scoped prefix (matching
+// symbol names that begin with the term). Groups are AND-joined so multi-term
+// patterns keep their current whole-token AND semantics while gaining prefix
+// support. The name-column scope keeps a prefix from over-matching unrelated
+// columns (e.g. "pkg:F" must not match "Foo" via the qualified_name column).
+// This mirrors bleve's PrefixQuery: an identifier search on a partial name
+// ("GetSym") returns every symbol whose name starts with it ("GetSymbol",
+// "GetSymbolBody") instead of silently matching nothing.
+func buildSymbolFTSQuery(pattern string) string {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return ""
+	}
+
+	terms := strings.Fields(pattern)
+	var groups []string
+	for _, t := range terms {
+		t = strings.ReplaceAll(t, `"`, `""`)
+		if isPunctuationOnly(t) {
+			continue
+		}
+		groups = append(groups, `("`+t+`" OR {name} : "`+t+`"*)`)
+	}
+	if len(groups) == 0 {
+		return ""
+	}
+	return strings.Join(groups, " AND ")
+}
+
 // isPunctuationOnly reports whether s consists entirely of non-letter,
 // non-digit characters. Such terms are dropped by sanitizeFTSQuery because
 // quoting them yields an empty phrase, which is a MATCH error.
@@ -1100,6 +1207,35 @@ func isPunctuationOnly(s string) bool {
 		}
 	}
 	return true
+}
+
+// ftsNeedsFullScan reports whether the FTS5 trigram tokenizer cannot serve the
+// pattern. The tokenizer only indexes terms of at least three characters, and
+// any shorter token in a MATCH query silently matches nothing. Because the
+// trigram tokenizer splits on non-alphanumerics just like unicode61, a short
+// token can hide inside a longer term (e.g. "pkg:F"), so every alphanumeric
+// run in every kept term must reach three characters.
+func ftsNeedsFullScan(pattern string) bool {
+	for term := range strings.FieldsSeq(pattern) {
+		if isPunctuationOnly(term) {
+			continue
+		}
+		run := 0
+		for _, r := range term {
+			if unicode.IsLetter(r) || unicode.IsDigit(r) {
+				run++
+				continue
+			}
+			if run > 0 && run < 3 {
+				return true
+			}
+			run = 0
+		}
+		if run > 0 && run < 3 {
+			return true
+		}
+	}
+	return false
 }
 
 type Package struct {
@@ -1979,7 +2115,7 @@ func (s *Store) SearchSymbolsByFile(filePattern, kind string, exported *bool, in
 }
 
 func (s *Store) SearchSymbols(pattern, kind string, exported *bool, pkgPath string, includeTests bool) ([]Symbol, error) {
-	ftsQuery := sanitizeFTSQuery(pattern)
+	ftsQuery := buildSymbolFTSQuery(pattern)
 	if ftsQuery == "" {
 		return nil, nil
 	}
@@ -2611,13 +2747,22 @@ func (s *Store) SearchFileContent(pattern, filePattern string, isRegex bool, con
 		if sanitized == "" {
 			return nil, nil
 		}
-		// The FTS MATCH is a whole-content candidate prefilter; the raw pattern
-		// must still occur verbatim in the content so a row selected here always
-		// yields at least one line from the per-line extractMatches walk. Without
-		// this, a multi-term pattern whose terms sit on different lines would
-		// select the row but then produce zero matches.
-		query = `SELECT f.path, f.content FROM file_content_fts fts JOIN files f ON f.rowid = fts.rowid WHERE file_content_fts MATCH ? AND instr(f.content, ?) > 0`
-		args = []any{sanitized, pattern}
+		if ftsNeedsFullScan(pattern) {
+			// The trigram tokenizer produces matches only for terms of at
+			// least three characters; a shorter term silently matches nothing
+			// in MATCH. Scan the files table directly so short patterns keep
+			// returning the same verbatim matches they did under unicode61.
+			query = `SELECT f.path, f.content FROM files f WHERE instr(f.content, ?) > 0`
+			args = []any{pattern}
+		} else {
+			// The FTS MATCH is a whole-content candidate prefilter; the raw pattern
+			// must still occur verbatim in the content so a row selected here always
+			// yields at least one line from the per-line extractMatches walk. Without
+			// this, a multi-term pattern whose terms sit on different lines would
+			// select the row but then produce zero matches.
+			query = `SELECT f.path, f.content FROM file_content_fts fts JOIN files f ON f.rowid = fts.rowid WHERE file_content_fts MATCH ? AND instr(f.content, ?) > 0`
+			args = []any{sanitized, pattern}
+		}
 	}
 
 	if filePattern != "" {

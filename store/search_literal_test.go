@@ -36,6 +36,9 @@ func seedSearchModule(t *testing.T) *Store {
 		"svc.go":    "package lit\n\n// handler for user-service\n// -deprecated still here\n// refactor pkg:F helper\nfunc Svc() {}\n",
 		"quote.go":  "package lit\n\n// say \"hi\" there\nfunc Quote() {}\n",
 		"prefix.go": "package lit\n\n// only alpha\n// alpha beta\n// cli/codemap.Run called\nfunc Prefix() {}\n",
+
+		// camelCase identifier used to exercise trigram substring matching.
+		"camel.go": "package lit\n\n// GetSymbolBody resolves a symbol\nfunc GetSymbolBody() {}\n",
 	})
 
 	res, files := parseModule(t, dir)
@@ -203,6 +206,17 @@ func TestSearchFileContentFTSSemantics(t *testing.T) {
 			decoy:    "only alpha",
 		},
 		{
+			name:     "camelCase fragment matches inside identifier",
+			pattern:  "ymbol",
+			wantFile: "camel.go",
+			decoy:    "symbol body",
+		},
+		{
+			name:     "full camelCase identifier matches",
+			pattern:  "GetSymbolBody",
+			wantFile: "camel.go",
+		},
+		{
 			name:        "punctuation-only pattern is inert",
 			pattern:     "-",
 			expectError: false,
@@ -328,5 +342,89 @@ func TestSanitizeFTSQuery(t *testing.T) {
 		if got := sanitizeFTSQuery(tc.in); got != tc.want {
 			t.Errorf("sanitizeFTSQuery(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// TestBuildSymbolFTSQuery pins the FTS5 expression shape used for symbol
+// search: each term becomes a parenthesized OR of the exact phrase and a
+// name-column-scoped prefix, and multi-term patterns AND the groups together.
+func TestBuildSymbolFTSQuery(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", ""},
+		{"simple", `("simple" OR {name} : "simple"*)`},
+		{"user-service", `("user-service" OR {name} : "user-service"*)`},
+		{"pkg:F", `("pkg:F" OR {name} : "pkg:F"*)`},
+		{`say "hi"`, `("say" OR {name} : "say"*) AND ("""hi""" OR {name} : """hi"""*)`},
+		{"alpha beta", `("alpha" OR {name} : "alpha"*) AND ("beta" OR {name} : "beta"*)`},
+		{"-", ""},
+		{"-deprecated", `("-deprecated" OR {name} : "-deprecated"*)`},
+		{"a - b", `("a" OR {name} : "a"*) AND ("b" OR {name} : "b"*)`},
+	}
+	for _, tc := range cases {
+		if got := buildSymbolFTSQuery(tc.in); got != tc.want {
+			t.Errorf("buildSymbolFTSQuery(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestSearchSymbolsPartialIdentifier verifies that a partial identifier
+// matches every symbol whose name starts with it (bleve-style prefix search),
+// while a name-scoped prefix never over-matches unrelated columns.
+func TestSearchSymbolsPartialIdentifier(t *testing.T) {
+	s := seedSearchModule(t)
+
+	cases := []struct {
+		name     string
+		pattern  string
+		wantName string // symbol name that must be returned
+		decoy    string // symbol name that must NOT be returned
+	}{
+		{
+			name:     "partial identifier matches",
+			pattern:  "GetSym",
+			wantName: "GetSymbolBody",
+			decoy:    "",
+		},
+		{
+			name:     "short partial prefix matches",
+			pattern:  "GetS",
+			wantName: "GetSymbolBody",
+			decoy:    "",
+		},
+		{
+			name:     "exact identifier still matches",
+			pattern:  "GetSymbolBody",
+			wantName: "GetSymbolBody",
+			decoy:    "",
+		},
+		{
+			// The prefix is scoped to the name column, so a term that only
+			// appears in the qualified_name column must not over-match.
+			name:     "name-scoped prefix avoids cross-column over-match",
+			pattern:  "pkg:F",
+			wantName: "",
+			decoy:    "FooXBar",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			syms, err := s.SearchSymbols(tc.pattern, "", nil, "", false)
+			if err != nil {
+				t.Fatalf("search %q: %v", tc.pattern, err)
+			}
+			names := map[string]bool{}
+			for _, sym := range syms {
+				names[sym.Name] = true
+			}
+			if tc.wantName != "" && !names[tc.wantName] {
+				t.Fatalf("pattern %q did not return %q, got: %v", tc.pattern, tc.wantName, names)
+			}
+			if tc.decoy != "" && names[tc.decoy] {
+				t.Fatalf("pattern %q over-matched decoy %q: %v", tc.pattern, tc.decoy, names)
+			}
+		})
 	}
 }

@@ -459,6 +459,51 @@ func TestSearchRelevanceOrdering(t *testing.T) {
 	}
 }
 
+// TestSearchPartialIdentifier verifies that a partial identifier is resolved
+// through the query layer: searching "NewPar" surfaces NewParser even though
+// no symbol is literally named "NewPar".
+func TestSearchPartialIdentifier(t *testing.T) {
+	absPath, err := filepath.Abs("testdata/simple")
+	if err != nil {
+		t.Fatalf("failed to get absolute path: %v", err)
+	}
+
+	parseResult, err := parse.Run(absPath)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	resolveResult := resolve.Run(parseResult)
+
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test.db")
+
+	s, err := store.Create(dbPath)
+	if err != nil {
+		t.Fatalf("store create error: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	if err := s.Write(resolveResult, nil, nil); err != nil {
+		t.Fatalf("store write error: %v", err)
+	}
+
+	results, err := query.Search(s, "NewPar")
+	if err != nil {
+		t.Fatalf("search error: %v", err)
+	}
+
+	found := false
+	for _, r := range results {
+		if r.QualifiedName == "codemap/testdata/simple.NewParser" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("partial identifier search did not surface NewParser, got: %+v", results)
+	}
+}
+
 func TestPackageQuery(t *testing.T) {
 	absPath, err := filepath.Abs("testdata/simple")
 	if err != nil {
