@@ -157,6 +157,7 @@ type T struct {
 	Host string ` +
 				"`cbor:\"host\" json:\"hostname\"`" + `
 }
+
 `, want: "host",
 		},
 		{
@@ -166,6 +167,7 @@ type T struct {
 	FirstName string ` +
 				"`json:\"first_name\"`" + `
 }
+
 `, want: "first_name",
 		},
 		{
@@ -237,6 +239,28 @@ type T struct {
 			}
 			if got := wireName(field, goName); got != tt.want {
 				t.Errorf("wireName = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExprStringArrayTypes(t *testing.T) {
+	tests := []struct {
+		expr string
+		want string
+	}{
+		{expr: "[4]byte", want: "[4]byte"},
+		{expr: "[...]int", want: "[...]int"},
+		{expr: "[]string", want: "[]string"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.expr, func(t *testing.T) {
+			expr, err := parser.ParseExpr(tt.expr)
+			if err != nil {
+				t.Fatalf("parse expression: %v", err)
+			}
+			if got := exprString(expr); got != tt.want {
+				t.Fatalf("exprString(%q) = %q, want %q", tt.expr, got, tt.want)
 			}
 		})
 	}

@@ -1698,15 +1698,20 @@ func matchGenDecl(d *ast.GenDecl, fset *token.FileSet, posLine int, name, kind s
 }
 
 func symbolSpan(filePath string, posLine int, receiver, name, kind string) (startOff, endOff, docStartOff int, partOfGroup bool, groupMembers int, err error) {
+	_, startOff, endOff, docStartOff, partOfGroup, groupMembers, err = symbolSpanData(filePath, posLine, receiver, name, kind)
+	return
+}
+
+func symbolSpanData(filePath string, posLine int, receiver, name, kind string) (data []byte, startOff, endOff, docStartOff int, partOfGroup bool, groupMembers int, err error) {
 	data, readErr := os.ReadFile(filePath)
 	if readErr != nil {
-		return 0, 0, 0, false, 0, fmt.Errorf("read source file %s: %w", filePath, readErr)
+		return nil, 0, 0, 0, false, 0, fmt.Errorf("read source file %s: %w", filePath, readErr)
 	}
 
 	fset := token.NewFileSet()
 	f, parseErr := parser.ParseFile(fset, filePath, data, parser.ParseComments)
 	if parseErr != nil {
-		return 0, 0, 0, false, 0, fmt.Errorf("parse source file %s: %w", filePath, parseErr)
+		return nil, 0, 0, 0, false, 0, fmt.Errorf("parse source file %s: %w", filePath, parseErr)
 	}
 
 	matchAtLine := func(line int) *spanMatch {
@@ -1727,7 +1732,7 @@ func symbolSpan(filePath string, posLine int, receiver, name, kind string) (star
 
 	// Exact-line match first: the fast path when the index is fresh.
 	if m := matchAtLine(posLine); m != nil {
-		return m.startOff, m.endOff, m.docStartOff, m.partOfGroup, m.groupMembers, nil
+		return data, m.startOff, m.endOff, m.docStartOff, m.partOfGroup, m.groupMembers, nil
 	}
 
 	// Name-only fallback: the index may be stale (file edited since indexing),
@@ -1735,22 +1740,17 @@ func symbolSpan(filePath string, posLine int, receiver, name, kind string) (star
 	// file and methods are disambiguated by receiver, so this stays safe.
 	if posLine != 0 {
 		if m := matchAtLine(0); m != nil {
-			return m.startOff, m.endOff, m.docStartOff, m.partOfGroup, m.groupMembers, nil
+			return data, m.startOff, m.endOff, m.docStartOff, m.partOfGroup, m.groupMembers, nil
 		}
 	}
 
-	return 0, 0, 0, false, 0, fmt.Errorf("declaration not found: %s (kind=%s) at line %d in %s", name, kind, posLine, filePath)
+	return nil, 0, 0, 0, false, 0, fmt.Errorf("declaration not found: %s (kind=%s) at line %d in %s", name, kind, posLine, filePath)
 }
 
 func symbolEndLine(filePath string, posLine int, receiver, name, kind string) (int, error) {
-	startOff, endOff, _, _, _, err := symbolSpan(filePath, posLine, receiver, name, kind)
+	data, _, endOff, _, _, _, err := symbolSpanData(filePath, posLine, receiver, name, kind)
 	if err != nil {
 		return 0, err
-	}
-	_ = startOff
-	data, readErr := os.ReadFile(filePath)
-	if readErr != nil {
-		return 0, readErr
 	}
 	lineOffsets := computeLineOffsets(data)
 	return offsetToLine(lineOffsets, endOff), nil
@@ -1801,14 +1801,9 @@ func GetSymbolBody(s *store.Store, qualifiedName string, contextLines int, inclu
 		return nil, fmt.Errorf("symbol not found: %s", qualifiedName)
 	}
 
-	startOff, endOff, docStartOff, partOfGroup, groupMembers, err := symbolSpan(sym.PosFile, sym.PosLine, sym.Receiver, sym.Name, sym.Kind)
+	data, startOff, endOff, docStartOff, partOfGroup, groupMembers, err := symbolSpanData(sym.PosFile, sym.PosLine, sym.Receiver, sym.Name, sym.Kind)
 	if err != nil {
 		return nil, err
-	}
-
-	data, err := os.ReadFile(sym.PosFile)
-	if err != nil {
-		return nil, fmt.Errorf("read source file %s: %w", sym.PosFile, err)
 	}
 
 	bodyStart := startOff
@@ -2455,13 +2450,9 @@ func readChangedBody(filePath, name, kind, receiver string, posLine int, include
 	if !include {
 		return "", nil
 	}
-	startOff, endOff, _, _, _, spanErr := symbolSpan(filePath, posLine, receiver, name, kind)
+	data, startOff, endOff, _, _, _, spanErr := symbolSpanData(filePath, posLine, receiver, name, kind)
 	if spanErr != nil {
 		return "", fmt.Errorf("changed_symbols: body for %s in %s: %w", name, filePath, spanErr)
-	}
-	data, rerr := os.ReadFile(filePath)
-	if rerr != nil {
-		return "", fmt.Errorf("changed_symbols: body for %s in %s: %w", name, filePath, rerr)
 	}
 	return string(data[startOff:endOff]), nil
 }

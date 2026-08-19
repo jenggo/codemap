@@ -469,11 +469,16 @@ func exprString(expr ast.Expr) string {
 	switch e := expr.(type) {
 	case *ast.Ident:
 		return e.Name
+	case *ast.BasicLit:
+		return e.Value
 	case *ast.StarExpr:
 		return "*" + exprString(e.X)
 	case *ast.SelectorExpr:
 		return exprString(e.X) + "." + e.Sel.Name
 	case *ast.ArrayType:
+		if e.Len != nil {
+			return "[" + exprString(e.Len) + "]" + exprString(e.Elt)
+		}
 		return "[]" + exprString(e.Elt)
 	case *ast.MapType:
 		return "map[" + exprString(e.Key) + "]" + exprString(e.Value)
@@ -494,6 +499,9 @@ func exprString(expr ast.Expr) string {
 		}
 		return exprString(e.X) + "[" + strings.Join(args, ", ") + "]"
 	case *ast.Ellipsis:
+		if e.Elt == nil {
+			return "..."
+		}
 		return "..." + exprString(e.Elt)
 	default:
 		return "?"

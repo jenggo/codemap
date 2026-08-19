@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -21,6 +22,31 @@ import (
 	"codemap/resolve"
 	"codemap/vcs"
 )
+
+var regexCache sync.Map
+
+func cachedRegex(pattern string) (*regexp.Regexp, error) {
+	if value, ok := regexCache.Load(pattern); ok {
+		return value.(*regexp.Regexp), nil
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, err
+	}
+	actual, _ := regexCache.LoadOrStore(pattern, re)
+	return actual.(*regexp.Regexp), nil
+}
+
+func openDB(path string) (*sql.DB, error) {
+	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	return db, nil
+}
 
 func jsonMarshal(v any) (string, error) {
 	b, err := json.Marshal(v)
@@ -47,11 +73,11 @@ func init() {
 			if !ok {
 				return nil, fmt.Errorf("regexp: value must be a string, got %T", args[1])
 			}
-			matched, err := regexp.MatchString(pattern, s)
+			re, err := cachedRegex(pattern)
 			if err != nil {
 				return nil, err
 			}
-			if matched {
+			if re.MatchString(s) {
 				return int64(1), nil
 			}
 			return int64(0), nil
@@ -253,11 +279,7 @@ func Create(path string) (*Store, error) {
 		_ = os.WriteFile(gitignorePath, []byte("*\n"), 0644)
 	}
 
-	if _, err := os.Stat(path); err == nil {
-		_ = os.Remove(path)
-	}
-
-	db, err := sql.Open("sqlite", path)
+	db, err := openDB(path)
 	if err != nil {
 		return nil, err
 	}
@@ -279,7 +301,7 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("codemap index not found: run 'codemap index' first or use the index MCP tool")
 	}
 
-	db, err := sql.Open("sqlite", path)
+	db, err := openDB(path)
 	if err != nil {
 		return nil, err
 	}
@@ -2577,7 +2599,7 @@ func (s *Store) SearchFileContent(pattern, filePattern string, isRegex bool, con
 
 	var re *regexp.Regexp
 	if isRegex {
-		compiled, err := regexp.Compile(pattern)
+		compiled, err := cachedRegex(pattern)
 		if err != nil {
 			return nil, fmt.Errorf("invalid regex %q: %w", pattern, err)
 		}

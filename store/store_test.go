@@ -39,6 +39,74 @@ func TestHealthRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCreatePreservesExistingDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	s, err := Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetRepoMeta("/repo/path", "abc123", 1, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err = Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	h, err := s.Health()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.RepoPath != "/repo/path" || h.GitHead != "abc123" {
+		t.Fatalf("existing metadata lost after Create: %+v", h)
+	}
+}
+
+func TestSQLiteConcurrencyConfig(t *testing.T) {
+	s, err := Create(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	var timeout int
+	if err := s.db.QueryRowContext(context.Background(), "PRAGMA busy_timeout").Scan(&timeout); err != nil {
+		t.Fatal(err)
+	}
+	if timeout != 5000 {
+		t.Fatalf("busy_timeout = %d, want 5000", timeout)
+	}
+	var journalMode string
+	if err := s.db.QueryRowContext(context.Background(), "PRAGMA journal_mode").Scan(&journalMode); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.EqualFold(journalMode, "wal") {
+		t.Fatalf("journal_mode = %q, want wal", journalMode)
+	}
+	if got := s.db.Stats().MaxOpenConnections; got != 1 {
+		t.Fatalf("max open connections = %d, want 1", got)
+	}
+}
+
+func TestCachedRegexReusesCompiledPattern(t *testing.T) {
+	pattern := `^cached-regex-pattern$`
+	first, err := cachedRegex(pattern)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := cachedRegex(pattern)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatal("cachedRegex returned different compiled patterns")
+	}
+}
+
 func TestRepoIdentityMismatch(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test.db")
 	s, err := Create(dbPath)
@@ -180,12 +248,20 @@ func TestHealthCorruptedDB(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 
-	// Corrupt the database file underneath the open connection.
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	removeSQLiteSidecars(t, dbPath)
 	if err := os.WriteFile(dbPath, []byte("this is not a sqlite database at all"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-
-	if _, err := s.Health(); err == nil {
+	opened, err := openDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = opened.Close() }()
+	corrupt := &Store{db: opened}
+	if _, err := corrupt.Health(); err == nil {
 		t.Fatal("expected error for corrupted database, not a healthy empty index")
 	}
 }
@@ -200,12 +276,29 @@ func TestColumnExistsPropagatesError(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	removeSQLiteSidecars(t, dbPath)
 	if err := os.WriteFile(dbPath, []byte("garbage, definitely not a database"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-
-	if _, err := columnExists(s.db, "edges", "sites"); err == nil {
+	opened, err := openDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = opened.Close() }()
+	if _, err := columnExists(opened, "edges", "sites"); err == nil {
 		t.Fatal("expected error when PRAGMA table_info fails")
+	}
+}
+
+func removeSQLiteSidecars(t *testing.T, dbPath string) {
+	t.Helper()
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := os.Remove(dbPath + suffix); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
 	}
 }
 
