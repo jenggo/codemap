@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 
+	"codemap/opt"
 	"codemap/store"
 	"codemap/vcs"
 )
@@ -30,60 +31,40 @@ type Options struct {
 	IncludeUnexported bool
 }
 
-type Option func(*Options)
+// Option mutates query Options. Alias of opt.Option[Options], so existing
+// call sites are unaffected by the shared implementation.
+type Option = opt.Option[Options]
 
-// WithRepo scopes a query to one workspace member (module path).
-func WithRepo(repo string) Option {
-	return func(o *Options) {
-		o.Repo = repo
-	}
-}
+var (
+	// WithRepo scopes a query to one workspace member (module path).
+	WithRepo = opt.New(func(o *Options, repo string) { o.Repo = repo })
 
+	WithKind     = opt.New(func(o *Options, kind string) { o.Kind = kind })
+	WithExported = opt.New(func(o *Options, exported bool) { o.Exported = &exported })
+	WithPackage  = opt.New(func(o *Options, pkg string) { o.Package = pkg })
+	WithFile     = opt.New(func(o *Options, file string) { o.File = file })
+	WithDepth    = opt.New(func(o *Options, depth int) { o.Depth = depth })
+)
+
+// WithTests includes test packages and symbols in the result.
 func WithTests() Option {
 	return func(o *Options) {
 		o.IncludeTests = true
 	}
 }
 
-func WithKind(kind string) Option {
-	return func(o *Options) {
-		o.Kind = kind
-	}
-}
-
-func WithExported(exported bool) Option {
-	return func(o *Options) {
-		o.Exported = &exported
-	}
-}
-
+// WithUnexported includes private symbols (package tool).
 func WithUnexported() Option {
 	return func(o *Options) {
 		o.IncludeUnexported = true
 	}
 }
 
-func WithPackage(pkg string) Option {
-	return func(o *Options) {
-		o.Package = pkg
-	}
-}
-
-func WithFile(file string) Option {
-	return func(o *Options) {
-		o.File = file
-	}
-}
-
+// WithEdgeTypes restricts returned edges to the given types. Kept variadic
+// so call sites can pass both single values and spread slices.
 func WithEdgeTypes(types ...string) Option {
 	return func(o *Options) {
 		o.EdgeTypes = types
-	}
-}
-
-func WithDepth(depth int) Option {
-	return func(o *Options) {
-		o.Depth = depth
 	}
 }
 
@@ -321,9 +302,7 @@ func expandLevel(edges []store.Edge, allowTypes []string, outgoing bool, visited
 
 func CallersOf(s *store.Store, qualifiedName string, opts ...Option) ([]EdgeDetail, error) {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 	allowTypes := options.EdgeTypes
 	if len(allowTypes) == 0 {
 		allowTypes = allEdgeTypes
@@ -337,9 +316,7 @@ func CallersOf(s *store.Store, qualifiedName string, opts ...Option) ([]EdgeDeta
 
 func CalleesOf(s *store.Store, qualifiedName string, opts ...Option) ([]EdgeDetail, error) {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 	allowTypes := options.EdgeTypes
 	if len(allowTypes) == 0 {
 		allowTypes = allEdgeTypes
@@ -353,9 +330,7 @@ func CalleesOf(s *store.Store, qualifiedName string, opts ...Option) ([]EdgeDeta
 
 func Show(s *store.Store, qualifiedName string, opts ...Option) (*ShowResult, error) {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	sym, err := s.SymbolByName(qualifiedName)
 	if err != nil {
@@ -404,9 +379,7 @@ func Show(s *store.Store, qualifiedName string, opts ...Option) (*ShowResult, er
 
 func Overview(s *store.Store, opts ...Option) (*OverviewResult, error) {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	pkgs, err := s.ListPackages()
 	if err != nil {
@@ -475,9 +448,8 @@ func buildPackageSummary(s *store.Store, p store.Package, includeTests bool, imp
 		Name:        p.Name,
 		Repo:        p.Repo,
 		ImportCount: importCounts[p.Path],
-	}
 
-	summary.ExportedSymbols = symbolDetails(syms, false)
+		ExportedSymbols: symbolDetails(syms, false)}
 
 	return summary, nil
 }
@@ -507,9 +479,7 @@ func symbolDetails(syms []store.Symbol, includeUnexported bool) []SymbolDetail {
 
 func Search(s *store.Store, pattern string, opts ...Option) ([]SearchResult, error) {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	var syms []store.Symbol
 	var err error
@@ -592,9 +562,7 @@ func sortSearchResults(results []SearchResult, patternLower string) {
 
 func MethodsOf(s *store.Store, typeName string, opts ...Option) ([]SymbolDetail, error) {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	syms, err := s.MethodsByReceiver(typeName, options.IncludeTests)
 	if err != nil {
@@ -637,9 +605,7 @@ type PackageResult struct {
 
 func Package(s *store.Store, pkgPath string, opts ...Option) (*PackageResult, error) {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	pkgs, err := s.ListPackages()
 	if err != nil {
@@ -684,9 +650,7 @@ func Package(s *store.Store, pkgPath string, opts ...Option) (*PackageResult, er
 
 func EdgesByType(s *store.Store, edgeType string, opts ...Option) ([]EdgeDetail, error) {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	edges, err := s.EdgesByType(edgeType)
 	if err != nil {
@@ -702,9 +666,7 @@ func EdgesByType(s *store.Store, edgeType string, opts ...Option) ([]EdgeDetail,
 
 func AllEdges(s *store.Store, opts ...Option) ([]EdgeDetail, error) {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	edges, err := s.AllEdges()
 	if err != nil {
@@ -720,9 +682,7 @@ func AllEdges(s *store.Store, opts ...Option) ([]EdgeDetail, error) {
 
 func ImportersOf(s *store.Store, pkgPath string, opts ...Option) ([]EdgeDetail, error) {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	allowTypes := options.EdgeTypes
 	if len(allowTypes) == 0 {
@@ -787,9 +747,7 @@ func importersViaShortPath(s *store.Store, pkgPath string, allowTypes []string) 
 
 func ImportsOf(s *store.Store, pkgPath string, opts ...Option) ([]EdgeDetail, error) {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	edges, err := s.EdgesFrom(pkgPath)
 	if err != nil {
@@ -847,9 +805,7 @@ func modulePathForRef(ref string, knownModules []string) string {
 
 func SearchByPrefix(s *store.Store, prefix string, opts ...Option) ([]SearchResult, error) {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	syms, err := s.SearchByQualifiedNamePrefix(prefix, options.IncludeTests)
 	if err != nil {
@@ -876,9 +832,7 @@ func SearchByPrefix(s *store.Store, prefix string, opts ...Option) ([]SearchResu
 
 func TransitiveImports(s *store.Store, pkgPath string, opts ...Option) ([]EdgeDetail, error) {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	pkgs, err := s.ListPackages()
 	if err != nil {
@@ -948,9 +902,7 @@ func transitiveImportBFS(pkgPath string, adj map[string][]store.Edge, projectSet
 
 func TypeUsage(s *store.Store, typeName string, opts ...Option) ([]SearchResult, error) {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	syms, err := s.SearchByType(typeName, options.IncludeTests)
 	if err != nil {
@@ -1005,9 +957,7 @@ var ErrNoPath = errors.New("no path found")
 
 func FindPath(s *store.Store, from, to string, maxDepth int, opts ...Option) ([]PathStep, error) {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 	if maxDepth <= 0 {
 		maxDepth = 10
 	}
@@ -1101,9 +1051,7 @@ func contractToEdge(c store.Contract) store.Edge {
 
 func MethodSearch(s *store.Store, methodName string, opts ...Option) ([]SearchResult, error) {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	syms, err := s.MethodsByName(methodName, options.IncludeTests)
 	if err != nil {
@@ -1187,9 +1135,7 @@ type UnusedSymbol struct {
 
 func UnusedSymbols(s *store.Store, opts ...Option) ([]UnusedSymbol, error) {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	allSyms, err := s.AllSymbols(options.IncludeTests)
 	if err != nil {
@@ -1380,9 +1326,7 @@ func canonicalCycle(cycle []string) string {
 
 func SymbolsInFile(s *store.Store, filePath string, opts ...Option) ([]SearchResult, error) {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 	syms, err := s.SearchSymbolsByFile(filePath, "", nil, false)
 	if err != nil {
 		return nil, err
@@ -1421,9 +1365,7 @@ var errSymbolMissing = errors.New("symbol not found")
 
 func GetBlastRadius(s *store.Store, qualifiedName string, depth int, opts ...Option) (*BlastRadius, error) {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 	if depth <= 0 {
 		depth = 3
 	}
@@ -1509,9 +1451,7 @@ func BlastRadiusWithContracts(s *store.Store, qualifiedName string, depth int, o
 	}
 
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	contractConsumers := 0
 	for _, c := range contracts {
@@ -1533,9 +1473,7 @@ func BlastRadiusWithContracts(s *store.Store, qualifiedName string, depth int, o
 
 func ListPackages(s *store.Store, opts ...Option) ([]store.Package, error) {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	pkgs, err := s.ListPackages()
 	if err != nil {
@@ -2808,9 +2746,7 @@ func SymbolImportance(s *store.Store, topN, scope int, opts ...Option) ([]Import
 	_ = scope
 
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	allSyms, err := s.AllSymbols(false)
 	if err != nil {

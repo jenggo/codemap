@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"codemap/opt"
 	"codemap/query"
 	"codemap/store"
 
@@ -29,14 +30,14 @@ type Options struct {
 	FullDocs bool
 }
 
-type Option func(*Options)
+// Option mutates render Options. Alias of opt.Option[Options], so existing
+// call sites are unaffected by the shared implementation.
+type Option = opt.Option[Options]
 
-func WithFormat(f Format) Option {
-	return func(o *Options) {
-		o.Format = f
-	}
-}
+// WithFormat selects the output format (TOON, text, JSON, compact).
+var WithFormat = opt.New(func(o *Options, f Format) { o.Format = f })
 
+// WithFullDocs shows complete documentation instead of the first sentence.
 func WithFullDocs() Option {
 	return func(o *Options) {
 		o.FullDocs = true
@@ -45,9 +46,7 @@ func WithFullDocs() Option {
 
 func RenderOverview(result *query.OverviewResult, opts ...Option) string {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	switch options.Format {
 	case FormatTOON:
@@ -140,9 +139,7 @@ func renderOverviewCompact(result *query.OverviewResult) string {
 
 func RenderShow(result *query.ShowResult, opts ...Option) string {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	switch options.Format {
 	case FormatTOON:
@@ -232,9 +229,7 @@ func renderShowCompact(r *query.ShowResult) string {
 
 func RenderCallers(edges []query.EdgeDetail, opts ...Option) string {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	switch options.Format {
 	case FormatTOON:
@@ -260,9 +255,7 @@ func RenderCallers(edges []query.EdgeDetail, opts ...Option) string {
 
 func RenderCallees(edges []query.EdgeDetail, opts ...Option) string {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	switch options.Format {
 	case FormatTOON:
@@ -288,9 +281,7 @@ func RenderCallees(edges []query.EdgeDetail, opts ...Option) string {
 
 func RenderSearch(results []query.SearchResult, opts ...Option) string {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	switch options.Format {
 	case FormatTOON:
@@ -320,9 +311,7 @@ func RenderSearch(results []query.SearchResult, opts ...Option) string {
 
 func RenderEdges(edges []query.EdgeDetail, opts ...Option) string {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	switch options.Format {
 	case FormatTOON:
@@ -351,9 +340,7 @@ func RenderEdges(edges []query.EdgeDetail, opts ...Option) string {
 
 func RenderListPackages(pkgs []store.Package, opts ...Option) string {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	switch options.Format {
 	case FormatTOON:
@@ -379,9 +366,7 @@ func RenderListPackages(pkgs []store.Package, opts ...Option) string {
 
 func RenderMethodsOf(methods []query.SymbolDetail, opts ...Option) string {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	switch options.Format {
 	case FormatTOON:
@@ -413,9 +398,7 @@ func RenderMethodsOf(methods []query.SymbolDetail, opts ...Option) string {
 
 func RenderPackage(pkg *query.PackageResult, opts ...Option) string {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	switch options.Format {
 	case FormatTOON:
@@ -682,9 +665,7 @@ func renderPackageTOON(pkg *query.PackageResult) string {
 
 func RenderSymbolBody(result *query.SymbolBodyResult, opts ...Option) string {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	switch options.Format {
 	case FormatTOON:
@@ -777,9 +758,7 @@ func renderSymbolBodyText(r *query.SymbolBodyResult) string {
 
 func RenderDependencyLayers(result *query.LayersResult, opts ...Option) string {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	switch options.Format {
 	case FormatTOON:
@@ -860,9 +839,7 @@ func renderDependencyLayersTOON(r *query.LayersResult) string {
 
 func RenderDependencyFlow(result *query.FlowResult, opts ...Option) string {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	switch options.Format {
 	case FormatTOON:
@@ -926,9 +903,7 @@ func renderDependencyFlowCompact(r *query.FlowResult) string {
 
 func RenderEntryPoints(entries []query.EntryPoint, opts ...Option) string {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	switch options.Format {
 	case FormatTOON:
@@ -985,9 +960,7 @@ func renderEntryPointsCompact(entries []query.EntryPoint) string {
 
 func RenderChangedSymbols(result *query.ChangedSymbolsResult, opts ...Option) string {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	switch options.Format {
 	case FormatTOON:
@@ -1066,9 +1039,7 @@ func indentEach(s, prefix string) string {
 
 func RenderTextMatches(matches []store.FileMatch, opts ...Option) string {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	switch options.Format {
 	case FormatJSON:
@@ -1110,9 +1081,7 @@ func RenderTextMatches(matches []store.FileMatch, opts ...Option) string {
 
 func RenderBundle(bundle *query.Bundle, opts ...Option) string {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	switch options.Format {
 	case FormatJSON:
@@ -1207,9 +1176,7 @@ func renderBundleTOON(b *query.Bundle) string {
 
 func RenderHotspots(hotspots []query.Hotspot, opts ...Option) string {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	switch options.Format {
 	case FormatJSON:
@@ -1248,9 +1215,7 @@ func renderHotspotsTOON(hotspots []query.Hotspot) string {
 
 func RenderImportance(entries []query.ImportanceEntry, opts ...Option) string {
 	options := &Options{}
-	for _, o := range opts {
-		o(options)
-	}
+	opt.Apply(options, opts)
 
 	switch options.Format {
 	case FormatJSON:
