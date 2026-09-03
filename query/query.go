@@ -2582,10 +2582,6 @@ func resolveRepoDir(repoDir string) (string, error) {
 	return abs, nil
 }
 
-func SearchText(s *store.Store, pattern, filePattern string, isRegex bool, contextLines int) ([]store.FileMatch, error) {
-	return s.SearchFileContent(pattern, filePattern, isRegex, contextLines)
-}
-
 type Bundle struct {
 	QualifiedName string         `json:"qualified_name"`
 	Symbol        *SymbolDetail  `json:"symbol,omitempty"`

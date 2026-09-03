@@ -250,6 +250,17 @@ CREATE VIRTUAL TABLE IF NOT EXISTS file_content_fts USING fts5(
     content_rowid=rowid,
     tokenize='trigram'
 );
+
+CREATE VIRTUAL TABLE IF NOT EXISTS response_chunks USING fts5(
+    response_id UNINDEXED,
+    tool        UNINDEXED,
+    section_idx UNINDEXED,
+    title       UNINDEXED,
+    content,
+    byte_count  UNINDEXED,
+    created_at  UNINDEXED,
+    tokenize='trigram'
+);
 `
 
 const andIsTestFalse = " AND s.is_test = FALSE"
@@ -377,6 +388,11 @@ func ensureSchema(db *sql.DB) error {
 		return err
 	}
 
+	// Overflow response chunks (additive FTS5 table).
+	if err := migrateResponseChunks(ctx, db); err != nil {
+		return err
+	}
+
 	if _, err := db.ExecContext(ctx, `INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)`, strconv.Itoa(schemaVersion)); err != nil {
 		return err
 	}
@@ -465,6 +481,29 @@ func migrateFileContentFTS(ctx context.Context, db *sql.DB) error {
 	}
 	if _, err := db.ExecContext(ctx, `INSERT INTO file_content_fts(file_content_fts) VALUES('rebuild')`); err != nil {
 		return fmt.Errorf("migrate file_content_fts: rebuild: %w", err)
+	}
+	return nil
+}
+
+// migrateResponseChunks creates the response_chunks FTS5 table on databases
+// created before overflow indexing existed (all additive). Fresh databases
+// already carry the table from schemaSQL.
+func migrateResponseChunks(ctx context.Context, db *sql.DB) error {
+	if tableExists(db, "response_chunks") {
+		return nil
+	}
+	_, err := db.ExecContext(ctx, `CREATE VIRTUAL TABLE response_chunks USING fts5(
+		response_id UNINDEXED,
+		tool        UNINDEXED,
+		section_idx UNINDEXED,
+		title       UNINDEXED,
+		content,
+		byte_count  UNINDEXED,
+		created_at  UNINDEXED,
+		tokenize='trigram'
+	)`)
+	if err != nil {
+		return fmt.Errorf("migrate response_chunks: %w", err)
 	}
 	return nil
 }
@@ -743,9 +782,14 @@ func (s *Store) writeTx(ctx context.Context, tx *sql.Tx, result *resolve.Result,
 		return err
 	}
 	if fileDirty {
-		return s.populateFileContentFTS(ctx, tx)
+		if err := s.populateFileContentFTS(ctx, tx); err != nil {
+			return err
+		}
 	}
-	return nil
+
+	// Overflow response chunks are a cache keyed to the previous index
+	// generation; any successful full index write invalidates them.
+	return deleteResponseChunksTx(ctx, tx)
 }
 
 // registerRepos upserts every member into the repos table (workspace mode) and
@@ -818,9 +862,12 @@ func (s *Store) ReplaceRepo(result *resolve.Result, files map[string]string, chu
 			return err
 		}
 		if fileDirty {
-			return s.populateFileContentFTS(ctx, tx)
+			if err := s.populateFileContentFTS(ctx, tx); err != nil {
+				return err
+			}
 		}
-		return nil
+		// A per-member re-index also invalidates the overflow cache.
+		return deleteResponseChunksTx(ctx, tx)
 	})
 }
 
@@ -2800,33 +2847,40 @@ func (s *Store) SearchFileContent(pattern, filePattern string, isRegex bool, con
 }
 
 func extractMatches(filePath, content, pattern string, re *regexp.Regexp, isRegex bool, contextLines int) []FileMatch {
+	return extractMatchesFunc(filePath, content, func(line string) bool {
+		if isRegex {
+			return re.MatchString(line)
+		}
+		return strings.Contains(line, pattern)
+	}, contextLines)
+}
+
+// extractMatchesFunc walks the content line by line and returns a FileMatch
+// for every line the predicate accepts, with contextLines of surrounding
+// text attached to each.
+func extractMatchesFunc(filePath, content string, match func(line string) bool, contextLines int) []FileMatch {
 	lines := strings.Split(content, "\n")
 	var matches []FileMatch
 	for i, line := range lines {
-		var matched bool
-		if isRegex {
-			matched = re.MatchString(line)
-		} else {
-			matched = strings.Contains(line, pattern)
+		if !match(line) {
+			continue
 		}
-		if matched {
-			_fm := FileMatch{
-				FilePath:   filePath,
-				LineNumber: i + 1,
-				Line:       line,
-			}
-			if contextLines > 0 {
-				start := max(0, i-contextLines)
-				end := min(len(lines), i+contextLines+1)
-				if start < i {
-					_fm.ContextBefore = strings.Join(lines[start:i], "\n")
-				}
-				if i+1 < end {
-					_fm.ContextAfter = strings.Join(lines[i+1:end], "\n")
-				}
-			}
-			matches = append(matches, _fm)
+		_fm := FileMatch{
+			FilePath:   filePath,
+			LineNumber: i + 1,
+			Line:       line,
 		}
+		if contextLines > 0 {
+			start := max(0, i-contextLines)
+			end := min(len(lines), i+contextLines+1)
+			if start < i {
+				_fm.ContextBefore = strings.Join(lines[start:i], "\n")
+			}
+			if i+1 < end {
+				_fm.ContextAfter = strings.Join(lines[i+1:end], "\n")
+			}
+		}
+		matches = append(matches, _fm)
 	}
 	return matches
 }

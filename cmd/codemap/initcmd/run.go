@@ -35,6 +35,8 @@ const ToolsAndTipsBlock = `## Available Tools
 | ` + "`get_symbol_importance`" + ` | Symbols ranked by PageRank centrality | Identifying architecturally critical code |
 | ` + "`changed_symbols`" + ` | Symbols changed in the working tree | One line per symbol with ` + "`compact: true`" + ` |
 | ` + "`workspace_changed_symbols`" + ` | Workspace-wide changed symbols | One line per symbol with ` + "`compact: true`" + ` |
+| ` + "`read_response_section`" + ` | Stored sections of an oversized response, by index or keyword | Reading back an oversized-response manifest |
+| ` + "`stats`" + ` | Per-tool calls, errors, response bytes, estimated raw-read bytes, reduction % | Verifying context savings and tuning output formats |
 
 ## Tips
 

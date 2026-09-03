@@ -59,7 +59,7 @@ func resultText(t *testing.T, resp map[string]any) string {
 func TestHandlerPanicReturnsErrorAndServerSurvives(t *testing.T) {
 	s := newTestServer(t)
 	s.handlers = queryHandlers()
-	s.handlers["boom"] = func(*store.Store, []query.Option, []render.Option, map[string]any) (string, bool) {
+	s.handlers["boom"] = func(*store.Store, []query.Option, []render.Option, map[string]any) (string, any, bool) {
 		panic("kaboom")
 	}
 
@@ -85,7 +85,7 @@ func TestHandlerPanicReturnsErrorAndServerSurvives(t *testing.T) {
 func TestPanicInNotificationGetsNoResponse(t *testing.T) {
 	s := newTestServer(t)
 	s.handlers = queryHandlers()
-	s.handlers["boom"] = func(*store.Store, []query.Option, []render.Option, map[string]any) (string, bool) {
+	s.handlers["boom"] = func(*store.Store, []query.Option, []render.Option, map[string]any) (string, any, bool) {
 		panic("kaboom")
 	}
 	out := captureStdout(func() {

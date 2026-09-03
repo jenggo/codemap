@@ -34,10 +34,14 @@ type Server struct {
 	handlers       map[string]toolHandler
 	stalenessCheck func(dbPath, repoPath string) (bool, error)
 	indexFn        func(absPath string) error
-	dbPath         string
-	repoPath       string
-	warnings       []string
-	reindexed      []string
+
+	// Session usage counters; nil-safe, so struct-literal servers record
+	// nothing. Initialized by New and NewLazy.
+	usage     *usageStats
+	dbPath    string
+	repoPath  string
+	warnings  []string
+	reindexed []string
 
 	// Filesystem allowlist roots (explicitly configured; derived otherwise).
 	allowedPaths []string
@@ -75,6 +79,7 @@ func New(s *store.Store) *Server {
 		failedIndexes:      make(map[string]failedIndex),
 		freshnessTTL:       defaultFreshnessTTL,
 		failedIndexBackoff: defaultFailedIndexBackoff,
+		usage:              newUsageStats(),
 	}
 }
 
@@ -86,6 +91,7 @@ func NewLazy(dbPath string) *Server {
 		failedIndexes:      make(map[string]failedIndex),
 		freshnessTTL:       defaultFreshnessTTL,
 		failedIndexBackoff: defaultFailedIndexBackoff,
+		usage:              newUsageStats(),
 	}
 }
 
@@ -442,7 +448,7 @@ func (s *Server) dispatchLineState(line string, st *dispatchState) {
 func (s *Server) handleInitialize(id json.RawMessage) {
 	s.sendResponse(id, map[string]any{
 		"protocolVersion": "2024-11-05",
-		"capabilities":    map[string]any{"tools": map[string]any{}},
+		"capabilities":    map[string]any{keyTools: map[string]any{}},
 		"serverInfo":      map[string]any{keyName: "codemap", "version": "0.1.0"},
 	})
 }
@@ -489,14 +495,29 @@ func (s *Server) handleToolsCall(id json.RawMessage, msg map[string]json.RawMess
 	s.sendResponse(id, res)
 }
 
-type toolHandler func(*store.Store, []query.Option, []render.Option, map[string]any) (string, bool)
+type toolHandler func(*store.Store, []query.Option, []render.Option, map[string]any) (string, any, bool)
 
 func (s *Server) handleTool(name string, args map[string]any) (string, bool) {
+	// record closes over this call's tool name so every return path counts
+	// exactly once, on the rendered payload the call produced.
+	record := func(result any, rendered string, isErr bool) {
+		s.recordUsage(name, result, rendered, isErr)
+	}
 	if name == "index" {
-		return s.handleIndex(args)
+		msg, isErr := s.handleIndex(args)
+		record(nil, msg, isErr)
+		return msg, isErr
 	}
 	if name == "schema" {
-		return handleSchema(), false
+		out := handleSchema()
+		record(nil, out, false)
+		return out, false
+	}
+	if name == "stats" {
+		// The report must stay byte-identical across repeat calls with
+		// identical usage, so stats does not record itself: a growing
+		// self-row would differ between consecutive calls.
+		return renderUsageStats(s.usage), false
 	}
 	if name == "changed_symbols" {
 		dir := "."
@@ -504,31 +525,62 @@ func (s *Server) handleTool(name string, args map[string]any) (string, bool) {
 			dir = v
 		}
 		if _, err := s.allowedTarget(dir); err != nil {
-			return fmt.Sprintf("Error: %v", err), true
+			msg := fmt.Sprintf("Error: %v", err)
+			record(nil, msg, true)
+			return msg, true
 		}
 	}
 	if err := validateToolArgs(name, args); err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		msg := fmt.Sprintf("Error: %v", err)
+		record(nil, msg, true)
+		return msg, true
 	}
 
 	st, err := s.getStore()
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		msg := fmt.Sprintf("Error: %v", err)
+		record(nil, msg, true)
+		return msg, true
 	}
 
 	opts, renderOpts := s.buildOptions(args)
 
 	handler, ok := s.toolHandlers()[name]
 	if !ok {
-		return fmt.Sprintf("Error: unknown tool %s", name), true
+		msg := fmt.Sprintf("Error: unknown tool %s", name)
+		record(nil, msg, true)
+		return msg, true
 	}
-	result, isErr := handler(st, opts, renderOpts, args)
+	result, typed, isErr := handler(st, opts, renderOpts, args)
 	if isErr {
 		if note := notIndexedNote(st, primaryArg(args)); note != "" {
 			result += note
 		}
+		record(nil, result, isErr)
+		return result, isErr
 	}
-	return result, isErr
+	// Usage records the handler's rendered output before the response gate
+	// runs, so response bytes count what the call rendered; a manifest the
+	// gate substitutes is disclosed separately via gated_responses.
+	record(typed, result, false)
+	// Single response gate: oversized payloads are stored and replaced by a
+	// manifest at this one dispatch point, so no handler carries size logic.
+	return s.gateResponse(name, result), false
+}
+
+// recordUsage updates the session usage counters for one completed tool call.
+// Raw cost uses the tool's estimator when the call succeeded and one is
+// registered; everything else falls back to identity (raw = rendered bytes),
+// so unmodeled tools and errors honestly report 0% reduction.
+func (s *Server) recordUsage(tool string, result any, rendered string, isErr bool) {
+	respBytes := int64(len(rendered))
+	rawBytes := respBytes
+	if !isErr {
+		if est, ok := rawEstimators[tool]; ok {
+			rawBytes = est(s.store, result)
+		}
+	}
+	s.usage.record(tool, respBytes, rawBytes, isErr)
 }
 
 func (s *Server) toolHandlers() map[string]toolHandler {
@@ -562,13 +614,13 @@ func queryHandlers() map[string]toolHandler {
 		toolCycles:                  handleCycles,
 		"symbols_in_file":           handleSymbolsInFile,
 		toolBlastRadius:             handleBlastRadius,
-		"get_symbol_body":           handleSymbolBody,
+		toolSymbolBody:              handleSymbolBody,
 		"dependency_layers":         handleDependencyLayers,
 		"dependency_flow":           handleDependencyFlow,
 		"entry_points":              handleEntryPoints,
 		"changed_symbols":           handleChangedSymbols,
 		"search_text":               handleSearchText,
-		"get_context_bundle":        handleContextBundle,
+		toolContextBundle:           handleContextBundle,
 		"get_hotspots":              handleHotspots,
 		"get_symbol_importance":     handleSymbolImportance,
 		"health":                    handleHealth,
@@ -578,6 +630,7 @@ func queryHandlers() map[string]toolHandler {
 		"contract_drift":            handleContractDrift,
 		"runtime_contracts":         handleRuntimeContracts,
 		"suppress_contract":         handleSuppressContract,
+		responseSectionTool:         handleReadResponseSection,
 	}
 }
 
@@ -610,30 +663,30 @@ func (s *Server) buildOptions(args map[string]any) ([]query.Option, []render.Opt
 	return opts, renderOpts
 }
 
-func handleOverview(st *store.Store, opts []query.Option, renderOpts []render.Option, _ map[string]any) (string, bool) {
+func handleOverview(st *store.Store, opts []query.Option, renderOpts []render.Option, _ map[string]any) (string, any, bool) {
 	result, err := query.Overview(st, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
-	return render.RenderOverview(result, renderOpts...), false
+	return render.RenderOverview(result, renderOpts...), result, false
 }
 
-func handleShow(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+func handleShow(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
 	qn := requiredString(args, "qualified_name")
 	if qn == "" {
-		return errQualifiedNameRequired, true
+		return errQualifiedNameRequired, nil, true
 	}
 	result, err := query.Show(st, qn, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
-	return render.RenderShow(result, renderOpts...), false
+	return render.RenderShow(result, renderOpts...), result, false
 }
 
-func handleCallersOf(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+func handleCallersOf(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
 	qn := requiredString(args, "qualified_name")
 	if qn == "" {
-		return errQualifiedNameRequired, true
+		return errQualifiedNameRequired, nil, true
 	}
 	opts = appendEdgeTypeFilter(args, opts)
 	if v, ok := args[keyDepth].(float64); ok && v > 0 {
@@ -641,15 +694,15 @@ func handleCallersOf(st *store.Store, opts []query.Option, renderOpts []render.O
 	}
 	edges, err := query.CallersOf(st, qn, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
-	return render.RenderCallers(edges, renderOpts...), false
+	return render.RenderCallers(edges, renderOpts...), edges, false
 }
 
-func handleCalleesOf(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+func handleCalleesOf(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
 	qn := requiredString(args, "qualified_name")
 	if qn == "" {
-		return errQualifiedNameRequired, true
+		return errQualifiedNameRequired, nil, true
 	}
 	opts = appendEdgeTypeFilter(args, opts)
 	if v, ok := args[keyDepth].(float64); ok && v > 0 {
@@ -657,9 +710,9 @@ func handleCalleesOf(st *store.Store, opts []query.Option, renderOpts []render.O
 	}
 	edges, err := query.CalleesOf(st, qn, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
-	return render.RenderCallees(edges, renderOpts...), false
+	return render.RenderCallees(edges, renderOpts...), edges, false
 }
 
 func healthNotice(st *store.Store) string {
@@ -671,10 +724,10 @@ func healthNotice(st *store.Store) string {
 		h.IndexedAt, h.RepoPath, h.GitHead, h.PackageCount, h.SymbolCount)
 }
 
-func handleSearch(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+func handleSearch(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
 	pattern := requiredString(args, "pattern")
 	if pattern == "" {
-		return errPatternRequired, true
+		return errPatternRequired, nil, true
 	}
 	if v, ok := args[keyKind].(string); ok && v != "" {
 		opts = append(opts, query.WithKind(v))
@@ -687,146 +740,146 @@ func handleSearch(st *store.Store, opts []query.Option, renderOpts []render.Opti
 	}
 	results, err := query.Search(st, pattern, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
 	if len(results) == 0 {
-		return healthNotice(st), false
+		return healthNotice(st), nil, false
 	}
-	return render.RenderSearch(results, renderOpts...), false
+	return render.RenderSearch(results, renderOpts...), results, false
 }
 
-func handlePackage(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+func handlePackage(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
 	pkgPath := requiredString(args, "path")
 	if pkgPath == "" {
-		return "Error: path is required", true
+		return "Error: path is required", nil, true
 	}
 	if b, ok := args["include_unexported"].(bool); ok && b {
 		opts = append(opts, query.WithUnexported())
 	}
 	result, err := query.Package(st, pkgPath, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
-	return render.RenderPackage(result, renderOpts...), false
+	return render.RenderPackage(result, renderOpts...), result, false
 }
 
-func handleMethodsOf(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+func handleMethodsOf(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
 	typeName := requiredString(args, "type_name")
 	if typeName == "" {
-		return "Error: type_name is required", true
+		return "Error: type_name is required", nil, true
 	}
 	methods, err := query.MethodsOf(st, typeName, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
 	if len(methods) == 0 {
-		return healthNotice(st), false
+		return healthNotice(st), nil, false
 	}
-	return render.RenderMethodsOf(methods, renderOpts...), false
+	return render.RenderMethodsOf(methods, renderOpts...), methods, false
 }
 
-func handleImportersOf(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+func handleImportersOf(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
 	pkgPath := requiredString(args, "package_path")
 	if pkgPath == "" {
-		return errPackagePathRequired, true
+		return errPackagePathRequired, nil, true
 	}
 	edges, err := query.ImportersOf(st, pkgPath, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
-	return render.RenderEdges(edges, renderOpts...), false
+	return render.RenderEdges(edges, renderOpts...), edges, false
 }
 
-func handleImportsOf(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+func handleImportsOf(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
 	pkgPath := requiredString(args, "package_path")
 	if pkgPath == "" {
-		return errPackagePathRequired, true
+		return errPackagePathRequired, nil, true
 	}
 	edges, err := query.ImportsOf(st, pkgPath, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
-	return render.RenderEdges(edges, renderOpts...), false
+	return render.RenderEdges(edges, renderOpts...), edges, false
 }
 
-func handleEdgesByType(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+func handleEdgesByType(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
 	edgeType := requiredString(args, "edge_type")
 	if edgeType == "" {
-		return errEdgeTypeRequired, true
+		return errEdgeTypeRequired, nil, true
 	}
 	edges, err := query.EdgesByType(st, edgeType, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
-	return render.RenderEdges(edges, renderOpts...), false
+	return render.RenderEdges(edges, renderOpts...), edges, false
 }
 
-func handleAllEdges(st *store.Store, opts []query.Option, renderOpts []render.Option, _ map[string]any) (string, bool) {
+func handleAllEdges(st *store.Store, opts []query.Option, renderOpts []render.Option, _ map[string]any) (string, any, bool) {
 	edges, err := query.AllEdges(st, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
-	return render.RenderEdges(edges, renderOpts...), false
+	return render.RenderEdges(edges, renderOpts...), edges, false
 }
 
-func handleListPackages(st *store.Store, opts []query.Option, renderOpts []render.Option, _ map[string]any) (string, bool) {
+func handleListPackages(st *store.Store, opts []query.Option, renderOpts []render.Option, _ map[string]any) (string, any, bool) {
 	pkgs, err := query.ListPackages(st, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
-	return render.RenderListPackages(pkgs, renderOpts...), false
+	return render.RenderListPackages(pkgs, renderOpts...), pkgs, false
 }
 
-func handleTypeUsage(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+func handleTypeUsage(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
 	typeName := requiredString(args, "type_name")
 	if typeName == "" {
-		return errTypeNameRequired, true
+		return errTypeNameRequired, nil, true
 	}
 	results, err := query.TypeUsage(st, typeName, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
 	if len(results) == 0 {
-		return healthNotice(st), false
+		return healthNotice(st), nil, false
 	}
-	return render.RenderSearch(results, renderOpts...), false
+	return render.RenderSearch(results, renderOpts...), results, false
 }
 
-func handleTransitiveImports(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+func handleTransitiveImports(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
 	pkgPath := requiredString(args, "package_path")
 	if pkgPath == "" {
-		return errPackagePathRequired, true
+		return errPackagePathRequired, nil, true
 	}
 	edges, err := query.TransitiveImports(st, pkgPath, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
-	return render.RenderEdges(edges, renderOpts...), false
+	return render.RenderEdges(edges, renderOpts...), edges, false
 }
 
-func handleSearchPrefix(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+func handleSearchPrefix(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
 	prefix := requiredString(args, "prefix")
 	if prefix == "" {
-		return errPrefixRequired, true
+		return errPrefixRequired, nil, true
 	}
 	results, err := query.SearchByPrefix(st, prefix, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
 	if len(results) == 0 {
-		return healthNotice(st), false
+		return healthNotice(st), nil, false
 	}
-	return render.RenderSearch(results, renderOpts...), false
+	return render.RenderSearch(results, renderOpts...), results, false
 }
 
-func handleFindPath(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+func handleFindPath(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
 	from := requiredString(args, "from")
 	if from == "" {
-		return "Error: from is required", true
+		return "Error: from is required", nil, true
 	}
 	to := requiredString(args, "to")
 	if to == "" {
-		return "Error: to is required", true
+		return "Error: to is required", nil, true
 	}
 	maxDepth := 10
 	if v, ok := args["max_depth"].(float64); ok && v > 0 {
@@ -837,92 +890,92 @@ func handleFindPath(st *store.Store, opts []query.Option, renderOpts []render.Op
 		// Absence is a result, not a failure: report it without the isError
 		// flag so agents do not mistake "no path exists" for a query error.
 		if errors.Is(err, query.ErrNoPath) {
-			return fmt.Sprintf("No path found from %s to %s", from, to), false
+			return fmt.Sprintf("No path found from %s to %s", from, to), nil, false
 		}
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
 	data, err := json.Marshal(path)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
-	return string(data), false
+	return string(data), path, false
 }
 
-func handleMethodSearch(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+func handleMethodSearch(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
 	methodName := requiredString(args, "method_name")
 	if methodName == "" {
-		return "Error: method_name is required", true
+		return "Error: method_name is required", nil, true
 	}
 	results, err := query.MethodSearch(st, methodName, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
 	if len(results) == 0 {
-		return healthNotice(st), false
+		return healthNotice(st), nil, false
 	}
-	return render.RenderSearch(results, renderOpts...), false
+	return render.RenderSearch(results, renderOpts...), results, false
 }
 
-func handleInterfaceImpls(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+func handleInterfaceImpls(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
 	interfaceName := requiredString(args, "interface_name")
 	if interfaceName == "" {
-		return "Error: interface_name is required", true
+		return "Error: interface_name is required", nil, true
 	}
 	results, err := query.InterfaceImplementations(st, interfaceName, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
 	data, err := json.Marshal(results)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
-	return string(data), false
+	return string(data), results, false
 }
 
-func handleUnused(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+func handleUnused(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
 	results, err := query.UnusedSymbols(st, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
 	data, err := json.Marshal(results)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
-	return string(data), false
+	return string(data), results, false
 }
 
-func handleCycles(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+func handleCycles(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
 	edgeType := requiredString(args, "edge_type")
 	if edgeType == "" {
-		return errEdgeTypeRequired, true
+		return errEdgeTypeRequired, nil, true
 	}
 	cycles, err := query.DetectCycles(st, edgeType)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
 	data, err := json.Marshal(cycles)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
-	return string(data), false
+	return string(data), cycles, false
 }
 
-func handleSymbolsInFile(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+func handleSymbolsInFile(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
 	filePath := requiredString(args, "file_path")
 	if filePath == "" {
-		return "Error: file_path is required", true
+		return "Error: file_path is required", nil, true
 	}
 	results, err := query.SymbolsInFile(st, filePath, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
-	return render.RenderSearch(results, renderOpts...), false
+	return render.RenderSearch(results, renderOpts...), results, false
 }
 
-func handleBlastRadius(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+func handleBlastRadius(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
 	qn := requiredString(args, "qualified_name")
 	if qn == "" {
-		return errQualifiedNameRequired, true
+		return errQualifiedNameRequired, nil, true
 	}
 	depth := 3
 	if v, ok := args[keyDepth].(float64); ok && v > 0 {
@@ -930,19 +983,19 @@ func handleBlastRadius(st *store.Store, opts []query.Option, renderOpts []render
 	}
 	result, err := query.BlastRadiusWithContracts(st, qn, depth, opts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
 	data, err := json.Marshal(result)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
-	return string(data), false
+	return string(data), result, false
 }
 
-func handleSymbolBody(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+func handleSymbolBody(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
 	qn := requiredString(args, "qualified_name")
 	if qn == "" {
-		return errQualifiedNameRequired, true
+		return errQualifiedNameRequired, nil, true
 	}
 	contextLines := 0
 	if v, ok := args[keyContextLines].(float64); ok && v > 0 {
@@ -954,12 +1007,12 @@ func handleSymbolBody(st *store.Store, _ []query.Option, renderOpts []render.Opt
 	}
 	result, err := query.GetSymbolBody(st, qn, contextLines, includeDoc)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
-	return render.RenderSymbolBody(result, renderOpts...), false
+	return render.RenderSymbolBody(result, renderOpts...), result, false
 }
 
-func handleDependencyLayers(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+func handleDependencyLayers(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
 	topHubs := 5
 	if v, ok := args["top_hubs"].(float64); ok && v > 0 {
 		topHubs = int(v)
@@ -970,24 +1023,24 @@ func handleDependencyLayers(st *store.Store, _ []query.Option, renderOpts []rend
 	}
 	result, err := query.DependencyLayers(st, includeTests, topHubs)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
-	return render.RenderDependencyLayers(result, renderOpts...), false
+	return render.RenderDependencyLayers(result, renderOpts...), result, false
 }
 
-func handleDependencyFlow(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+func handleDependencyFlow(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
 	pkgPath := requiredString(args, "package_path")
 	if pkgPath == "" {
-		return errPackagePathRequired, true
+		return errPackagePathRequired, nil, true
 	}
 	result, err := query.DependencyFlow(st, pkgPath)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
-	return render.RenderDependencyFlow(result, renderOpts...), false
+	return render.RenderDependencyFlow(result, renderOpts...), result, false
 }
 
-func handleEntryPoints(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+func handleEntryPoints(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
 	var heuristics []string
 	if v, ok := args["heuristics"].([]any); ok {
 		for _, h := range v {
@@ -1002,12 +1055,12 @@ func handleEntryPoints(st *store.Store, _ []query.Option, renderOpts []render.Op
 	}
 	entries, err := query.EntryPoints(st, heuristics, includeTests)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
-	return render.RenderEntryPoints(entries, renderOpts...), false
+	return render.RenderEntryPoints(entries, renderOpts...), entries, false
 }
 
-func handleChangedSymbols(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+func handleChangedSymbols(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
 	ref := ""
 	if v, ok := args["ref"].(string); ok && v != "" {
 		ref = v
@@ -1033,12 +1086,12 @@ func handleChangedSymbols(st *store.Store, _ []query.Option, renderOpts []render
 	}
 	result, err := query.ChangedSymbols(st, repoDir, ref, withBlast, includeBodies, includeTests)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
-	return render.RenderChangedSymbols(result, renderOpts...), false
+	return render.RenderChangedSymbols(result, renderOpts...), result, false
 }
 
-func handleWorkspaceChangedSymbols(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) (string, bool) {
+func handleWorkspaceChangedSymbols(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
 	withBlast := true
 	if b, ok := args["with_blast_radius"].(bool); ok {
 		withBlast = b
@@ -1056,24 +1109,24 @@ func handleWorkspaceChangedSymbols(st *store.Store, _ []query.Option, renderOpts
 	}
 	result, err := query.WorkspaceChangedSymbols(st, withBlast, includeBodies, includeTests)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
-	return render.RenderChangedSymbols(result, renderOpts...), false
+	return render.RenderChangedSymbols(result, renderOpts...), result, false
 }
 
-func handleHealth(st *store.Store, _ []query.Option, _ []render.Option, _ map[string]any) (string, bool) {
+func handleHealth(st *store.Store, _ []query.Option, _ []render.Option, _ map[string]any) (string, any, bool) {
 	repos, err := st.ListRepos()
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
 	if len(repos) == 0 {
 		h, herr := st.Health()
 		if herr != nil {
-			return fmt.Sprintf("Error: health check failed: %v", herr), true
+			return fmt.Sprintf("Error: health check failed: %v", herr), nil, true
 		}
 		out := fmt.Sprintf("indexed_at=%s repo=%s head=%s %d packages, %d symbols",
 			h.IndexedAt, h.RepoPath, h.GitHead, h.PackageCount, h.SymbolCount)
-		return out, false
+		return out, nil, false
 	}
 	var b strings.Builder
 	b.WriteString("repos:\n")
@@ -1091,7 +1144,7 @@ func handleHealth(st *store.Store, _ []query.Option, _ []render.Option, _ map[st
 		}
 		b.WriteString("\n")
 	}
-	return b.String(), false
+	return b.String(), nil, false
 }
 
 // notIndexedNote reports when a queried name belongs to a workspace member
@@ -1329,18 +1382,23 @@ func evalRoot(p string) string {
 
 // --- input validation ---
 
-const edgeTypeImports = "imports"
+const (
+	edgeTypeCalls   = "calls"
+	edgeTypeImports = "imports"
+)
 
 const (
-	toolBlastRadius = "blast_radius"
-	toolCallersOf   = "callers_of"
-	toolCalleesOf   = "callees_of"
-	toolContracts   = "contracts"
-	toolCycles      = "cycles"
+	toolBlastRadius   = "blast_radius"
+	toolCallersOf     = "callers_of"
+	toolCalleesOf     = "callees_of"
+	toolContextBundle = "get_context_bundle"
+	toolContracts     = "contracts"
+	toolCycles        = "cycles"
+	toolSymbolBody    = "get_symbol_body"
 )
 
 var (
-	validEdgeTypes    = []string{"calls", "references", "satisfies", "embeds", edgeTypeImports}
+	validEdgeTypes    = []string{edgeTypeCalls, "references", "satisfies", "embeds", edgeTypeImports}
 	validKinds        = []string{"function", "method", "type", "interface", "alias", "const", "var"}
 	validSeverities   = []string{"compatible", "breaking", "unknown"}
 	validDirections   = []string{"producer", "consumer", "shared"}
@@ -1379,8 +1437,9 @@ var toolIntArgs = map[string][]intArgSpec{
 	"get_symbol_importance": {{key: keyTopN, min: 1, max: 500}, {key: "scope", min: 0, max: 1_000_000}},
 	"dependency_layers":     {{key: "top_hubs", min: 1, max: 500}},
 	"search_text":           {{key: keyContextLines, min: 0, max: 500}},
-	"get_symbol_body":       {{key: keyContextLines, min: 0, max: 500}},
-	"get_context_bundle":    {{key: "token_budget", min: 1, max: 1_000_000}},
+	toolSymbolBody:          {{key: keyContextLines, min: 0, max: 500}},
+	toolContextBundle:       {{key: "token_budget", min: 1, max: 1_000_000}},
+	responseSectionTool:     {{key: "section", min: 0, max: 1_000_000}, {key: "limit", min: 1, max: 100}},
 }
 
 var toolFloatArgs = map[string][]floatArgSpec{
@@ -1554,6 +1613,7 @@ const (
 	keyDescription   = "description"
 	keyBody          = "body"
 	keyToolPackage   = "package"
+	keyTools         = "tools"
 	keyEvidence      = "evidence"
 	keyIndexedAt     = "indexed_at"
 	keyTopN          = "top_n"
@@ -1625,7 +1685,7 @@ var returnTypeSchemas = map[string]any{
 		"import_count":     "int — number of imports",
 	},
 	"EdgeTypes": map[string]any{
-		"calls":         "A calls B — function/method A invokes function/method B",
+		edgeTypeCalls:   "A calls B — function/method A invokes function/method B",
 		"references":    "A references B — symbol A uses symbol B in a non-call context (field access, variable read, type usage)",
 		"satisfies":     "A satisfies B — type A implements interface B (found via callers_of on interfaces)",
 		"embeds":        "A embeds B — struct A embeds struct/interface B",
@@ -1798,14 +1858,14 @@ func (s *Server) sendError(id json.RawMessage, code int, message string) {
 
 func (s *Server) handleToolsList(id json.RawMessage) {
 	s.sendResponse(id, map[string]any{
-		"tools": buildToolsList(),
+		keyTools: buildToolsList(),
 	})
 }
 
-func handleSearchText(st *store.Store, qOpts []query.Option, rOpts []render.Option, args map[string]any) (string, bool) {
+func handleSearchText(st *store.Store, qOpts []query.Option, rOpts []render.Option, args map[string]any) (string, any, bool) {
 	pattern := requiredString(args, "pattern")
 	if strings.TrimSpace(pattern) == "" {
-		return "Error: pattern is required", true
+		return "Error: pattern is required", nil, true
 	}
 	filePattern := ""
 	if v, ok := args["file_pattern"].(string); ok {
@@ -1819,17 +1879,32 @@ func handleSearchText(st *store.Store, qOpts []query.Option, rOpts []render.Opti
 	if v, ok := args[keyContextLines].(float64); ok {
 		contextLines = int(v)
 	}
-	matches, err := query.SearchText(st, pattern, filePattern, isRegex, contextLines)
+	matches, corrections, err := query.SearchTextWithCorrections(st, pattern, filePattern, isRegex, contextLines)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
+	}
+	correctionNote := ""
+	if len(corrections) > 0 {
+		parts := make([]string, len(corrections))
+		for i, c := range corrections {
+			parts[i] = fmt.Sprintf("%s -> %s", c.Original, c.Corrected)
+		}
+		correctionNote = "corrected_terms: " + strings.Join(parts, ", ")
 	}
 	if len(matches) == 0 {
-		return healthNotice(st), false
+		if correctionNote != "" {
+			return correctionNote, nil, false
+		}
+		return healthNotice(st), nil, false
 	}
-	return render.RenderTextMatches(matches, rOpts...), false
+	out := render.RenderTextMatches(matches, rOpts...)
+	if correctionNote != "" {
+		return correctionNote + "\n" + out, matches, false
+	}
+	return out, matches, false
 }
 
-func handleContextBundle(st *store.Store, qOpts []query.Option, rOpts []render.Option, args map[string]any) (string, bool) {
+func handleContextBundle(st *store.Store, qOpts []query.Option, rOpts []render.Option, args map[string]any) (string, any, bool) {
 	qn := requiredString(args, "qualified_name")
 	tokenBudget := 8000
 	if v, ok := args["token_budget"].(float64); ok {
@@ -1837,12 +1912,12 @@ func handleContextBundle(st *store.Store, qOpts []query.Option, rOpts []render.O
 	}
 	bundle, err := query.ContextBundle(st, qn, tokenBudget)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
-	return render.RenderBundle(bundle, rOpts...), false
+	return render.RenderBundle(bundle, rOpts...), bundle, false
 }
 
-func handleHotspots(st *store.Store, qOpts []query.Option, rOpts []render.Option, args map[string]any) (string, bool) {
+func handleHotspots(st *store.Store, qOpts []query.Option, rOpts []render.Option, args map[string]any) (string, any, bool) {
 	topN := 10
 	if v, ok := args[keyTopN].(float64); ok {
 		topN = int(v)
@@ -1857,12 +1932,12 @@ func handleHotspots(st *store.Store, qOpts []query.Option, rOpts []render.Option
 	}
 	hotspots, err := query.Hotspots(st, topN, minComplexity, minChurn)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
-	return render.RenderHotspots(hotspots, rOpts...), false
+	return render.RenderHotspots(hotspots, rOpts...), hotspots, false
 }
 
-func handleSymbolImportance(st *store.Store, qOpts []query.Option, rOpts []render.Option, args map[string]any) (string, bool) {
+func handleSymbolImportance(st *store.Store, qOpts []query.Option, rOpts []render.Option, args map[string]any) (string, any, bool) {
 	topN := 10
 	if v, ok := args[keyTopN].(float64); ok {
 		topN = int(v)
@@ -1873,9 +1948,9 @@ func handleSymbolImportance(st *store.Store, qOpts []query.Option, rOpts []rende
 	}
 	entries, err := query.SymbolImportance(st, topN, scope, qOpts...)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err), true
+		return fmt.Sprintf("Error: %v", err), nil, true
 	}
-	return render.RenderImportance(entries, rOpts...), false
+	return render.RenderImportance(entries, rOpts...), entries, false
 }
 
 func buildToolsList() []map[string]any {
@@ -1884,6 +1959,7 @@ func buildToolsList() []map[string]any {
 	tools = append(tools, queryTools()...)
 	tools = append(tools, sourceTools()...)
 	tools = append(tools, shapeTools()...)
+	tools = append(tools, statsTools()...)
 	return tools
 }
 
@@ -1939,6 +2015,7 @@ func queryTools() []map[string]any {
 	tools = append(tools, graphTools()...)
 	tools = append(tools, advancedTools()...)
 	tools = append(tools, contractTools()...)
+	tools = append(tools, overflowTools()...)
 	return tools
 }
 
@@ -2012,7 +2089,7 @@ func graphTools() []map[string]any {
 			"List every relationship edge in the indexed codebase. Returns from/to symbol references, edge types, and source locations. Intended for bulk analysis; prefer callers_of or callees_of for targeted queries.",
 			map[string]any{}),
 		toolDef("search_text",
-			"Search file contents using FTS5 full-text search or regex. Returns matching file paths, line numbers, and context lines. Use for finding text patterns in source code.",
+			"Search file contents using a fused multi-strategy match: a ranked FTS5 pass merged with a case-insensitive substring scan (Reciprocal Rank Fusion), proximity-reranked so terms occurring close together rank first, with Levenshtein typo correction noted via corrected_terms. Regex mode bypasses fusion. Returns matching file paths, line numbers, and context lines. Use for finding text patterns in source code.",
 			map[string]any{
 				keyPattern:      stringProp("Search pattern (FTS5 query or regex)"),
 				"file_pattern":  stringProp("File path filter pattern (substring match, optional)"),
@@ -2020,7 +2097,7 @@ func graphTools() []map[string]any {
 				keyContextLines: intProp("Number of context lines around each match (default 0)"),
 			},
 			"pattern"),
-		toolDef("get_context_bundle",
+		toolDef(toolContextBundle,
 			"Bundle a symbol with its body, callees, callers, and same-file symbols into a single context window. Estimates token count and trims to budget. Use for LLM context preparation.",
 			map[string]any{
 				keyQualifiedName: stringProp("Fully qualified symbol name"),
@@ -2179,7 +2256,7 @@ func intProp(desc string) map[string]any {
 
 func sourceTools() []map[string]any {
 	return []map[string]any{
-		toolDef("get_symbol_body",
+		toolDef(toolSymbolBody,
 			"Get the source text of a single Go symbol (function, method, type, const, or var) by qualified name. Re-parses the file at query time to extract the exact declaration span, with optional doc comment and context-line padding. Replaces read(whole_file) for 'show me this one symbol' lookups with ~20x token reduction.",
 			map[string]any{
 				keyQualifiedName: stringProp("Fully qualified symbol name (e.g., cli/codemap/extract.Run)"),

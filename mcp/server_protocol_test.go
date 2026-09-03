@@ -44,7 +44,7 @@ func newTestServer(t *testing.T) *Server {
 	if err := st.SetRepoMeta(abs, "", len(resolveResult.Packages), len(resolveResult.Symbols)); err != nil {
 		t.Fatalf("set repo meta: %v", err)
 	}
-	return &Server{store: st, dbPath: dbPath, repoPath: abs}
+	return &Server{store: st, dbPath: dbPath, repoPath: abs, usage: newUsageStats()}
 }
 
 // captureStdout runs fn and returns everything written to os.Stdout.
