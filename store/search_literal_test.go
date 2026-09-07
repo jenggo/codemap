@@ -254,6 +254,107 @@ func TestSearchFileContentFTSSemantics(t *testing.T) {
 	}
 }
 
+// seedAlternationModule indexes files whose identifiers sit on separate
+// sides of an alternation so `A|B`, `A B|C`, and the empty-segment rules can
+// be pinned end to end through SearchFileContent.
+func seedAlternationModule(t *testing.T) *Store {
+	t.Helper()
+
+	dir := writeModule(t, map[string]string{
+		"alpha.go": "package alt\n\n// alpha one\nfunc Alpha() {}\n",
+		"beta.go":  "package alt\n\n// beta two\nfunc Beta() {}\n",
+		"both.go":  "package alt\n\n// alpha beta together\nfunc Both() {}\n",
+		"ab.go":    "package alt\n\n// ab short\nfunc AB() {}\n",
+		"x.go":     "package alt\n\n// xray\nfunc X() {}\n",
+	})
+	res, files := parseModule(t, dir)
+	s, err := Create(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	if err := s.Write(res, files, nil); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	return s
+}
+
+// TestSearchFileContentFTSAlternation pins literal-mode alternation end to
+// end: `A|B` finds either side, `A B|C` means (A AND B) OR C, empty
+// segments are inert, and every returned line is consistent with what the
+// pattern claims.
+func TestSearchFileContentFTSAlternation(t *testing.T) {
+	s := seedAlternationModule(t)
+
+	t.Run("either side matches", func(t *testing.T) {
+		matches, err := s.SearchFileContent("alpha|beta", "", false, 0)
+		if err != nil {
+			t.Fatalf("alternation search errored: %v", err)
+		}
+		for _, want := range []string{"alpha.go", "beta.go", "both.go"} {
+			if !hasFile(matches, want) {
+				t.Fatalf("alternation missed %s: %+v", want, matches)
+			}
+		}
+		for _, m := range matches {
+			if !strings.Contains(m.Line, "alpha") && !strings.Contains(m.Line, "beta") {
+				t.Fatalf("returned line matches neither alternative: %+v", m)
+			}
+		}
+	})
+
+	t.Run("mixed AND within OR", func(t *testing.T) {
+		matches, err := s.SearchFileContent("alpha beta|gamma", "", false, 0)
+		if err != nil {
+			t.Fatalf("mixed alternation errored: %v", err)
+		}
+		if !hasFile(matches, "both.go") {
+			t.Fatalf("(alpha AND beta) alternative missed both.go: %+v", matches)
+		}
+		for _, m := range matches {
+			if strings.Contains(m.FilePath, "alpha.go") || strings.Contains(m.FilePath, "beta.go") {
+				t.Fatalf("single-side file over-matched the AND alternative: %+v", m)
+			}
+		}
+	})
+
+	t.Run("empty segments are inert", func(t *testing.T) {
+		matches, err := s.SearchFileContent("alpha||beta", "", false, 0)
+		if err != nil {
+			t.Fatalf("empty-segment search errored: %v", err)
+		}
+		if !hasFile(matches, "alpha.go") || !hasFile(matches, "beta.go") {
+			t.Fatalf("empty segment broke alternation: %+v", matches)
+		}
+
+		pipeOnly, err := s.SearchFileContent("|", "", false, 0)
+		if err != nil {
+			t.Fatalf("pipe-only search errored: %v", err)
+		}
+		if len(pipeOnly) != 0 {
+			t.Fatalf("pipe-only pattern should match nothing: %+v", pipeOnly)
+		}
+
+		punct, err := s.SearchFileContent("-|-", "", false, 0)
+		if err != nil {
+			t.Fatalf("punctuation-only search errored: %v", err)
+		}
+		if len(punct) != 0 {
+			t.Fatalf("punctuation-only pattern should match nothing: %+v", punct)
+		}
+	})
+
+	t.Run("short-token alternation served by full scan", func(t *testing.T) {
+		matches, err := s.SearchFileContent("ab|x", "", false, 0)
+		if err != nil {
+			t.Fatalf("short-token alternation errored: %v", err)
+		}
+		if !hasFile(matches, "ab.go") {
+			t.Fatalf("short-token alternative missed ab.go: %+v", matches)
+		}
+	})
+}
+
 func TestSearchFileContentRegexErrorsSurface(t *testing.T) {
 	s := seedSearchModule(t)
 
@@ -332,11 +433,17 @@ func TestSanitizeFTSQuery(t *testing.T) {
 		{"simple", `"simple"`},
 		{"user-service", `"user-service"`},
 		{"pkg:F", `"pkg:F"`},
-		{`say "hi"`, `"say" """hi"""`},
-		{"alpha beta", `"alpha" "beta"`},
+		{`say "hi"`, `("say" """hi""")`},
+		{"alpha beta", `("alpha" "beta")`},
 		{"-", ""},
 		{"-deprecated", `"-deprecated"`},
-		{"a - b", `"a" "b"`},
+		{"a - b", `("a" "b")`},
+		{"alpha|beta", `"alpha" OR "beta"`},
+		{"alpha beta|gamma", `("alpha" "beta") OR "gamma"`},
+		{"alpha||beta", `"alpha" OR "beta"`},
+		{"|", ""},
+		{"-|-", ""},
+		{" alpha | beta ", `"alpha" OR "beta"`},
 	}
 	for _, tc := range cases {
 		if got := sanitizeFTSQuery(tc.in); got != tc.want {

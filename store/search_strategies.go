@@ -19,9 +19,9 @@ import (
 // trigram tokenizer cannot serve (any alphanumeric run shorter than three
 // characters) fall back to the direct substring full scan, matching the
 // dispatch inside SearchFileContent. Rows are ordered by bm25 relevance when
-// FTS served the match and by path, rowid otherwise; the raw pattern must
-// still occur verbatim on a line for that line to be returned. The
-// flattened match list is capped at limit entries (limit <= 0 means
+// FTS served the match and by path, rowid otherwise; an alternative of the
+// pattern must still occur verbatim on a line for that line to be returned.
+// The flattened match list is capped at limit entries (limit <= 0 means
 // uncapped) and each match carries contextLines of surrounding text.
 func (s *Store) FileMatchesFTS(pattern, filePattern string, limit, contextLines int) ([]FileMatch, error) {
 	sanitized := sanitizeFTSQuery(pattern)
@@ -30,22 +30,7 @@ func (s *Store) FileMatchesFTS(pattern, filePattern string, limit, contextLines 
 	}
 	fullScan := ftsNeedsFullScan(pattern)
 
-	var query string
-	var args []any
-	if fullScan {
-		// The trigram tokenizer produces matches only for terms of at
-		// least three characters; a shorter term silently matches nothing
-		// in MATCH. Scan the files table directly so short patterns keep
-		// returning the same verbatim matches they did under unicode61.
-		query = `SELECT f.path, f.content FROM files f WHERE instr(f.content, ?) > 0`
-		args = []any{pattern}
-	} else {
-		// The FTS MATCH is a whole-content candidate prefilter; the raw pattern
-		// must still occur verbatim in the content so a row selected here always
-		// yields at least one line from the per-line extractMatches walk.
-		query = `SELECT f.path, f.content FROM file_content_fts fts JOIN files f ON f.rowid = fts.rowid WHERE file_content_fts MATCH ? AND instr(f.content, ?) > 0`
-		args = []any{sanitized, pattern}
-	}
+	query, args := literalContentQuery(pattern, sanitized, fullScan)
 
 	if filePattern != "" {
 		query += " AND " + likeMatch("f.path")
@@ -59,17 +44,55 @@ func (s *Store) FileMatchesFTS(pattern, filePattern string, limit, contextLines 
 	return s.fileMatchesQuery(query, args, pattern, limit, contextLines)
 }
 
+// literalContentQuery builds the candidate query and bindings shared by the
+// literal paths of FileMatchesFTS and SearchFileContent: the FTS5 MATCH
+// expression (or a short-token full scan when the trigram tokenizer cannot
+// serve the pattern) gated by a per-alternative verbatim instr OR. The
+// per-alternative prefilter preserves the line-consistency invariant — a row
+// kept here always contains one alternative verbatim, so the per-line
+// extractMatches walk yields at least one visible match.
+func literalContentQuery(pattern, sanitized string, fullScan bool) (string, []any) {
+	cond, args := alternationInstrCond("f.content", SplitAlternatives(pattern))
+	if fullScan {
+		// The trigram tokenizer produces matches only for terms of at
+		// least three characters; a shorter term silently matches nothing
+		// in MATCH. Scan the files table directly so short patterns keep
+		// returning the same verbatim matches they did under unicode61.
+		return `SELECT f.path, f.content FROM files f WHERE ` + cond, args
+	}
+	// The FTS MATCH is a whole-content candidate prefilter; the verbatim
+	// instr OR above ensures a row selected here always yields at least one
+	// line from the per-line extractMatches walk.
+	query := `SELECT f.path, f.content FROM file_content_fts fts JOIN files f ON f.rowid = fts.rowid WHERE file_content_fts MATCH ? AND ` + cond
+	return query, append([]any{sanitized}, args...)
+}
+
+// alternationInstrCond builds a single SQL condition that keeps a row when
+// any alternative occurs verbatim in the column: `(instr(col, ?) > 0 OR ...)`
+// with one binding per alternative.
+func alternationInstrCond(column string, alternatives []string) (string, []any) {
+	conds := make([]string, len(alternatives))
+	args := make([]any, len(alternatives))
+	for i, alt := range alternatives {
+		conds[i] = "instr(" + column + ", ?) > 0"
+		args[i] = alt
+	}
+	return "(" + strings.Join(conds, " OR ") + ")", args
+}
+
 // FileMatchesSubstring returns candidates by scanning indexed file contents
-// case-insensitively: a file matches when every word-bearing term occurs
-// somewhere in its content, and every line containing at least one term
-// becomes a candidate, so terms scattered across lines are still recalled
-// even when no single line holds the whole pattern. Punctuation-only terms
-// are ignored. Files are ranked by match count descending (ties keep path
-// order), lines within a file in ascending order; the flattened list is
-// capped at limit entries (limit <= 0 means uncapped).
-func (s *Store) FileMatchesSubstring(terms []string, filePattern string, limit, contextLines int) ([]FileMatch, error) {
-	terms = substringTerms(terms)
-	if len(terms) == 0 {
+// case-insensitively: alternatives is a list of term lists, and a file
+// matches when every term of at least one alternative occurs somewhere in
+// its content. Every line containing at least one term of any alternative
+// becomes a candidate line, so terms scattered across lines are still
+// recalled even when no single line holds a whole alternative.
+// Punctuation-only terms and alternatives left without any word-bearing
+// term are ignored. Files are ranked by match count descending (ties keep
+// path order), lines within a file in ascending order; the flattened list
+// is capped at limit entries (limit <= 0 means uncapped).
+func (s *Store) FileMatchesSubstring(alternatives [][]string, filePattern string, limit, contextLines int) ([]FileMatch, error) {
+	alternatives = substringAlternatives(alternatives)
+	if len(alternatives) == 0 {
 		return nil, nil
 	}
 
@@ -96,10 +119,10 @@ func (s *Store) FileMatchesSubstring(terms []string, filePattern string, limit, 
 		if err := rows.Scan(&filePath, &content); err != nil {
 			return nil, err
 		}
-		if !containsAllTerms(content, terms) {
+		if !matchesAnyAlternative(content, alternatives) {
 			continue
 		}
-		ms := extractMatchesFunc(filePath, content, substringLineMatcher(terms), contextLines)
+		ms := extractMatchesFunc(filePath, content, substringLineMatcher(alternatives), contextLines)
 		if len(ms) > 0 {
 			files = append(files, fileMatches{matches: ms})
 		}
@@ -180,6 +203,24 @@ func (s *Store) fileMatchesQuery(query string, args []any, pattern string, limit
 	return matches, rows.Err()
 }
 
+// SplitAlternatives splits a literal search pattern on top-level `|`
+// into alternatives: each segment is whitespace-trimmed, and empty or
+// punctuation-only segments are dropped, so `A||B` behaves as `A|B` and a
+// punctuation-only pattern yields no alternatives. Within an alternative,
+// whitespace-separated terms keep their AND semantics; alternatives are OR.
+// No other regex grammar is parsed — a plain split is the whole rule.
+func SplitAlternatives(pattern string) []string {
+	out := make([]string, 0, 2)
+	for alt := range strings.SplitSeq(pattern, "|") {
+		alt = strings.TrimSpace(alt)
+		if alt == "" || isPunctuationOnly(alt) {
+			continue
+		}
+		out = append(out, alt)
+	}
+	return out
+}
+
 // substringTerms lowercases and filters the term list: empty and
 // punctuation-only terms (no letter or digit) are dropped, mirroring how
 // sanitizeFTSQuery treats such tokens.
@@ -195,6 +236,32 @@ func substringTerms(terms []string) []string {
 	return out
 }
 
+// substringAlternatives normalizes a list of alternatives: each term list is
+// lowercased and filtered via substringTerms, and alternatives left without
+// any word-bearing term are dropped.
+func substringAlternatives(alternatives [][]string) [][]string {
+	out := make([][]string, 0, len(alternatives))
+	for _, terms := range alternatives {
+		terms = substringTerms(terms)
+		if len(terms) == 0 {
+			continue
+		}
+		out = append(out, terms)
+	}
+	return out
+}
+
+// matchesAnyAlternative reports whether every term of at least one
+// alternative occurs somewhere in the case-folded content.
+func matchesAnyAlternative(content string, alternatives [][]string) bool {
+	for _, terms := range alternatives {
+		if containsAllTerms(content, terms) {
+			return true
+		}
+	}
+	return false
+}
+
 // containsAllTerms reports whether every term occurs somewhere in the
 // case-folded content.
 func containsAllTerms(content string, loweredTerms []string) bool {
@@ -208,13 +275,15 @@ func containsAllTerms(content string, loweredTerms []string) bool {
 }
 
 // substringLineMatcher returns a per-line predicate: the line matches when
-// it contains any term, case-insensitively.
-func substringLineMatcher(loweredTerms []string) func(string) bool {
+// it contains any term of any alternative, case-insensitively.
+func substringLineMatcher(alternatives [][]string) func(string) bool {
 	return func(line string) bool {
 		lower := strings.ToLower(line)
-		for _, t := range loweredTerms {
-			if strings.Contains(lower, t) {
-				return true
+		for _, terms := range alternatives {
+			for _, t := range terms {
+				if strings.Contains(lower, t) {
+					return true
+				}
 			}
 		}
 		return false

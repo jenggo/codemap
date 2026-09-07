@@ -92,7 +92,7 @@ func TestSearchTextMisspelledQueryIsCorrected(t *testing.T) {
 		"other.go": "package fused\n\n// UnrelatedHelper does something else\nfunc UnrelatedHelper() {}\n",
 	})
 
-	matches, corrections, err := query.SearchTextWithCorrections(s, "SrchLexicon", "", false, 0)
+	matches, corrections, hint, err := query.SearchTextWithCorrections(s, "SrchLexicon", "", false, 0)
 	if err != nil {
 		t.Fatalf("SearchTextWithCorrections: %v", err)
 	}
@@ -103,8 +103,37 @@ func TestSearchTextMisspelledQueryIsCorrected(t *testing.T) {
 	if corrections[0] != want {
 		t.Fatalf("correction = %+v, want %+v", corrections[0], want)
 	}
+	if hint != "" {
+		t.Fatalf("hint must stay empty when results exist, got %q", hint)
+	}
 	if !hasMatch(matches, "lex.go", "SearchLexicon") {
 		t.Fatalf("corrected search did not find the symbol: %+v", matches)
+	}
+}
+
+// TestSearchTextAlternationMixedTypoCorrected pins per-alternative
+// correction: with pattern BuildMCPKeyMap|Enabel the good alternative
+// already surfaces results, and the correction pass still reports the
+// replacement for the misspelled alternative without changing the results.
+func TestSearchTextAlternationMixedTypoCorrected(t *testing.T) {
+	s := buildTextSearchStore(t, map[string]string{
+		"keymap.go": "package fused\n\n// BuildMCPKeyMap builds keys\nfunc BuildMCPKeyMap() {}\n",
+		"enable.go": "package fused\n\n// Enable enables things\nfunc Enable() {}\n",
+	})
+
+	matches, corrections, hint, err := query.SearchTextWithCorrections(s, "BuildMCPKeyMap|Enabel", "", false, 0)
+	if err != nil {
+		t.Fatalf("SearchTextWithCorrections: %v", err)
+	}
+	if !hasMatch(matches, "keymap.go", "BuildMCPKeyMap") {
+		t.Fatalf("good alternative did not surface results: %+v", matches)
+	}
+	want := []fuse.Correction{{Original: "Enabel", Corrected: "enable"}}
+	if len(corrections) != 1 || corrections[0] != want[0] {
+		t.Fatalf("corrections = %+v, want %+v", corrections, want)
+	}
+	if hint != "" {
+		t.Fatalf("hint must stay empty when results exist, got %q", hint)
 	}
 }
 
@@ -115,7 +144,7 @@ func TestSearchTextSufficientResultsNoCorrection(t *testing.T) {
 		"exact.go": "package fused\n\n// alpha beta exact\nfunc Exact() {}\n",
 	})
 
-	matches, corrections, err := query.SearchTextWithCorrections(s, "alpha", "", false, 0)
+	matches, corrections, _, err := query.SearchTextWithCorrections(s, "alpha", "", false, 0)
 	if err != nil {
 		t.Fatalf("SearchTextWithCorrections: %v", err)
 	}
@@ -125,6 +154,77 @@ func TestSearchTextSufficientResultsNoCorrection(t *testing.T) {
 	if corrections != nil {
 		t.Fatalf("no correction should run when results suffice, got %+v", corrections)
 	}
+}
+
+// TestSearchTextAlternationEndToEnd pins the fused-pipeline alternation
+// contract over a real indexed module: literal `A|B` returns matches for
+// either side (zero results before the fix), `A B|C` respects (A AND B) OR
+// C precedence, and every returned line is consistent with what the pattern
+// claims.
+func TestSearchTextAlternationEndToEnd(t *testing.T) {
+	s := buildTextSearchStore(t, map[string]string{
+		"alpha.go": "package fused\n\n// Alpha does alpha things\nfunc Alpha() {}\n",
+		"beta.go":  "package fused\n\n// Beta does beta things\nfunc Beta() {}\n",
+		"gamma.go": "package fused\n\n// Gamma standalone\nfunc Gamma() {}\n",
+	})
+
+	t.Run("either side matches", func(t *testing.T) {
+		matches, err := query.SearchText(s, "Alpha|Beta", "", false, 0)
+		if err != nil {
+			t.Fatalf("SearchText alternation: %v", err)
+		}
+		if !hasMatch(matches, "alpha.go", "Alpha") {
+			t.Fatalf("alternation missed the Alpha side: %+v", matches)
+		}
+		if !hasMatch(matches, "beta.go", "Beta") {
+			t.Fatalf("alternation missed the Beta side: %+v", matches)
+		}
+		for _, m := range matches {
+			lower := strings.ToLower(m.Line)
+			if !strings.Contains(lower, "alpha") && !strings.Contains(lower, "beta") {
+				t.Fatalf("returned line matches neither alternative: %+v", m)
+			}
+		}
+	})
+
+	t.Run("mixed AND within OR", func(t *testing.T) {
+		matches, err := query.SearchText(s, "Alpha Beta|Gamma", "", false, 0)
+		if err != nil {
+			t.Fatalf("SearchText mixed alternation: %v", err)
+		}
+		if !hasMatch(matches, "gamma.go", "Gamma") {
+			t.Fatalf("OR alternative missed gamma.go: %+v", matches)
+		}
+		for _, m := range matches {
+			if strings.Contains(m.FilePath, "alpha.go") || strings.Contains(m.FilePath, "beta.go") {
+				t.Fatalf("single-side file over-matched the AND alternative: %+v", m)
+			}
+		}
+	})
+
+	t.Run("empty result on metacharacter pattern gets regex hint", func(t *testing.T) {
+		_, corrections, hint, err := query.SearchTextWithCorrections(s, "Zilch|Nothing", "", false, 0)
+		if err != nil {
+			t.Fatalf("SearchTextWithCorrections: %v", err)
+		}
+		if hint == "" {
+			t.Fatal("expected a regex-metacharacter hint on an empty literal result")
+		}
+		if !strings.Contains(hint, "is_regex") {
+			t.Fatalf("hint should point at is_regex: %q", hint)
+		}
+		_ = corrections
+	})
+
+	t.Run("clean-pattern miss gets no hint", func(t *testing.T) {
+		_, _, hint, err := query.SearchTextWithCorrections(s, "zzzqqqwwww", "", false, 0)
+		if err != nil {
+			t.Fatalf("SearchTextWithCorrections: %v", err)
+		}
+		if hint != "" {
+			t.Fatalf("clean pattern must not carry a hint, got %q", hint)
+		}
+	})
 }
 
 // TestSearchTextRegexModeUnchanged pins the regex guarantee: regex mode

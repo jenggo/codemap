@@ -104,39 +104,33 @@ const (
 // deterministic tiebreaks as Fuse, so reranking reorders entries without
 // adding or dropping any.
 func RerankByProximity(results []Candidate, terms []string) []Candidate {
-	terms = WordTerms(terms)
-	if len(terms) < 2 || len(results) < 2 {
+	if len(WordTerms(terms)) < 2 || len(results) < 2 {
+		return results
+	}
+	return RerankByAlternatives(results, [][]string{terms})
+}
+
+// RerankByAlternatives is RerankByProximity over per-alternative term lists:
+// a file is boosted by the alternative that matched it best — the smallest
+// positive minimum-window across alternatives — so an alternation query
+// reranks against the alternative that actually matched. Alternatives with
+// fewer than two word-bearing terms produce no window of their own; a file
+// matching none of the multi-term alternatives gets no boost. The output is
+// re-sorted with the same deterministic tiebreaks as Fuse.
+func RerankByAlternatives(results []Candidate, alternatives [][]string) []Candidate {
+	if len(results) < 2 {
+		return results
+	}
+	norms := multiTermAlternatives(alternatives)
+	if len(norms) == 0 {
 		return results
 	}
 
-	// term -> matched line numbers, per file.
-	termLines := make(map[string]map[string]map[int]bool)
-	for _, c := range results {
-		byTerm := termLines[c.FilePath]
-		if byTerm == nil {
-			byTerm = make(map[string]map[int]bool, len(terms))
-			termLines[c.FilePath] = byTerm
-		}
-		lower := strings.ToLower(c.Line)
-		for _, t := range terms {
-			if strings.Contains(lower, t) {
-				if byTerm[t] == nil {
-					byTerm[t] = make(map[int]bool)
-				}
-				byTerm[t][c.LineNumber] = true
-			}
-		}
-	}
-
-	windows := make(map[string]int, len(termLines))
-	for path, byTerm := range termLines {
-		windows[path] = minTermWindow(byTerm, terms)
-	}
-
+	termLines := alternativeTermLines(results, norms)
 	out := make([]Candidate, len(results))
 	copy(out, results)
 	for i := range out {
-		w := windows[out[i].FilePath]
+		w := bestAlternativeWindow(termLines[out[i].FilePath], norms)
 		if w <= 0 {
 			continue
 		}
@@ -148,6 +142,59 @@ func RerankByProximity(results []Candidate, terms []string) []Candidate {
 	}
 	sort.Slice(out, func(i, j int) bool { return lessCandidate(out[i], out[j]) })
 	return out
+}
+
+// multiTermAlternatives normalizes each alternative via WordTerms and keeps
+// only the ones with at least two word-bearing terms — the only alternatives
+// that can produce a proximity window.
+func multiTermAlternatives(alternatives [][]string) [][]string {
+	norms := make([][]string, 0, len(alternatives))
+	for _, terms := range alternatives {
+		if terms = WordTerms(terms); len(terms) >= 2 {
+			norms = append(norms, terms)
+		}
+	}
+	return norms
+}
+
+// alternativeTermLines maps file path -> term -> matched line numbers over
+// the matched lines present in the results, for every term of every
+// alternative term list.
+func alternativeTermLines(results []Candidate, alternatives [][]string) map[string]map[string]map[int]bool {
+	termLines := make(map[string]map[string]map[int]bool)
+	for _, c := range results {
+		byTerm := termLines[c.FilePath]
+		if byTerm == nil {
+			byTerm = make(map[string]map[int]bool)
+			termLines[c.FilePath] = byTerm
+		}
+		lower := strings.ToLower(c.Line)
+		for _, terms := range alternatives {
+			for _, t := range terms {
+				if strings.Contains(lower, t) {
+					if byTerm[t] == nil {
+						byTerm[t] = make(map[int]bool)
+					}
+					byTerm[t][c.LineNumber] = true
+				}
+			}
+		}
+	}
+	return termLines
+}
+
+// bestAlternativeWindow returns the smallest positive minimum-window across
+// the alternative term lists for one file's term-occurrence map — the span
+// of the alternative that matched the file best — or 0 when no alternative
+// covers all of its terms.
+func bestAlternativeWindow(byTerm map[string]map[int]bool, alternatives [][]string) int {
+	best := 0
+	for _, terms := range alternatives {
+		if w := minTermWindow(byTerm, terms); w > 0 && (best == 0 || w < best) {
+			best = w
+		}
+	}
+	return best
 }
 
 // minTermWindow returns the smallest span of lines b-a+1 covering at least
@@ -238,36 +285,50 @@ func CorrectTerms(lexicon, terms []string, maxDist int) ([]string, []Correction)
 	out := make([]string, len(terms))
 	var applied []Correction
 	for i, term := range terms {
-		corrected := term
-		if maxDist > 0 && wordy(term) {
-			lower := strings.ToLower(term)
-			if len([]rune(lower)) >= minCorrectionLen && !dict[lower] {
-				best, bestDist, ties := "", maxDist+1, 0
-				for _, e := range entries {
-					if absLenDiff(lower, e) > maxDist {
-						continue
-					}
-					d := levenshtein(lower, e)
-					if d > maxDist {
-						continue
-					}
-					if d < bestDist {
-						best, bestDist, ties = e, d, 1
-						continue
-					}
-					if d == bestDist {
-						ties++
-					}
-				}
-				if bestDist <= maxDist && ties == 1 {
-					corrected = best
-					applied = append(applied, Correction{Original: term, Corrected: best})
-				}
-			}
+		corrected, fixed := correctTerm(entries, dict, term, maxDist)
+		if fixed {
+			applied = append(applied, Correction{Original: term, Corrected: corrected})
 		}
 		out[i] = corrected
 	}
 	return out, applied
+}
+
+// correctTerm returns the lexicon replacement for term when exactly one
+// lexicon entry lies within maxDist edits, plus whether a correction was
+// made. A term is eligible only when maxDist is positive, it carries at
+// least one letter or digit, its lowercase form is at least
+// minCorrectionLen characters, and it is not already in the lexicon; a tie
+// between candidates is ambiguous and leaves the term as-is.
+func correctTerm(entries []string, dict map[string]bool, term string, maxDist int) (string, bool) {
+	if maxDist <= 0 || !wordy(term) {
+		return term, false
+	}
+	lower := strings.ToLower(term)
+	if len([]rune(lower)) < minCorrectionLen || dict[lower] {
+		return term, false
+	}
+	best, bestDist, ties := "", maxDist+1, 0
+	for _, e := range entries {
+		if absLenDiff(lower, e) > maxDist {
+			continue
+		}
+		d := levenshtein(lower, e)
+		if d > maxDist {
+			continue
+		}
+		if d < bestDist {
+			best, bestDist, ties = e, d, 1
+			continue
+		}
+		if d == bestDist {
+			ties++
+		}
+	}
+	if bestDist <= maxDist && ties == 1 {
+		return best, true
+	}
+	return term, false
 }
 
 // levenshtein computes the edit distance between a and b with the standard

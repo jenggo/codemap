@@ -503,6 +503,11 @@ func (s *Server) handleTool(name string, args map[string]any) (string, bool) {
 	record := func(result any, rendered string, isErr bool) {
 		s.recordUsage(name, result, rendered, isErr)
 	}
+	fail := func(format string, a ...any) (string, bool) {
+		msg := fmt.Sprintf(format, a...)
+		record(nil, msg, true)
+		return msg, true
+	}
 	if name == "index" {
 		msg, isErr := s.handleIndex(args)
 		record(nil, msg, isErr)
@@ -525,31 +530,23 @@ func (s *Server) handleTool(name string, args map[string]any) (string, bool) {
 			dir = v
 		}
 		if _, err := s.allowedTarget(dir); err != nil {
-			msg := fmt.Sprintf("Error: %v", err)
-			record(nil, msg, true)
-			return msg, true
+			return fail("Error: %v", err)
 		}
 	}
 	if err := validateToolArgs(name, args); err != nil {
-		msg := fmt.Sprintf("Error: %v", err)
-		record(nil, msg, true)
-		return msg, true
+		return fail("Error: %v", err)
 	}
 
 	st, err := s.getStore()
 	if err != nil {
-		msg := fmt.Sprintf("Error: %v", err)
-		record(nil, msg, true)
-		return msg, true
+		return fail("Error: %v", err)
 	}
 
 	opts, renderOpts := s.buildOptions(args)
 
 	handler, ok := s.toolHandlers()[name]
 	if !ok {
-		msg := fmt.Sprintf("Error: unknown tool %s", name)
-		record(nil, msg, true)
-		return msg, true
+		return fail("Error: unknown tool %s", name)
 	}
 	result, typed, isErr := handler(st, opts, renderOpts, args)
 	if isErr {
@@ -1879,7 +1876,7 @@ func handleSearchText(st *store.Store, qOpts []query.Option, rOpts []render.Opti
 	if v, ok := args[keyContextLines].(float64); ok {
 		contextLines = int(v)
 	}
-	matches, corrections, err := query.SearchTextWithCorrections(st, pattern, filePattern, isRegex, contextLines)
+	matches, corrections, hint, err := query.SearchTextWithCorrections(st, pattern, filePattern, isRegex, contextLines)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err), nil, true
 	}
@@ -1892,8 +1889,15 @@ func handleSearchText(st *store.Store, qOpts []query.Option, rOpts []render.Opti
 		correctionNote = "corrected_terms: " + strings.Join(parts, ", ")
 	}
 	if len(matches) == 0 {
-		if correctionNote != "" {
-			return correctionNote, nil, false
+		note := correctionNote
+		if hint != "" {
+			if note != "" {
+				note += "\n"
+			}
+			note += "hint: " + hint
+		}
+		if note != "" {
+			return note, nil, false
 		}
 		return healthNotice(st), nil, false
 	}
@@ -2089,7 +2093,7 @@ func graphTools() []map[string]any {
 			"List every relationship edge in the indexed codebase. Returns from/to symbol references, edge types, and source locations. Intended for bulk analysis; prefer callers_of or callees_of for targeted queries.",
 			map[string]any{}),
 		toolDef("search_text",
-			"Search file contents using a fused multi-strategy match: a ranked FTS5 pass merged with a case-insensitive substring scan (Reciprocal Rank Fusion), proximity-reranked so terms occurring close together rank first, with Levenshtein typo correction noted via corrected_terms. Regex mode bypasses fusion. Returns matching file paths, line numbers, and context lines. Use for finding text patterns in source code.",
+			"Search file contents using a fused multi-strategy match: a ranked FTS5 pass merged with a case-insensitive substring scan (Reciprocal Rank Fusion), proximity-reranked so terms occurring close together rank first, with Levenshtein typo correction noted via corrected_terms. A top-level | in a literal pattern alternates (A B|C means (A AND B) OR C); other regex syntax is inert. When a literal search matches nothing and the pattern contains regex metacharacters, the response carries a hint to retry with is_regex: true. Regex mode bypasses fusion. Returns matching file paths, line numbers, and context lines. Use for finding text patterns in source code.",
 			map[string]any{
 				keyPattern:      stringProp("Search pattern (FTS5 query or regex)"),
 				"file_pattern":  stringProp("File path filter pattern (substring match, optional)"),

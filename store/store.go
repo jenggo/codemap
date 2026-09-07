@@ -1185,28 +1185,44 @@ func likeMatch(column string) string {
 
 // sanitizeFTSQuery converts a user pattern into an FTS5 expression in which
 // every term is a phrase (embedded `"` doubled), joined with implicit AND.
+// A top-level `|` splits the pattern into alternatives, each rendered as a
+// parenthesized phrase group when it holds more than one term; the groups
+// are joined with the FTS5 OR keyword, so `A B|C` becomes `("a" "b") OR "c"`.
 // FTS5 operator characters in the user input are inert literals inside the
-// phrases. A term that is punctuation-only (e.g. `-`) is dropped rather than
-// quoted, since an empty quoted string is a MATCH error.
+// phrases — only the generated OR keyword is ever an operator, which keeps
+// the no-MATCH-syntax-error guarantee. A term that is punctuation-only
+// (e.g. `-`) is dropped rather than quoted, since an empty quoted string is
+// a MATCH error; alternatives left without any word-bearing term are
+// dropped the same way.
 func sanitizeFTSQuery(pattern string) string {
 	pattern = strings.TrimSpace(pattern)
 	if pattern == "" {
 		return ""
 	}
 
-	terms := strings.Fields(pattern)
-	var quoted []string
-	for _, t := range terms {
-		t = strings.ReplaceAll(t, `"`, `""`)
-		if isPunctuationOnly(t) {
+	var groups []string
+	for _, alt := range SplitAlternatives(pattern) {
+		var quoted []string
+		for t := range strings.FieldsSeq(alt) {
+			t = strings.ReplaceAll(t, `"`, `""`)
+			if isPunctuationOnly(t) {
+				continue
+			}
+			quoted = append(quoted, `"`+t+`"`)
+		}
+		if len(quoted) == 0 {
 			continue
 		}
-		quoted = append(quoted, `"`+t+`"`)
+		group := strings.Join(quoted, " ")
+		if len(quoted) > 1 {
+			group = "(" + group + ")"
+		}
+		groups = append(groups, group)
 	}
-	if len(quoted) == 0 {
+	if len(groups) == 0 {
 		return ""
 	}
-	return strings.Join(quoted, " ")
+	return strings.Join(groups, " OR ")
 }
 
 // buildSymbolFTSQuery converts a user pattern into an FTS5 expression that
@@ -2794,22 +2810,7 @@ func (s *Store) SearchFileContent(pattern, filePattern string, isRegex bool, con
 		if sanitized == "" {
 			return nil, nil
 		}
-		if ftsNeedsFullScan(pattern) {
-			// The trigram tokenizer produces matches only for terms of at
-			// least three characters; a shorter term silently matches nothing
-			// in MATCH. Scan the files table directly so short patterns keep
-			// returning the same verbatim matches they did under unicode61.
-			query = `SELECT f.path, f.content FROM files f WHERE instr(f.content, ?) > 0`
-			args = []any{pattern}
-		} else {
-			// The FTS MATCH is a whole-content candidate prefilter; the raw pattern
-			// must still occur verbatim in the content so a row selected here always
-			// yields at least one line from the per-line extractMatches walk. Without
-			// this, a multi-term pattern whose terms sit on different lines would
-			// select the row but then produce zero matches.
-			query = `SELECT f.path, f.content FROM file_content_fts fts JOIN files f ON f.rowid = fts.rowid WHERE file_content_fts MATCH ? AND instr(f.content, ?) > 0`
-			args = []any{sanitized, pattern}
-		}
+		query, args = literalContentQuery(pattern, sanitized, ftsNeedsFullScan(pattern))
 	}
 
 	if filePattern != "" {
@@ -2847,12 +2848,31 @@ func (s *Store) SearchFileContent(pattern, filePattern string, isRegex bool, con
 }
 
 func extractMatches(filePath, content, pattern string, re *regexp.Regexp, isRegex bool, contextLines int) []FileMatch {
-	return extractMatchesFunc(filePath, content, func(line string) bool {
-		if isRegex {
+	var match func(line string) bool
+	if isRegex {
+		match = func(line string) bool {
 			return re.MatchString(line)
 		}
-		return strings.Contains(line, pattern)
-	}, contextLines)
+	} else {
+		match = literalLineMatcher(pattern)
+	}
+	return extractMatchesFunc(filePath, content, match, contextLines)
+}
+
+// literalLineMatcher returns a per-line predicate for a literal pattern: the
+// line matches when it contains any alternative of the pattern verbatim.
+// Every alternative kept by the candidate query occurs verbatim somewhere in
+// the content, so a selected row always yields at least one matching line.
+func literalLineMatcher(pattern string) func(string) bool {
+	alts := SplitAlternatives(pattern)
+	return func(line string) bool {
+		for _, alt := range alts {
+			if strings.Contains(line, alt) {
+				return true
+			}
+		}
+		return false
+	}
 }
 
 // extractMatchesFunc walks the content line by line and returns a FileMatch

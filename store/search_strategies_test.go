@@ -2,6 +2,7 @@ package store
 
 import (
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -130,7 +131,7 @@ func TestFileMatchesFTSFilePatternAndLimit(t *testing.T) {
 func TestFileMatchesSubstringRecallsScatteredTerms(t *testing.T) {
 	s := seedStrategiesModule(t)
 
-	matches, err := s.FileMatchesSubstring([]string{"alpha", "beta"}, "", 100, 0)
+	matches, err := s.FileMatchesSubstring([][]string{{"alpha", "beta"}}, "", 100, 0)
 	if err != nil {
 		t.Fatalf("FileMatchesSubstring: %v", err)
 	}
@@ -152,7 +153,7 @@ func TestFileMatchesSubstringRecallsScatteredTerms(t *testing.T) {
 func TestFileMatchesSubstringCaseInsensitive(t *testing.T) {
 	s := seedStrategiesModule(t)
 
-	matches, err := s.FileMatchesSubstring([]string{"ALPHA", "Beta"}, "", 100, 0)
+	matches, err := s.FileMatchesSubstring([][]string{{"ALPHA", "Beta"}}, "", 100, 0)
 	if err != nil {
 		t.Fatalf("FileMatchesSubstring: %v", err)
 	}
@@ -161,7 +162,7 @@ func TestFileMatchesSubstringCaseInsensitive(t *testing.T) {
 	}
 
 	// A file missing one term is not a candidate at all.
-	none, err := s.FileMatchesSubstring([]string{"alpha", "missing"}, "", 100, 0)
+	none, err := s.FileMatchesSubstring([][]string{{"alpha", "missing"}}, "", 100, 0)
 	if err != nil {
 		t.Fatalf("FileMatchesSubstring: %v", err)
 	}
@@ -175,7 +176,7 @@ func TestFileMatchesSubstringCaseInsensitive(t *testing.T) {
 func TestFileMatchesSubstringPunctuationOnlyTermsInert(t *testing.T) {
 	s := seedStrategiesModule(t)
 
-	matches, err := s.FileMatchesSubstring([]string{"-", "alpha"}, "", 100, 0)
+	matches, err := s.FileMatchesSubstring([][]string{{"-", "alpha"}}, "", 100, 0)
 	if err != nil {
 		t.Fatalf("FileMatchesSubstring: %v", err)
 	}
@@ -183,12 +184,43 @@ func TestFileMatchesSubstringPunctuationOnlyTermsInert(t *testing.T) {
 		t.Fatalf("punctuation-only term broke the scan: %+v", matches)
 	}
 
-	inert, err := s.FileMatchesSubstring([]string{"-"}, "", 100, 0)
+	inert, err := s.FileMatchesSubstring([][]string{{"-"}}, "", 100, 0)
 	if err != nil {
 		t.Fatalf("FileMatchesSubstring: %v", err)
 	}
 	if len(inert) != 0 {
 		t.Fatalf("punctuation-only term list should match nothing: %+v", inert)
+	}
+}
+
+// TestFileMatchesSubstringAlternation pins any-alternative semantics: a file
+// matches when every term of ANY alternative occurs in its content, and
+// lines from both sides of the alternation are surfaced.
+func TestFileMatchesSubstringAlternation(t *testing.T) {
+	s := seedStrategiesModule(t)
+
+	// (alpha AND beta) OR gamma — no file contains gamma, so only the
+	// alpha/beta files may surface.
+	matches, err := s.FileMatchesSubstring([][]string{{"alpha", "beta"}, {"gamma"}}, "", 100, 0)
+	if err != nil {
+		t.Fatalf("FileMatchesSubstring: %v", err)
+	}
+	if !hasFile(matches, "exact.go") || !hasFile(matches, "scatter.go") {
+		t.Fatalf("alternation substring scan missed the alpha/beta fixtures: %+v", matches)
+	}
+	for _, m := range matches {
+		if strings.Contains(m.Line, "gamma") {
+			t.Fatalf("gamma alternative over-matched: %+v", m)
+		}
+	}
+
+	// Either side alone still matches its own file.
+	either, err := s.FileMatchesSubstring([][]string{{"exact"}, {"ab block"}}, "", 100, 0)
+	if err != nil {
+		t.Fatalf("FileMatchesSubstring either-side: %v", err)
+	}
+	if !hasFile(either, "exact.go") || !hasFile(either, "ab.go") {
+		t.Fatalf("either-side alternation missed one side: %+v", either)
 	}
 }
 
@@ -219,6 +251,37 @@ func TestSearchLexiconDedupLowercasedSorted(t *testing.T) {
 	}
 	if helperCount != 1 {
 		t.Fatalf("expected exactly one deduplicated \"helper\" entry, got %d: %v", helperCount, lexicon)
+	}
+}
+
+// TestSplitAlternatives pins the shared literal-mode splitter: top-level `|`
+// separates OR alternatives, segments are trimmed, and empty or
+// punctuation-only segments are dropped.
+func TestSplitAlternatives(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"A|B", []string{"A", "B"}},
+		{"A||B", []string{"A", "B"}},
+		{"|", nil},
+		{"-|-", nil},
+		{"", nil},
+		{"A|", []string{"A"}},
+		{"A B|C D", []string{"A B", "C D"}},
+		{" alpha | beta ", []string{"alpha", "beta"}},
+		{"no pipes", []string{"no pipes"}},
+	}
+	for _, tc := range cases {
+		got := SplitAlternatives(tc.in)
+		if len(got) != 0 && len(tc.want) != 0 {
+			if reflect.DeepEqual(got, tc.want) {
+				continue
+			}
+		} else if len(got) == 0 && len(tc.want) == 0 {
+			continue
+		}
+		t.Errorf("SplitAlternatives(%q) = %q, want %q", tc.in, got, tc.want)
 	}
 }
 

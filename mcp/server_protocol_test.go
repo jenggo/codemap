@@ -184,13 +184,13 @@ func TestServerSurvivesOversizedLine(t *testing.T) {
 	}
 }
 
-// copyDir recursively copies src to dst.
-func copyDir(src, dst string) error {
-	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+// copyDir recursively copies the simple fixture directory to dst.
+func copyDir(dst string) error {
+	return filepath.Walk("../testdata/simple", func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		rel, err := filepath.Rel(src, path)
+		rel, err := filepath.Rel("../testdata/simple", path)
 		if err != nil {
 			return err
 		}
@@ -207,9 +207,8 @@ func copyDir(src, dst string) error {
 }
 
 func TestSearchTextWorksAfterMCPIndex(t *testing.T) {
-	src := "../testdata/simple"
 	dst := filepath.Join(t.TempDir(), "simple")
-	if err := copyDir(src, dst); err != nil {
+	if err := copyDir(dst); err != nil {
 		t.Fatalf("copy fixture: %v", err)
 	}
 

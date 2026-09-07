@@ -309,15 +309,12 @@ func scanJSONString(s string, i int) (string, int, bool) {
 			case 'f':
 				b.WriteByte('\f')
 			case 'u':
-				if i+4 > len(s) {
+				r, next, ok := decodeUnicodeEscape(s, i)
+				if !ok {
 					return "", i, false
 				}
-				v, err := strconv.ParseUint(s[i:i+4], 16, 32)
-				if err != nil {
-					return "", i, false
-				}
-				b.WriteRune(rune(v))
-				i += 4
+				b.WriteRune(r)
+				i = next
 			default:
 				return "", i, false
 			}
@@ -327,6 +324,64 @@ func scanJSONString(s string, i int) (string, int, bool) {
 		}
 	}
 	return "", i, false
+}
+
+// decodeUnicodeEscape decodes the 4-hex-digit escape starting at s[i] (the
+// position just past `u`), returning the rune and the index just past the
+// digits.
+func decodeUnicodeEscape(s string, i int) (rune, int, bool) {
+	if i+4 > len(s) {
+		return 0, i, false
+	}
+	v, err := strconv.ParseUint(s[i:i+4], 16, 32)
+	if err != nil {
+		return 0, i, false
+	}
+	return rune(v), i + 4, true
+}
+
+// scanJSONDelimited scans a `{...}` or `[...]` value starting at s[i],
+// skipping strings verbatim, and returns the index just past the closing
+// brace or bracket.
+func scanJSONDelimited(s string, i int) (int, bool) {
+	depth := 0
+	for i < len(s) {
+		switch s[i] {
+		case '"':
+			_, next, ok := scanJSONString(s, i)
+			if !ok {
+				return i, false
+			}
+			i = next
+			continue
+		case '{', '[':
+			depth++
+		case '}', ']':
+			depth--
+			if depth == 0 {
+				return i + 1, true
+			}
+		}
+		i++
+	}
+	return i, false
+}
+
+// scanJSONScalar scans a number, true, false, or null token: it runs until
+// a structural character and returns the index just past it.
+func scanJSONScalar(s string, i int) (int, bool) {
+	start := i
+	for i < len(s) {
+		c := s[i]
+		if c == ',' || c == '}' || c == ']' || c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+			break
+		}
+		i++
+	}
+	if i == start {
+		return i, false
+	}
+	return i, true
 }
 
 // scanJSONValue returns the index just past the JSON value starting at s[i].
@@ -340,40 +395,8 @@ func scanJSONValue(s string, i int) (int, bool) {
 		_, next, ok := scanJSONString(s, i)
 		return next, ok
 	case '{', '[':
-		depth := 0
-		for i < len(s) {
-			switch s[i] {
-			case '"':
-				_, next, ok := scanJSONString(s, i)
-				if !ok {
-					return i, false
-				}
-				i = next
-				continue
-			case '{', '[':
-				depth++
-			case '}', ']':
-				depth--
-				if depth == 0 {
-					return i + 1, true
-				}
-			}
-			i++
-		}
-		return i, false
+		return scanJSONDelimited(s, i)
 	default:
-		// Number, true, false, null: runs until a structural character.
-		start := i
-		for i < len(s) {
-			c := s[i]
-			if c == ',' || c == '}' || c == ']' || c == ' ' || c == '\t' || c == '\r' || c == '\n' {
-				break
-			}
-			i++
-		}
-		if i == start {
-			return i, false
-		}
-		return i, true
+		return scanJSONScalar(s, i)
 	}
 }

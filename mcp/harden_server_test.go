@@ -256,9 +256,8 @@ func TestChangedSymbolsCompactFormat(t *testing.T) {
 }
 
 func TestIndexAcceptsAllowedTarget(t *testing.T) {
-	src := "../testdata/simple"
 	dst := filepath.Join(t.TempDir(), "simple")
-	if err := copyDir(src, dst); err != nil {
+	if err := copyDir(dst); err != nil {
 		t.Fatalf("copy fixture: %v", err)
 	}
 	s := NewLazy("")
