@@ -314,6 +314,17 @@ func TestAutoReindexNoticeOnSuccess(t *testing.T) {
 	}
 }
 
+func TestRebuildNoticePointsAtChangedSymbolsWhenDirty(t *testing.T) {
+	dirty := rebuildNotice("uncommitted .go changes not covered by the current index")
+	if !strings.Contains(dirty, "codemap_changed_symbols") || !strings.Contains(dirty, "HEAD") {
+		t.Errorf("dirty notice lacks the changed_symbols pointer: %q", dirty)
+	}
+	clean := rebuildNotice("a .go file is newer than the last index")
+	if strings.Contains(clean, "codemap_changed_symbols") {
+		t.Errorf("non-dirty notice must not point at changed_symbols: %q", clean)
+	}
+}
+
 func TestAutoReindexNoMisleadingNoticeOnFailure(t *testing.T) {
 	s := newTestServer(t)
 	s.stalenessCheck = func(dbPath, repoPath string) (bool, error) {

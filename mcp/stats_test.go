@@ -189,9 +189,8 @@ func TestRecordUsageIdentityFallbackForUnregisteredTool(t *testing.T) {
 }
 
 // TestStatsRecordsSymbolBodyEstimator proves the typed handler result reaches
-// the estimator through the dispatch wrapper. The fixture symbol is tiny, so
-// the rendered payload (headers + fences) exceeds the raw span estimate — the
-// documented exception that clamps reduction to 0.
+// the estimator through the dispatch wrapper: a source read is priced as the
+// whole indexed file, so even a tiny symbol reports real savings.
 func TestStatsRecordsSymbolBodyEstimator(t *testing.T) {
 	s := newTestServer(t)
 	qn := "codemap/testdata/simple.NewParser"
@@ -203,7 +202,11 @@ func TestStatsRecordsSymbolBodyEstimator(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSymbolBody: %v", err)
 	}
-	wantRaw := int64(len(body.Body) + len(body.ContextBefore) + len(body.ContextAfter))
+	content, err := s.store.FileContent(body.PosFile)
+	if err != nil {
+		t.Fatalf("FileContent: %v", err)
+	}
+	wantRaw := int64(len(content))
 
 	snap := s.usage.snapshot()
 	if len(snap.Rows) != 1 {
@@ -214,13 +217,59 @@ func TestStatsRecordsSymbolBodyEstimator(t *testing.T) {
 		t.Fatalf("unexpected row: %+v", row)
 	}
 	if row.RawBytes != wantRaw {
-		t.Errorf("rawBytes = %d, want %d (body + context spans)", row.RawBytes, wantRaw)
+		t.Errorf("rawBytes = %d, want %d (indexed file content)", row.RawBytes, wantRaw)
 	}
 	if row.RespBytes != int64(len(out)) {
 		t.Errorf("respBytes = %d, want %d (rendered payload)", row.RespBytes, len(out))
 	}
-	if row.Reduction != 0 {
-		t.Errorf("reduction = %v, want 0 (rendered headers exceed raw span: clamp)", row.Reduction)
+	if row.Reduction <= 0 {
+		t.Errorf("reduction = %v, want > 0 (whole-file read avoided)", row.Reduction)
+	}
+}
+
+func TestEstimateSymbolBodyRaw(t *testing.T) {
+	s := newTestServer(t)
+	posFile := "/repo/simple.go"
+	content := "package simple\n\nfunc X() {}\n"
+	if err := s.store.WriteFiles(map[string]string{posFile: content}); err != nil {
+		t.Fatalf("WriteFiles: %v", err)
+	}
+
+	indexed := &query.SymbolBodyResult{PosFile: posFile, Body: "func X() {}"}
+	if got := estimateSymbolBodyRaw(s.store, indexed); got != int64(len(content)) {
+		t.Errorf("indexed file: got %d, want %d", got, len(content))
+	}
+
+	missing := &query.SymbolBodyResult{PosFile: "not/indexed.go", Body: "func X() {}"}
+	if got := estimateSymbolBodyRaw(s.store, missing); got != int64(len(missing.Body)) {
+		t.Errorf("unindexed file: got %d, want span fallback %d", got, len(missing.Body))
+	}
+
+	if got := estimateSymbolBodyRaw(s.store, &query.ShowResult{}); got != 0 {
+		t.Errorf("non-source result: got %d, want 0", got)
+	}
+}
+
+func TestStatsMixedShowCallsReportSavings(t *testing.T) {
+	s := newTestServer(t)
+	calls := []map[string]any{
+		{"qualified_name": "codemap/testdata/simple.NewParser", "source": true},
+		{"qualified_name": "codemap/testdata/simple.NewParser"},
+		{"qualified_name": "codemap/testdata/simple.Parser"},
+	}
+	for _, args := range calls {
+		if out, isErr := s.handleTool("show", args); isErr {
+			t.Fatalf("show failed: %s", out)
+		}
+	}
+
+	snap := s.usage.snapshot()
+	if len(snap.Rows) != 1 {
+		t.Fatalf("want 1 row, got %d", len(snap.Rows))
+	}
+	row := snap.Rows[0]
+	if row.Reduction <= 0 {
+		t.Errorf("reduction = %v, want > 0 for a mixed session", row.Reduction)
 	}
 }
 
@@ -286,6 +335,59 @@ func TestStatsRecordsContextBundleEstimator(t *testing.T) {
 	}
 	if row.RawBytes != wantRaw {
 		t.Errorf("rawBytes = %d, want %d (TokenEstimate x 4)", row.RawBytes, wantRaw)
+	}
+}
+
+func TestRecordUsageZeroEstimateFallsBackToIdentity(t *testing.T) {
+	s := newTestServer(t)
+	rendered := "rendered non-source show"
+	s.recordUsage("show", &query.ShowResult{}, rendered, false)
+
+	snap := s.usage.snapshot()
+	if len(snap.Rows) != 1 {
+		t.Fatalf("want 1 row, got %d", len(snap.Rows))
+	}
+	row := snap.Rows[0]
+	if row.RawBytes != int64(len(rendered)) {
+		t.Errorf("rawBytes = %d, want %d (identity fallback)", row.RawBytes, len(rendered))
+	}
+	if row.RespBytes != int64(len(rendered)) {
+		t.Errorf("respBytes = %d, want %d", row.RespBytes, len(rendered))
+	}
+}
+
+func TestRecordUsageMixedSourceAndNonSource(t *testing.T) {
+	s := newTestServer(t)
+	body := &query.SymbolBodyResult{Body: strings.Repeat("x", 400)}
+	s.recordUsage("show", body, "rendered", false)
+	s.recordUsage("show", &query.ShowResult{}, "rendered", false)
+
+	snap := s.usage.snapshot()
+	if len(snap.Rows) != 1 {
+		t.Fatalf("want 1 row, got %d", len(snap.Rows))
+	}
+	row := snap.Rows[0]
+	if row.Reduction <= 0 {
+		t.Errorf("reduction = %v, want > 0 for a mixed session", row.Reduction)
+	}
+	if row.RawBytes <= row.RespBytes {
+		t.Errorf("rawBytes = %d, respBytes = %d, want raw > resp", row.RawBytes, row.RespBytes)
+	}
+}
+
+func TestRecordUsageErrorStaysIdentity(t *testing.T) {
+	s := newTestServer(t)
+	body := &query.SymbolBodyResult{Body: strings.Repeat("x", 400)}
+	rendered := "error payload"
+	s.recordUsage("show", body, rendered, true)
+
+	snap := s.usage.snapshot()
+	if len(snap.Rows) != 1 {
+		t.Fatalf("want 1 row, got %d", len(snap.Rows))
+	}
+	row := snap.Rows[0]
+	if row.RawBytes != int64(len(rendered)) || row.RespBytes != int64(len(rendered)) {
+		t.Errorf("error call must use identity, got raw=%d resp=%d", row.RawBytes, row.RespBytes)
 	}
 }
 

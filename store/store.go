@@ -2608,6 +2608,8 @@ type HealthInfo struct {
 	RepoPath     string
 	GitHead      string
 	IndexedVia   string // "go-list" or "dir-walk"; empty if unknown
+	Dirty        bool   // uncommitted .go changes when health was computed
+	DirtyIndexed bool   // index fingerprint matches the current dirty diff
 	PackageCount int
 	SymbolCount  int
 }
@@ -2653,6 +2655,11 @@ func (s *Store) Health() (HealthInfo, error) {
 	}
 	if err := rows.Err(); err != nil {
 		return h, err
+	}
+	if dirty, fp, derr := vcs.GitDirtyDiff(h.RepoPath, "HEAD"); derr == nil && dirty {
+		h.Dirty = true
+		stored, ok := readMetaDB(s.db, dirtyFingerprintKey)
+		h.DirtyIndexed = ok && stored == fp
 	}
 	return h, nil
 }

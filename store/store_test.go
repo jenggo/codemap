@@ -39,6 +39,59 @@ func TestHealthRoundTrip(t *testing.T) {
 	}
 }
 
+func TestHealthDirtyProvenance(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	head := initGitRepo(t, repo)
+
+	s, err := Create(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.SetRepoMeta(repo, head, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetIndexedAt(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	h, err := s.Health()
+	if err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+	if h.Dirty || h.DirtyIndexed {
+		t.Fatalf("clean tree: got dirty=%t indexed=%t", h.Dirty, h.DirtyIndexed)
+	}
+
+	if err := os.WriteFile(filepath.Join(repo, "a.go"), []byte("package a\n\nvar X = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h, err = s.Health()
+	if err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+	if !h.Dirty || h.DirtyIndexed {
+		t.Fatalf("unseen dirty tree: got dirty=%t indexed=%t", h.Dirty, h.DirtyIndexed)
+	}
+
+	// Record the fingerprint, as a rebuild does.
+	_, fp, derr := vcs.GitDirtyDiff(repo, "HEAD")
+	if derr != nil {
+		t.Fatal(derr)
+	}
+	if err := s.SetDirtyFingerprint("", fp); err != nil {
+		t.Fatal(err)
+	}
+
+	h, err = s.Health()
+	if err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+	if !h.Dirty || !h.DirtyIndexed {
+		t.Fatalf("indexed dirty tree: got dirty=%t indexed=%t", h.Dirty, h.DirtyIndexed)
+	}
+}
+
 func TestCreatePreservesExistingDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.db")
 	s, err := Create(path)

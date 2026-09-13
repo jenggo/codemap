@@ -225,11 +225,21 @@ func (s *Server) refreshSingleStale(dbPath string) error {
 		// as a completed action so agents trust the result below instead of
 		// mistaking the auto-reindex for stale or failed data.
 		s.mu.Lock()
-		s.warnings = append(s.warnings,
-			fmt.Sprintf("index was stale (%s) and was auto-rebuilt before answering; results below reflect the latest code", reason))
+		s.warnings = append(s.warnings, rebuildNotice(reason))
 		s.mu.Unlock()
 	}
 	return nil
+}
+
+// rebuildNotice frames a completed auto-rebuild so agents trust the result
+// below, and points at changed_symbols when the rebuild was caused by
+// uncommitted changes.
+func rebuildNotice(reason string) string {
+	notice := fmt.Sprintf("index was stale (%s) and was auto-rebuilt before answering; results below reflect the latest code", reason)
+	if strings.Contains(reason, "uncommitted") {
+		notice += `; run codemap_changed_symbols (ref: "HEAD") for the uncommitted delta`
+	}
+	return notice
 }
 
 // staleCheck is the single-repo staleness probe, overridable in tests.
@@ -574,7 +584,9 @@ func (s *Server) recordUsage(tool string, result any, rendered string, isErr boo
 	rawBytes := respBytes
 	if !isErr {
 		if est, ok := rawEstimators[tool]; ok {
-			rawBytes = est(s.store, result)
+			if r := est(s.store, result); r > 0 {
+				rawBytes = r
+			}
 		}
 	}
 	s.usage.record(tool, respBytes, rawBytes, isErr)
@@ -1056,6 +1068,13 @@ func handleHealth(st *store.Store, _ []query.Option, _ []render.Option, _ map[st
 		}
 		out := fmt.Sprintf("indexed_at=%s repo=%s head=%s %d packages, %d symbols",
 			h.IndexedAt, h.RepoPath, h.GitHead, h.PackageCount, h.SymbolCount)
+		if h.Dirty {
+			state := "stale"
+			if h.DirtyIndexed {
+				state = "indexed"
+			}
+			out += fmt.Sprintf(" dirty=true (%s)", state)
+		}
 		return out, nil, false
 	}
 	var b strings.Builder

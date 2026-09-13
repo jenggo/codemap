@@ -93,7 +93,10 @@ Commands: `contracts`, `contract-drift`, `runtime-contracts` (MCP: `contracts`, 
 - **Context file** — writes navigation documentation to `~/.config/opencode/context/codemap/navigation.md`
 - **Plugin** — installs a soft-mode guard to `~/.config/opencode/plugins/codemap-guard.ts` that warns agents when they use grep/glob/read on `.go` files instead of codemap MCP tools
 - **Crush** — injects MCP config into `~/.config/crush/crush.json`
+- **Command Code** — installs a soft-mode guard mod to `~/.commandcode/mods/codemap-guard.ts` (skipped when `~/.commandcode` is absent)
 - **AGENTS.md** — creates project-level guidance for AI agents (skipped if already exists)
+
+Re-run `codemap init` after upgrading codemap to refresh the installed opencode plugin, navigation doc, and Command Code mod; the command reports `updated` or `unchanged` per artifact, and each guard carries a `Version:` marker.
 
 ## Usage
 

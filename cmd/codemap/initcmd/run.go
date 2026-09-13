@@ -72,7 +72,7 @@ This project uses ` + "`codemap`" + ` MCP tools for Go codebase analysis. These 
 ` + ToolsAndTipsBlock + `
 `
 
-const opencodeNavContent = `<!-- Context: codemap/navigation | Priority: high | Version: 1.2 -->
+const opencodeNavContent = `<!-- Context: codemap/navigation | Priority: high | Version: 1.3 -->
 
 # Codemap MCP Tools
 
@@ -105,13 +105,14 @@ Indexing is **automatic** — the first tool call triggers indexing if needed (~
 
 const codemapGuardPlugin = `/**
  * Codemap Guard — OpenCode plugin
+ * Version: 1.3
  *
  * Soft-mode guard that warns agents when they use grep/glob/read on .go files
  * instead of codemap MCP tools. The warning includes a suggestion to use the
  * appropriate codemap tool. Calls are NOT blocked — the agent can proceed if
  * it has a good reason (e.g. reading non-Go files, checking config, etc).
  *
- * Installed by ` + "`codemap inject`" + `.
+ * Installed by ` + "`codemap inject`" + ` (alias: ` + "`codemap init`" + `).
  */
 
 import type { Plugin } from "@opencode-ai/plugin"
@@ -121,7 +122,7 @@ const GO_FILE_RE = /\.go\b/
 const TOOL_SUGGESTIONS: Record<string, string> = {
   grep: "Use ` + "`codemap_search`" + ` (symbol names), ` + "`codemap_search_text`" + ` (file contents), or ` + "`codemap_callers_of`" + `/` + "`codemap_callees_of`" + ` (relationships) instead.",
   glob: "Use ` + "`codemap_package`" + ` (package API; without path it lists all packages) to discover Go packages and their symbols.",
-  read: "Use ` + "`codemap_show`" + ` (single symbol; source: true for raw source), ` + "`codemap_package`" + ` (full package API), or ` + "`codemap_get_context_bundle`" + ` (symbol + context) instead.",
+  read: "For one symbol: ` + "`codemap_show`" + ` (source: true for raw source). For a file's symbols: ` + "`codemap_symbols_in_file`" + `. For symbol context: ` + "`codemap_get_context_bundle`" + `. For a changed tree: ` + "`codemap_changed_symbols`" + `.",
 }
 
 function isGoTarget(args: Record<string, any>): boolean {
@@ -132,13 +133,26 @@ function isGoTarget(args: Record<string, any>): boolean {
   return false
 }
 
+// opencode exposes MCP tools namespaced (codemap_search); built-ins are bare.
+function baseToolName(tool: string): string {
+  return tool.toLowerCase().replace(/^codemap[._-]/, "")
+}
+
+function warnKey(tool: string, args: Record<string, any>): string {
+  const target = args.filePath || args.file || args.path || args.pattern || tool
+  return ` + "`${tool}:${target}`" + `
+}
+
 export const CodemapGuard: Plugin = async () => {
+  const warned = new Set<string>()
+
   return {
     "tool.execute.after": async (input, output) => {
       const tool = input.tool.toLowerCase()
+      const name = baseToolName(tool)
 
       const CODEMAP_SEARCH = ["search", "search_text", "methods_of"]
-      if (CODEMAP_SEARCH.includes(tool)) {
+      if (CODEMAP_SEARCH.includes(name)) {
         const rendered = output.output ?? ""
         if (!rendered.trim()) {
           output.output = ` + "`[codemap-guard] \"${input.tool}\" returned no results. The index may be stale or incomplete — run the 'index' tool to rebuild it, then retry.\\n\\n`" + ` + rendered
@@ -146,16 +160,86 @@ export const CodemapGuard: Plugin = async () => {
         return
       }
 
-      const suggestion = TOOL_SUGGESTIONS[tool]
+      const suggestion = TOOL_SUGGESTIONS[name]
       if (!suggestion) return
 
       const args = (input.args ?? {}) as Record<string, any>
       if (!isGoTarget(args)) return
 
-      const warning = ` + "`[codemap-guard] \"${input.tool}\" tool output references Go files (${input.args?.pattern || input.args?.filePath || input.args?.file || \"\"}). ${suggestion}\\n\\n`" + `
+      // ` + "`read`" + ` is correct when an Edit follows; warn once per file.
+      const key = warnKey(name, args)
+      if (warned.has(key)) return
+      warned.add(key)
+
+      const warning = ` + "`[codemap-guard] \"${input.tool}\" on a Go file (${args.pattern || args.filePath || args.file || \"\"}). ${suggestion}\\n\\n`" + `
       output.output = warning + (output.output ?? "")
     },
   }
+}
+`
+
+const codemapGuardMod = `/**
+ * Codemap Guard — Command Code mod
+ * Version: 1.0
+ *
+ * Soft-mode guard that warns agents when they use grep/glob/read on .go files
+ * instead of codemap MCP tools. Calls are NOT blocked.
+ *
+ * Installed by ` + "`codemap inject`" + ` (alias: ` + "`codemap init`" + `).
+ */
+
+import type { ModApi } from "@commandcode/harness"
+
+const GO_FILE_RE = /\.go\b/
+
+const TOOL_SUGGESTIONS: Record<string, string> = {
+  grep: "Use ` + "`codemap_search`" + ` (symbol names), ` + "`codemap_search_text`" + ` (file contents), or ` + "`codemap_callers_of`" + `/` + "`codemap_callees_of`" + ` (relationships) instead.",
+  glob: "Use ` + "`codemap_package`" + ` (package API; without path it lists all packages) to discover Go packages and their symbols.",
+  read_file: "For one symbol: ` + "`codemap_show`" + ` (source: true for raw source). For a file's symbols: ` + "`codemap_symbols_in_file`" + `. For symbol context: ` + "`codemap_get_context_bundle`" + `. For a changed tree: ` + "`codemap_changed_symbols`" + `.",
+}
+
+function isGoTarget(input: Record<string, any>): boolean {
+  for (const key of ["pattern", "glob", "path", "file_path", "include"]) {
+    const val = input[key]
+    if (typeof val === "string" && GO_FILE_RE.test(val)) return true
+  }
+  const paths = input.paths
+  return Array.isArray(paths) && paths.some((p) => typeof p === "string" && GO_FILE_RE.test(p))
+}
+
+// MCP tools may surface namespaced; built-ins are bare.
+function baseToolName(tool: string): string {
+  return tool.toLowerCase().replace(/^mcp__codemap__/, "").replace(/^codemap[._-]/, "")
+}
+
+function warnKey(tool: string, input: Record<string, any>): string {
+  const target = input.file_path || input.path || input.pattern || input.glob || tool
+  return ` + "`${tool}:${target}`" + `
+}
+
+export default function (cmd: ModApi): void {
+  const warned = new Set<string>()
+
+  cmd.hooks({
+    afterToolCall({ toolName, input, isError }) {
+      if (isError) return undefined
+
+      const name = baseToolName(toolName)
+      const suggestion = TOOL_SUGGESTIONS[name]
+      if (!suggestion) return undefined
+
+      const args = (input ?? {}) as Record<string, any>
+      if (!isGoTarget(args)) return undefined
+
+      const key = warnKey(name, args)
+      if (warned.has(key)) return undefined
+      warned.add(key)
+
+      return {
+        additionalContext: ` + "`[codemap-guard] \"${toolName}\" on a Go file (${args.pattern || args.file_path || args.path || \"\"}). ${suggestion}`" + `,
+      }
+    },
+  })
 }
 `
 
@@ -169,6 +253,11 @@ func Run() error {
 
 	if err := injectOpencode(); err != nil {
 		fmt.Fprintf(os.Stderr, "opencode: %v\n", err)
+		errors = true
+	}
+
+	if err := injectCommandCode(); err != nil {
+		fmt.Fprintf(os.Stderr, "commandcode: %v\n", err)
 		errors = true
 	}
 
@@ -238,10 +327,11 @@ func injectOpencode() error {
 	}
 
 	navPath := filepath.Join(navDir, "navigation.md")
-	if err := os.WriteFile(navPath, []byte(opencodeNavContent), 0644); err != nil {
+	changed, err := writeIfChanged(navPath, opencodeNavContent)
+	if err != nil {
 		return fmt.Errorf("writing navigation.md: %w", err)
 	}
-	fmt.Printf("opencode: updated %s\n", navPath)
+	fmt.Printf("opencode: %s %s\n", changeVerb(changed), navPath)
 
 	// Plugin (codemap-guard.ts)
 	pluginDir := filepath.Join(os.Getenv("HOME"), ".config", "opencode", "plugins")
@@ -250,10 +340,56 @@ func injectOpencode() error {
 	}
 
 	pluginPath := filepath.Join(pluginDir, "codemap-guard.ts")
-	if err := os.WriteFile(pluginPath, []byte(codemapGuardPlugin), 0644); err != nil {
+	changed, err = writeIfChanged(pluginPath, codemapGuardPlugin)
+	if err != nil {
 		return fmt.Errorf("writing codemap-guard.ts: %w", err)
 	}
-	fmt.Printf("opencode: updated %s\n", pluginPath)
+	fmt.Printf("opencode: %s %s\n", changeVerb(changed), pluginPath)
+
+	return nil
+}
+
+// writeIfChanged writes content to path and reports whether the bytes differed
+// from what was already there, so callers can tell a refreshed install from a
+// no-op run of a stale binary.
+func writeIfChanged(path, content string) (bool, error) {
+	existing, err := os.ReadFile(path)
+	if err == nil && string(existing) == content {
+		return false, nil
+	}
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func changeVerb(changed bool) string {
+	if changed {
+		return "updated"
+	}
+	return "unchanged"
+}
+
+// injectCommandCode installs the guard mod only where Command Code is present,
+// so machines without it are never given a stray ~/.commandcode tree.
+func injectCommandCode() error {
+	baseDir := filepath.Join(os.Getenv("HOME"), ".commandcode")
+	if _, err := os.Stat(baseDir); os.IsNotExist(err) {
+		fmt.Println("commandcode: ~/.commandcode not found, skipping")
+		return nil
+	}
+
+	modDir := filepath.Join(baseDir, "mods")
+	if err := os.MkdirAll(modDir, 0755); err != nil {
+		return fmt.Errorf("creating commandcode mods directory: %w", err)
+	}
+
+	modPath := filepath.Join(modDir, "codemap-guard.ts")
+	changed, err := writeIfChanged(modPath, codemapGuardMod)
+	if err != nil {
+		return fmt.Errorf("writing codemap-guard.ts: %w", err)
+	}
+	fmt.Printf("commandcode: %s %s\n", changeVerb(changed), modPath)
 
 	return nil
 }

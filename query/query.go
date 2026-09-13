@@ -334,6 +334,9 @@ func Show(s *store.Store, qualifiedName string, opts ...Option) (*ShowResult, er
 
 	sym, err := s.SymbolByName(qualifiedName)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, symbolMissError(s, qualifiedName)
+		}
 		return nil, err
 	}
 	if repoMismatch(sym.Repo, options.Repo) {
@@ -1125,6 +1128,77 @@ func extractShortName(qualifiedName string) string {
 	return parts[len(parts)-1]
 }
 
+// symbolMissError turns a lookup miss into an actionable error with near-name
+// candidates so agents recover without a blind second guess.
+func symbolMissError(s *store.Store, qualifiedName string) error {
+	short := qualifiedName
+	if i := strings.LastIndexAny(short, "./"); i >= 0 {
+		short = short[i+1:]
+	}
+	pkgPrefix := ""
+	if i := strings.LastIndex(qualifiedName, "."); i >= 0 {
+		pkgPrefix = qualifiedName[:i]
+	}
+
+	candidates := symbolCandidates(s, short, pkgPrefix)
+	if len(candidates) == 0 {
+		return fmt.Errorf("symbol not found: %s", qualifiedName)
+	}
+	return fmt.Errorf("symbol not found: %s; did you mean: %s",
+		qualifiedName, strings.Join(candidates, ", "))
+}
+
+// symbolCandidates prefers the short-name search and falls back to a
+// qualified-name prefix search when the short name matches nothing (e.g. a
+// package-path-only input).
+func symbolCandidates(s *store.Store, short, pkgPrefix string) []string {
+	syms, err := s.SearchSymbols(short, "", nil, "", false)
+	if err != nil || len(syms) == 0 {
+		syms, err = s.SearchByQualifiedNamePrefix(short, false)
+		if err != nil {
+			return nil
+		}
+	}
+	return rankSymbolCandidates(syms, short, pkgPrefix, 5)
+}
+
+func rankSymbolCandidates(syms []store.Symbol, short, pkgPrefix string, limit int) []string {
+	seen := make(map[string]bool, len(syms))
+	ranked := make([]store.Symbol, 0, len(syms))
+	for _, sym := range syms {
+		if seen[sym.QualifiedName] {
+			continue
+		}
+		seen[sym.QualifiedName] = true
+		ranked = append(ranked, sym)
+	}
+	sort.SliceStable(ranked, func(i, j int) bool {
+		return symbolCandidateRank(ranked[i], short, pkgPrefix) < symbolCandidateRank(ranked[j], short, pkgPrefix)
+	})
+
+	names := make([]string, 0, limit)
+	for _, sym := range ranked {
+		if len(names) == limit {
+			break
+		}
+		names = append(names, sym.QualifiedName)
+	}
+	return names
+}
+
+// symbolCandidateRank orders exact short-name matches first, then candidates in
+// the package prefix the caller supplied, then everything else.
+func symbolCandidateRank(sym store.Symbol, short, pkgPrefix string) int {
+	switch {
+	case sym.Name == short:
+		return 0
+	case pkgPrefix != "" && strings.HasPrefix(sym.QualifiedName, pkgPrefix+"."):
+		return 1
+	default:
+		return 2
+	}
+}
+
 type UnusedSymbol struct {
 	QualifiedName string
 	Kind          string
@@ -1736,7 +1810,10 @@ type SymbolBodyResult struct {
 func GetSymbolBody(s *store.Store, qualifiedName string, contextLines int, includeDoc bool) (*SymbolBodyResult, error) {
 	sym, err := s.SymbolByName(qualifiedName)
 	if err != nil {
-		return nil, fmt.Errorf("symbol not found: %s", qualifiedName)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, symbolMissError(s, qualifiedName)
+		}
+		return nil, err
 	}
 
 	data, startOff, endOff, docStartOff, partOfGroup, groupMembers, err := symbolSpanData(sym.PosFile, sym.PosLine, sym.Receiver, sym.Name, sym.Kind)

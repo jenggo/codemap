@@ -155,15 +155,20 @@ var rawEstimators = map[string]rawEstimator{
 	toolContextBundle: estimateBundleRaw,
 }
 
-// estimateSymbolBodyRaw models the naive alternative for show with source: true:
-// the reader pulls the symbol's declaration plus the requested context window,
-// both already computed by the handler as SymbolBodyResult spans. Rendering
-// adds headers and fences, so a tiny symbol's rendered response can exceed
-// the estimate; those calls clamp to 0% reduction instead of claiming savings.
-func estimateSymbolBodyRaw(_ *store.Store, result any) int64 {
+// estimateSymbolBodyRaw models show with source: true as a whole-file read
+// from the index: without codemap the reader opens the symbol's file, so the
+// raw cost is the indexed file content, not the returned span. Falls back to
+// the returned span cost when the file is unindexed or empty. Non-source
+// results return 0, which recordUsage treats as identity.
+func estimateSymbolBodyRaw(st *store.Store, result any) int64 {
 	body, ok := result.(*query.SymbolBodyResult)
 	if !ok || body == nil {
 		return 0
+	}
+	if st != nil {
+		if content, err := st.FileContent(body.PosFile); err == nil && content != "" {
+			return int64(len(content))
+		}
 	}
 	return int64(len(body.Body) + len(body.ContextBefore) + len(body.ContextAfter))
 }

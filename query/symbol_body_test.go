@@ -129,3 +129,69 @@ func TestGetSymbolBodyInterface(t *testing.T) {
 		t.Errorf("body missing type Reader interface\nbody: %s", result.Body)
 	}
 }
+
+func TestSymbolMissSuggestions(t *testing.T) {
+	s := setupQueryTestStore(t, "../testdata/simple")
+
+	t.Run("show suggests the right package prefix", func(t *testing.T) {
+		_, err := Show(s, "codemap/testdata/wrong.NewParser")
+		if err == nil {
+			t.Fatal("expected error for wrong package prefix")
+		}
+		msg := err.Error()
+		if !strings.Contains(msg, "symbol not found: codemap/testdata/wrong.NewParser") {
+			t.Errorf("miss message lost the requested name: %q", msg)
+		}
+		if !strings.Contains(msg, "did you mean:") || !strings.Contains(msg, "codemap/testdata/simple.NewParser") {
+			t.Errorf("miss message lacks the correct candidate: %q", msg)
+		}
+	})
+
+	t.Run("get_symbol_body suggests the same candidates", func(t *testing.T) {
+		_, err := GetSymbolBody(s, "codemap/testdata/wrong.NewParser", 0, false)
+		if err == nil {
+			t.Fatal("expected error for wrong package prefix")
+		}
+		if !strings.Contains(err.Error(), "did you mean:") || !strings.Contains(err.Error(), "codemap/testdata/simple.NewParser") {
+			t.Errorf("miss message lacks the correct candidate: %q", err)
+		}
+	})
+
+	t.Run("unknown name stays a plain miss", func(t *testing.T) {
+		_, err := GetSymbolBody(s, "codemap/testdata/simple.ZzzNotAThing", 0, false)
+		if err == nil {
+			t.Fatal("expected error for unknown symbol")
+		}
+		if strings.Contains(err.Error(), "did you mean") {
+			t.Errorf("unknown name should not suggest candidates: %q", err)
+		}
+	})
+}
+
+func TestRankSymbolCandidates(t *testing.T) {
+	syms := []store.Symbol{
+		{QualifiedName: "pkg/a.NewParserX", Name: "NewParserX"},
+		{QualifiedName: "pkg/b.NewParser", Name: "NewParser"},
+		{QualifiedName: "pkg/b.NewParser", Name: "NewParser"},
+		{QualifiedName: "pkg/b.OtherParser", Name: "OtherParser"},
+	}
+
+	got := rankSymbolCandidates(syms, "NewParser", "pkg/b", 5)
+	if len(got) != 3 {
+		t.Fatalf("candidates = %v, want 3 unique", got)
+	}
+	if got[0] != "pkg/b.NewParser" {
+		t.Errorf("exact short-name match must rank first, got %v", got)
+	}
+	if got[1] != "pkg/b.OtherParser" {
+		t.Errorf("same-package match must rank before unrelated matches, got %v", got)
+	}
+	if got[2] != "pkg/a.NewParserX" {
+		t.Errorf("unrelated match must rank last, got %v", got)
+	}
+
+	capped := rankSymbolCandidates(syms, "NewParser", "", 2)
+	if len(capped) != 2 {
+		t.Errorf("cap not applied: %v", capped)
+	}
+}
