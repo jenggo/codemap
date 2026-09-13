@@ -589,52 +589,42 @@ func (s *Server) toolHandlers() map[string]toolHandler {
 
 func queryHandlers() map[string]toolHandler {
 	return map[string]toolHandler{
-		"overview":                  handleOverview,
-		"show":                      handleShow,
-		toolCallersOf:               handleCallersOf,
-		toolCalleesOf:               handleCalleesOf,
-		"search":                    handleSearch,
-		keyToolPackage:              handlePackage,
-		"methods_of":                handleMethodsOf,
-		"importers_of":              handleImportersOf,
-		"imports_of":                handleImportsOf,
-		"edges_by_type":             handleEdgesByType,
-		"all_edges":                 handleAllEdges,
-		"list_packages":             handleListPackages,
-		"type_usage":                handleTypeUsage,
-		"transitive_imports":        handleTransitiveImports,
-		"search_prefix":             handleSearchPrefix,
-		"find_path":                 handleFindPath,
-		"method_search":             handleMethodSearch,
-		"interface_impls":           handleInterfaceImpls,
-		"unused":                    handleUnused,
-		toolCycles:                  handleCycles,
-		"symbols_in_file":           handleSymbolsInFile,
-		toolBlastRadius:             handleBlastRadius,
-		toolSymbolBody:              handleSymbolBody,
-		"dependency_layers":         handleDependencyLayers,
-		"dependency_flow":           handleDependencyFlow,
-		"entry_points":              handleEntryPoints,
-		"changed_symbols":           handleChangedSymbols,
-		"search_text":               handleSearchText,
-		toolContextBundle:           handleContextBundle,
-		"get_hotspots":              handleHotspots,
-		"get_symbol_importance":     handleSymbolImportance,
-		"health":                    handleHealth,
-		"codemap_health":            handleHealth,
-		"workspace_changed_symbols": handleWorkspaceChangedSymbols,
-		toolContracts:               handleContracts,
-		"contract_drift":            handleContractDrift,
-		"runtime_contracts":         handleRuntimeContracts,
-		"suppress_contract":         handleSuppressContract,
-		responseSectionTool:         handleReadResponseSection,
+		"overview":          handleOverview,
+		toolShow:            handleShow,
+		toolCallersOf:       handleCallersOf,
+		toolCalleesOf:       handleCalleesOf,
+		"search":            handleSearch,
+		keyToolPackage:      handlePackage,
+		"methods_of":        handleMethodsOf,
+		"imports_of":        handleImportsOf,
+		"all_edges":         handleAllEdges,
+		"type_usage":        handleTypeUsage,
+		"find_path":         handleFindPath,
+		"interface_impls":   handleInterfaceImpls,
+		"unused":            handleUnused,
+		toolCycles:          handleCycles,
+		"symbols_in_file":   handleSymbolsInFile,
+		toolBlastRadius:     handleBlastRadius,
+		"dependency_flow":   handleDependencyFlow,
+		"entry_points":      handleEntryPoints,
+		"changed_symbols":   handleChangedSymbols,
+		"search_text":       handleSearchText,
+		toolContextBundle:   handleContextBundle,
+		toolHotspots:        handleHotspots,
+		"health":            handleHealth,
+		"codemap_health":    handleHealth,
+		toolContracts:       handleContracts,
+		"contract_drift":    handleContractDrift,
+		"runtime_contracts": handleRuntimeContracts,
+		"suppress_contract": handleSuppressContract,
+		responseSectionTool: handleReadResponseSection,
 	}
 }
 
 // primaryArg guesses the symbol/package name a tool call is about, so a missed
 // lookup can be attributed to a missing repo rather than silent absence.
 func primaryArg(args map[string]any) string {
-	for _, k := range []string{keyQualifiedName, keyPattern, "package_path", keyPath, keyTypeName, "prefix", "method_name", "interface_name", "from", "to"} {
+	for _, k := range []string{keyQualifiedName, keyPattern, keyPackagePath, keyPath, keyTypeName, "interface_name", "from", "to", keyFilePath} {
 		if v, ok := args[k].(string); ok && v != "" {
 			return v
 		}
@@ -669,9 +659,24 @@ func handleOverview(st *store.Store, opts []query.Option, renderOpts []render.Op
 }
 
 func handleShow(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
-	qn := requiredString(args, "qualified_name")
+	qn := requiredString(args, keyQualifiedName)
 	if qn == "" {
 		return errQualifiedNameRequired, nil, true
+	}
+	if b, ok := args[keySource].(bool); ok && b {
+		contextLines := 0
+		if v, ok := args[keyContextLines].(float64); ok && v > 0 {
+			contextLines = int(v)
+		}
+		includeDoc := true
+		if b2, ok := args[keyIncludeDoc].(bool); ok {
+			includeDoc = b2
+		}
+		result, err := query.GetSymbolBody(st, qn, contextLines, includeDoc)
+		if err != nil {
+			return fmt.Sprintf("Error: %v", err), nil, true
+		}
+		return render.RenderSymbolBody(result, renderOpts...), result, false
 	}
 	result, err := query.Show(st, qn, opts...)
 	if err != nil {
@@ -722,20 +727,31 @@ func healthNotice(st *store.Store) string {
 }
 
 func handleSearch(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
-	pattern := requiredString(args, "pattern")
-	if pattern == "" {
-		return errPatternRequired, nil, true
+	mode := searchModeSubstring
+	if v, ok := args[keyMode].(string); ok && v != "" {
+		mode = v
 	}
-	if v, ok := args[keyKind].(string); ok && v != "" {
-		opts = append(opts, query.WithKind(v))
+	var results []query.SearchResult
+	var err error
+	switch mode {
+	case searchModePrefix:
+		results, err = query.SearchByPrefix(st, requiredString(args, keyPattern), opts...)
+	case searchModeMethod:
+		results, err = query.MethodSearch(st, requiredString(args, keyPattern), opts...)
+	case searchModeSubstring:
+		if v, ok := args[keyKind].(string); ok && v != "" {
+			opts = append(opts, query.WithKind(v))
+		}
+		if b, ok := args["exported"].(bool); ok {
+			opts = append(opts, query.WithExported(b))
+		}
+		if v, ok := args["file"].(string); ok && v != "" {
+			opts = append(opts, query.WithFile(v))
+		}
+		results, err = query.Search(st, requiredString(args, keyPattern), opts...)
+	default:
+		return fmt.Sprintf("Error: mode must be one of [%s, %s, %s], got %q", searchModeSubstring, searchModePrefix, searchModeMethod, mode), nil, true
 	}
-	if b, ok := args["exported"].(bool); ok {
-		opts = append(opts, query.WithExported(b))
-	}
-	if v, ok := args["file"].(string); ok && v != "" {
-		opts = append(opts, query.WithFile(v))
-	}
-	results, err := query.Search(st, pattern, opts...)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err), nil, true
 	}
@@ -746,9 +762,13 @@ func handleSearch(st *store.Store, opts []query.Option, renderOpts []render.Opti
 }
 
 func handlePackage(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
-	pkgPath := requiredString(args, "path")
+	pkgPath := requiredString(args, keyPath)
 	if pkgPath == "" {
-		return "Error: path is required", nil, true
+		pkgs, err := query.ListPackages(st, opts...)
+		if err != nil {
+			return fmt.Sprintf("Error: %v", err), nil, true
+		}
+		return render.RenderListPackages(pkgs, renderOpts...), pkgs, false
 	}
 	if b, ok := args["include_unexported"].(bool); ok && b {
 		opts = append(opts, query.WithUnexported())
@@ -775,56 +795,48 @@ func handleMethodsOf(st *store.Store, opts []query.Option, renderOpts []render.O
 	return render.RenderMethodsOf(methods, renderOpts...), methods, false
 }
 
-func handleImportersOf(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
-	pkgPath := requiredString(args, "package_path")
-	if pkgPath == "" {
-		return errPackagePathRequired, nil, true
-	}
-	edges, err := query.ImportersOf(st, pkgPath, opts...)
-	if err != nil {
-		return fmt.Sprintf("Error: %v", err), nil, true
-	}
-	return render.RenderEdges(edges, renderOpts...), edges, false
-}
-
 func handleImportsOf(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
-	pkgPath := requiredString(args, "package_path")
+	pkgPath := requiredString(args, keyPackagePath)
 	if pkgPath == "" {
 		return errPackagePathRequired, nil, true
 	}
-	edges, err := query.ImportsOf(st, pkgPath, opts...)
+	direction := importDirectionOut
+	if v, ok := args[keyDirection].(string); ok && v != "" {
+		direction = v
+	}
+	var edges []query.EdgeDetail
+	var err error
+	switch direction {
+	case "in":
+		edges, err = query.ImportersOf(st, pkgPath, opts...)
+	case importDirectionOut:
+		if b, ok := args[keyTransitive].(bool); ok && b {
+			edges, err = query.TransitiveImports(st, pkgPath, opts...)
+		} else {
+			edges, err = query.ImportsOf(st, pkgPath, opts...)
+		}
+	default:
+		return fmt.Sprintf("Error: direction must be one of [in, out], got %q", direction), nil, true
+	}
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err), nil, true
 	}
 	return render.RenderEdges(edges, renderOpts...), edges, false
 }
 
-func handleEdgesByType(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
-	edgeType := requiredString(args, "edge_type")
-	if edgeType == "" {
-		return errEdgeTypeRequired, nil, true
+func handleAllEdges(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
+	if edgeType := requiredString(args, keyEdgeType); edgeType != "" {
+		edges, err := query.EdgesByType(st, edgeType, opts...)
+		if err != nil {
+			return fmt.Sprintf("Error: %v", err), nil, true
+		}
+		return render.RenderEdges(edges, renderOpts...), edges, false
 	}
-	edges, err := query.EdgesByType(st, edgeType, opts...)
-	if err != nil {
-		return fmt.Sprintf("Error: %v", err), nil, true
-	}
-	return render.RenderEdges(edges, renderOpts...), edges, false
-}
-
-func handleAllEdges(st *store.Store, opts []query.Option, renderOpts []render.Option, _ map[string]any) (string, any, bool) {
 	edges, err := query.AllEdges(st, opts...)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err), nil, true
 	}
 	return render.RenderEdges(edges, renderOpts...), edges, false
-}
-
-func handleListPackages(st *store.Store, opts []query.Option, renderOpts []render.Option, _ map[string]any) (string, any, bool) {
-	pkgs, err := query.ListPackages(st, opts...)
-	if err != nil {
-		return fmt.Sprintf("Error: %v", err), nil, true
-	}
-	return render.RenderListPackages(pkgs, renderOpts...), pkgs, false
 }
 
 func handleTypeUsage(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
@@ -833,33 +845,6 @@ func handleTypeUsage(st *store.Store, opts []query.Option, renderOpts []render.O
 		return errTypeNameRequired, nil, true
 	}
 	results, err := query.TypeUsage(st, typeName, opts...)
-	if err != nil {
-		return fmt.Sprintf("Error: %v", err), nil, true
-	}
-	if len(results) == 0 {
-		return healthNotice(st), nil, false
-	}
-	return render.RenderSearch(results, renderOpts...), results, false
-}
-
-func handleTransitiveImports(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
-	pkgPath := requiredString(args, "package_path")
-	if pkgPath == "" {
-		return errPackagePathRequired, nil, true
-	}
-	edges, err := query.TransitiveImports(st, pkgPath, opts...)
-	if err != nil {
-		return fmt.Sprintf("Error: %v", err), nil, true
-	}
-	return render.RenderEdges(edges, renderOpts...), edges, false
-}
-
-func handleSearchPrefix(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
-	prefix := requiredString(args, "prefix")
-	if prefix == "" {
-		return errPrefixRequired, nil, true
-	}
-	results, err := query.SearchByPrefix(st, prefix, opts...)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err), nil, true
 	}
@@ -896,21 +881,6 @@ func handleFindPath(st *store.Store, opts []query.Option, renderOpts []render.Op
 		return fmt.Sprintf("Error: %v", err), nil, true
 	}
 	return string(data), path, false
-}
-
-func handleMethodSearch(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
-	methodName := requiredString(args, "method_name")
-	if methodName == "" {
-		return "Error: method_name is required", nil, true
-	}
-	results, err := query.MethodSearch(st, methodName, opts...)
-	if err != nil {
-		return fmt.Sprintf("Error: %v", err), nil, true
-	}
-	if len(results) == 0 {
-		return healthNotice(st), nil, false
-	}
-	return render.RenderSearch(results, renderOpts...), results, false
 }
 
 func handleInterfaceImpls(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
@@ -958,7 +928,7 @@ func handleCycles(st *store.Store, opts []query.Option, renderOpts []render.Opti
 }
 
 func handleSymbolsInFile(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
-	filePath := requiredString(args, "file_path")
+	filePath := requiredString(args, keyFilePath)
 	if filePath == "" {
 		return "Error: file_path is required", nil, true
 	}
@@ -989,44 +959,23 @@ func handleBlastRadius(st *store.Store, opts []query.Option, renderOpts []render
 	return string(data), result, false
 }
 
-func handleSymbolBody(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
-	qn := requiredString(args, "qualified_name")
-	if qn == "" {
-		return errQualifiedNameRequired, nil, true
-	}
-	contextLines := 0
-	if v, ok := args[keyContextLines].(float64); ok && v > 0 {
-		contextLines = int(v)
-	}
-	includeDoc := true
-	if b, ok := args["include_doc"].(bool); ok {
-		includeDoc = b
-	}
-	result, err := query.GetSymbolBody(st, qn, contextLines, includeDoc)
-	if err != nil {
-		return fmt.Sprintf("Error: %v", err), nil, true
-	}
-	return render.RenderSymbolBody(result, renderOpts...), result, false
-}
-
-func handleDependencyLayers(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
-	topHubs := 5
-	if v, ok := args["top_hubs"].(float64); ok && v > 0 {
-		topHubs = int(v)
-	}
-	includeTests := false
-	if b, ok := args["include_tests"].(bool); ok {
-		includeTests = b
-	}
-	result, err := query.DependencyLayers(st, includeTests, topHubs)
-	if err != nil {
-		return fmt.Sprintf("Error: %v", err), nil, true
-	}
-	return render.RenderDependencyLayers(result, renderOpts...), result, false
-}
-
 func handleDependencyFlow(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
-	pkgPath := requiredString(args, "package_path")
+	if b, ok := args[keyLayers].(bool); ok && b {
+		topHubs := 5
+		if v, ok := args["top_hubs"].(float64); ok && v > 0 {
+			topHubs = int(v)
+		}
+		includeTests := false
+		if b2, ok := args[keyIncludeTests].(bool); ok {
+			includeTests = b2
+		}
+		result, err := query.DependencyLayers(st, includeTests, topHubs)
+		if err != nil {
+			return fmt.Sprintf("Error: %v", err), nil, true
+		}
+		return render.RenderDependencyLayers(result, renderOpts...), result, false
+	}
+	pkgPath := requiredString(args, keyPackagePath)
 	if pkgPath == "" {
 		return errPackagePathRequired, nil, true
 	}
@@ -1058,6 +1007,28 @@ func handleEntryPoints(st *store.Store, _ []query.Option, renderOpts []render.Op
 }
 
 func handleChangedSymbols(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
+	withBlast := true
+	if b, ok := args["with_blast_radius"].(bool); ok {
+		withBlast = b
+	}
+	includeBodies := false
+	if b, ok := args["include_bodies"].(bool); ok {
+		includeBodies = b
+	}
+	includeTests := false
+	if b, ok := args["include_tests"].(bool); ok {
+		includeTests = b
+	}
+	if compact, ok := args["compact"].(bool); ok && compact {
+		renderOpts = append(renderOpts, render.WithFormat(render.FormatCompact))
+	}
+	if b, ok := args[keyWorkspace].(bool); ok && b {
+		result, err := query.WorkspaceChangedSymbols(st, withBlast, includeBodies, includeTests)
+		if err != nil {
+			return fmt.Sprintf("Error: %v", err), nil, true
+		}
+		return render.RenderChangedSymbols(result, renderOpts...), result, false
+	}
 	ref := ""
 	if v, ok := args["ref"].(string); ok && v != "" {
 		ref = v
@@ -1066,45 +1037,7 @@ func handleChangedSymbols(st *store.Store, _ []query.Option, renderOpts []render
 	if v, ok := args["repo_dir"].(string); ok && v != "" {
 		repoDir = v
 	}
-	withBlast := true
-	if b, ok := args["with_blast_radius"].(bool); ok {
-		withBlast = b
-	}
-	includeBodies := false
-	if b, ok := args["include_bodies"].(bool); ok {
-		includeBodies = b
-	}
-	includeTests := false
-	if b, ok := args["include_tests"].(bool); ok {
-		includeTests = b
-	}
-	if compact, ok := args["compact"].(bool); ok && compact {
-		renderOpts = append(renderOpts, render.WithFormat(render.FormatCompact))
-	}
 	result, err := query.ChangedSymbols(st, repoDir, ref, withBlast, includeBodies, includeTests)
-	if err != nil {
-		return fmt.Sprintf("Error: %v", err), nil, true
-	}
-	return render.RenderChangedSymbols(result, renderOpts...), result, false
-}
-
-func handleWorkspaceChangedSymbols(st *store.Store, _ []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
-	withBlast := true
-	if b, ok := args["with_blast_radius"].(bool); ok {
-		withBlast = b
-	}
-	includeBodies := false
-	if b, ok := args["include_bodies"].(bool); ok {
-		includeBodies = b
-	}
-	includeTests := false
-	if b, ok := args["include_tests"].(bool); ok {
-		includeTests = b
-	}
-	if compact, ok := args["compact"].(bool); ok && compact {
-		renderOpts = append(renderOpts, render.WithFormat(render.FormatCompact))
-	}
-	result, err := query.WorkspaceChangedSymbols(st, withBlast, includeBodies, includeTests)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err), nil, true
 	}
@@ -1385,13 +1318,15 @@ const (
 )
 
 const (
-	toolBlastRadius   = "blast_radius"
-	toolCallersOf     = "callers_of"
-	toolCalleesOf     = "callees_of"
-	toolContextBundle = "get_context_bundle"
-	toolContracts     = "contracts"
-	toolCycles        = "cycles"
-	toolSymbolBody    = "get_symbol_body"
+	toolBlastRadius    = "blast_radius"
+	toolCallersOf      = "callers_of"
+	toolCalleesOf      = "callees_of"
+	toolContextBundle  = "get_context_bundle"
+	toolContracts      = "contracts"
+	toolCycles         = "cycles"
+	toolShow           = "show"
+	toolHotspots       = "get_hotspots"
+	importDirectionOut = "out"
 )
 
 var (
@@ -1401,6 +1336,9 @@ var (
 	validDirections   = []string{"producer", "consumer", "shared"}
 	validRuntimeKinds = []string{"redis", "jetstream", "ws_type"}
 	validHeuristics   = []string{"main", "test", "uncalled_exported", "handler_sig", "handler_name"}
+	validImportDirs   = []string{"in", importDirectionOut}
+	validSearchModes  = []string{searchModeSubstring, searchModePrefix, searchModeMethod}
+	validRankModes    = []string{hotspotModeChurn, hotspotModePagerank}
 )
 
 // intArgSpec documents one validated integer argument for a tool.
@@ -1426,17 +1364,16 @@ type enumArgSpec struct {
 }
 
 var toolIntArgs = map[string][]intArgSpec{
-	toolCallersOf:           {{key: keyDepth, min: 1, max: 100}},
-	toolCalleesOf:           {{key: keyDepth, min: 1, max: 100}},
-	toolBlastRadius:         {{key: keyDepth, min: 1, max: 100}},
-	"find_path":             {{key: "max_depth", min: 1, max: 100}},
-	"get_hotspots":          {{key: keyTopN, min: 1, max: 500}, {key: "min_complexity", min: 0, max: 1_000_000}, {key: "min_churn", min: 0, max: 1_000_000}},
-	"get_symbol_importance": {{key: keyTopN, min: 1, max: 500}, {key: "scope", min: 0, max: 1_000_000}},
-	"dependency_layers":     {{key: "top_hubs", min: 1, max: 500}},
-	"search_text":           {{key: keyContextLines, min: 0, max: 500}},
-	toolSymbolBody:          {{key: keyContextLines, min: 0, max: 500}},
-	toolContextBundle:       {{key: "token_budget", min: 1, max: 1_000_000}},
-	responseSectionTool:     {{key: "section", min: 0, max: 1_000_000}, {key: "limit", min: 1, max: 100}},
+	toolCallersOf:       {{key: keyDepth, min: 1, max: 100}},
+	toolCalleesOf:       {{key: keyDepth, min: 1, max: 100}},
+	toolBlastRadius:     {{key: keyDepth, min: 1, max: 100}},
+	"find_path":         {{key: "max_depth", min: 1, max: 100}},
+	"get_hotspots":      {{key: keyTopN, min: 1, max: 500}, {key: "min_complexity", min: 0, max: 1_000_000}, {key: "min_churn", min: 0, max: 1_000_000}, {key: "scope", min: 0, max: 1_000_000}},
+	"dependency_flow":   {{key: "top_hubs", min: 1, max: 500}},
+	"search_text":       {{key: keyContextLines, min: 0, max: 500}},
+	"show":              {{key: keyContextLines, min: 0, max: 500}},
+	toolContextBundle:   {{key: "token_budget", min: 1, max: 1_000_000}},
+	responseSectionTool: {{key: "section", min: 0, max: 1_000_000}, {key: "limit", min: 1, max: 100}},
 }
 
 var toolFloatArgs = map[string][]floatArgSpec{
@@ -1446,9 +1383,11 @@ var toolFloatArgs = map[string][]floatArgSpec{
 var toolEnumArgs = map[string][]enumArgSpec{
 	toolCallersOf:       {{key: keyEdgeTypes, allowed: validEdgeTypes, slice: true}},
 	toolCalleesOf:       {{key: keyEdgeTypes, allowed: validEdgeTypes, slice: true}},
-	"search":            {{key: keyKind, allowed: validKinds}},
-	"edges_by_type":     {{key: "edge_type", allowed: validEdgeTypes}},
-	toolCycles:          {{key: "edge_type", allowed: validEdgeTypes}},
+	"search":            {{key: keyKind, allowed: validKinds}, {key: keyMode, allowed: validSearchModes}},
+	"all_edges":         {{key: keyEdgeType, allowed: validEdgeTypes}},
+	toolCycles:          {{key: keyEdgeType, allowed: validEdgeTypes}},
+	"imports_of":        {{key: keyDirection, allowed: validImportDirs}},
+	toolHotspots:        {{key: keyMode, allowed: validRankModes}},
 	toolContracts:       {{key: keyDirection, allowed: validDirections}, {key: keySeverity, allowed: validSeverities}},
 	"contract_drift":    {{key: keySeverity, allowed: validSeverities}},
 	"runtime_contracts": {{key: keyKind, allowed: validRuntimeKinds}},
@@ -1586,8 +1525,6 @@ const (
 	errPackagePathRequired   = "Error: package_path is required"
 	errEdgeTypeRequired      = "Error: edge_type is required"
 	errTypeNameRequired      = "Error: type_name is required"
-	errPrefixRequired        = "Error: prefix is required"
-	errPatternRequired       = "Error: pattern is required"
 )
 
 const (
@@ -1616,6 +1553,22 @@ const (
 	keyTopN          = "top_n"
 	keyContextLines  = "context_lines"
 	keyEdgeTypes     = "edge_types"
+	keyFilePath      = "file_path"
+	keyMode          = "mode"
+	keySource        = "source"
+	keyIncludeDoc    = "include_doc"
+	keyTransitive    = "transitive"
+	keyLayers        = "layers"
+	keyWorkspace     = "workspace"
+)
+
+const (
+	searchModeSubstring = "substring"
+	searchModePrefix    = "prefix"
+	searchModeMethod    = "method"
+
+	hotspotModeChurn    = "churn"
+	hotspotModePagerank = "pagerank"
 )
 
 const (
@@ -1926,6 +1879,21 @@ func handleHotspots(st *store.Store, qOpts []query.Option, rOpts []render.Option
 	if v, ok := args[keyTopN].(float64); ok {
 		topN = int(v)
 	}
+	mode := hotspotModeChurn
+	if v, ok := args[keyMode].(string); ok && v != "" {
+		mode = v
+	}
+	if mode == hotspotModePagerank {
+		scope := 0
+		if v, ok := args["scope"].(float64); ok {
+			scope = int(v)
+		}
+		entries, err := query.SymbolImportance(st, topN, scope, qOpts...)
+		if err != nil {
+			return fmt.Sprintf("Error: %v", err), nil, true
+		}
+		return render.RenderImportance(entries, rOpts...), entries, false
+	}
 	minComplexity := 0
 	if v, ok := args["min_complexity"].(float64); ok {
 		minComplexity = int(v)
@@ -1941,22 +1909,6 @@ func handleHotspots(st *store.Store, qOpts []query.Option, rOpts []render.Option
 	return render.RenderHotspots(hotspots, rOpts...), hotspots, false
 }
 
-func handleSymbolImportance(st *store.Store, qOpts []query.Option, rOpts []render.Option, args map[string]any) (string, any, bool) {
-	topN := 10
-	if v, ok := args[keyTopN].(float64); ok {
-		topN = int(v)
-	}
-	scope := 0
-	if v, ok := args["scope"].(float64); ok {
-		scope = int(v)
-	}
-	entries, err := query.SymbolImportance(st, topN, scope, qOpts...)
-	if err != nil {
-		return fmt.Sprintf("Error: %v", err), nil, true
-	}
-	return render.RenderImportance(entries, rOpts...), entries, false
-}
-
 func buildToolsList() []map[string]any {
 	tools := make([]map[string]any, 0, 14)
 	tools = append(tools, indexTools()...)
@@ -1970,42 +1922,45 @@ func buildToolsList() []map[string]any {
 func indexTools() []map[string]any {
 	return []map[string]any{
 		toolDef("index",
-			"Index the Go repository at the given path (or the workspace declared by its codemap.yaml). Indexing happens automatically on first tool call, so this is only needed to force a full re-index. Returns the number of packages, symbols, and edges indexed.",
+			"Index the repo at path (or its codemap.yaml workspace). Automatic on first tool call; this forces a full re-index. Returns package/symbol/edge counts.",
 			map[string]any{
-				"path": stringProp("Absolute or relative path to the Go repository root. Defaults to current directory."),
+				"path": stringProp("Repository root; defaults to current directory."),
 			}),
 		toolDef("health",
-			"Source of truth for index freshness: per-repo state (indexed/stale/missing) and indexed_at. Use when results look stale or a query misses a symbol you expect to exist.",
+			"Per-repo index freshness: indexed/stale/missing state and indexed_at. Call when results look stale or an expected symbol is missing.",
 			map[string]any{}),
 		toolDef("overview",
-			"Get a bird's-eye architecture summary of all indexed Go packages: each package's path, exported symbols with signatures, and import counts. Use instead of reading multiple files to understand project structure.",
+			"Architecture summary of all indexed Go packages: paths, exported symbols with signatures, import counts.",
 			map[string]any{
 				keyIncludeTests: boolProp("Include test packages and symbols"),
 				"full_docs":     boolProp("Show full documentation instead of first sentence"),
 			}),
-		toolDef("show",
-			"Get full details for a Go symbol: file path, line number, type signature, documentation, and all call relationships (who calls it and what it calls). Incoming and outgoing edges are deduplicated per (from, to, type) pair and include aggregated sites and site counts. Use instead of reading source files when you need symbol context and relationships. Requires a fully qualified name like 'fmt.Println' or 'encoding/json.Decoder.Decode'.",
+		toolDef(toolShow,
+			"Symbol details: file:line, signature, docs, deduplicated call relationships with call sites. source: true returns raw declaration text instead.",
 			map[string]any{
 				keyQualifiedName: stringProp("Fully qualified symbol name (e.g., cli/codemap/extract.Run)"),
-				"full_docs":      boolProp("Show full documentation instead of first sentence"),
+				keySource:        boolProp("Return raw source text (default false)"),
+				keyContextLines:  intProp("Context lines (source mode, default 0)"),
+				keyIncludeDoc:    boolProp("Prepend doc comment (source mode, default true)"),
+				"full_docs":      boolProp("Full docs instead of first sentence"),
 				keyRepo:          repoProp(),
 			},
 			"qualified_name"),
 		toolDef(toolCallersOf,
-			"Find all callers of a Go function, method, or type: returns caller names, file paths, line numbers, edge types (calls, references, satisfies, embeds, imports), aggregated sites, and site counts. Edges are deduplicated per (from, to, type) pair; each edge carries an aggregated list of distinct call sites. For interfaces, this returns types that implement the interface (satisfies edges). Use instead of grep for tracing call sites and understanding where a symbol is used.",
+			"All callers of a function, method, or type; for interfaces, implementers via satisfies edges. Deduplicated edges with file:line and call sites.",
 			map[string]any{
 				keyQualifiedName: stringProp("Fully qualified symbol name"),
-				keyEdgeTypes:     stringArrayProp("Optional filter for specific edge types (e.g., calls, references, satisfies, embeds, imports)"),
-				keyDepth:         intProp("Traversal depth for transitive callers (default: 1 = direct only)"),
+				keyEdgeTypes:     stringArrayProp("Optional edge-type filter (calls, references, satisfies, embeds, imports)"),
+				keyDepth:         intProp("Traversal depth (default 1 = direct)"),
 				keyRepo:          repoProp(),
 			},
 			"qualified_name"),
 		toolDef(toolCalleesOf,
-			"Find all functions and methods called by a Go symbol: returns callee names, file paths, line numbers, edge types (calls, references, satisfies, embeds, imports), aggregated sites, and site counts. Edges are deduplicated per (from, to, type) pair; each edge carries an aggregated list of distinct call sites. For types, this returns embedded types and implemented interfaces. Use to trace dependencies and understand what a function relies on.",
+			"Everything a Go symbol calls; for types, embedded types and implemented interfaces. Deduplicated edges with file:line and call sites.",
 			map[string]any{
 				keyQualifiedName: stringProp("Fully qualified symbol name"),
-				keyEdgeTypes:     stringArrayProp("Optional filter for specific edge types (e.g., calls, references, satisfies, embeds, imports)"),
-				keyDepth:         intProp("Traversal depth for transitive callees (default: 1 = direct only)"),
+				keyEdgeTypes:     stringArrayProp("Optional edge-type filter (calls, references, satisfies, embeds, imports)"),
+				keyDepth:         intProp("Traversal depth (default 1 = direct)"),
 				keyRepo:          repoProp(),
 			},
 			"qualified_name"),
@@ -2026,7 +1981,7 @@ func queryTools() []map[string]any {
 func schemaTools() []map[string]any {
 	return []map[string]any{
 		toolDef("schema",
-			"Returns the schema of all result types returned by codemap tools. Call this first to understand the structure of responses before interpreting results.",
+			"Schema of all codemap result types. Call first to understand response structure before interpreting results.",
 			map[string]any{}),
 	}
 }
@@ -2034,92 +1989,75 @@ func schemaTools() []map[string]any {
 func symbolTools() []map[string]any {
 	return []map[string]any{
 		toolDef("package",
-			"Get all exported (or unexported) symbols for a single Go package: names, kinds, signatures, receivers, file paths, line numbers, and documentation. Use instead of reading package files one by one to understand a package's API.",
+			"Get one Go package's symbols (names, kinds, signatures, receivers, file:line, docs). Without path, lists all indexed packages with import paths and symbol counts.",
 			map[string]any{
-				"path":               stringProp("Package import path"),
+				keyPath:              stringProp("Package import path; omit to list all packages"),
 				"include_unexported": boolProp("Include unexported symbols"),
+				keyIncludeTests:      boolProp("Include test packages (list mode only)"),
 				keyRepo:              repoProp(),
-			},
-			"path"),
+			}),
 		toolDef("methods_of",
-			"Find all methods on a Go type by its short name (e.g., 'Server', 'Store'). Returns each method's qualified name, signature, file path, line number, and documentation. Use instead of grep when you need a type's full method set.",
+			"Find all methods on a Go type by its short name (e.g., 'Server'): qualified names, signatures, file:line, docs.",
 			map[string]any{
 				keyTypeName: stringProp("Short type name (e.g., Store)"),
 				keyRepo:     repoProp(),
 			},
 			"type_name"),
 		toolDef("search",
-			"Search Go symbols (functions, types, methods, interfaces, constants, variables) by name. Returns qualified names, file paths, line numbers, signatures, and documentation. More precise than grep for finding Go symbol definitions and declarations. Use this when you know a symbol name but not its location. Returns both exported and unexported symbols by default.",
+			"Search Go symbols (functions, types, methods, interfaces, consts, vars) by name: qualified names, file:line, signatures, docs. mode: substring (default) matches anywhere, prefix matches qualified-name starts, method finds methods with that name across all types.",
 			map[string]any{
-				keyPattern:      stringProp("Search pattern (case-insensitive substring match)"),
+				keyPattern:      stringProp("Pattern (case-insensitive; semantics per mode)"),
+				keyMode:         stringProp("substring (default), prefix, or method"),
 				keyIncludeTests: boolProp("Include test packages and symbols"),
-				keyKind:         stringProp("Filter by symbol kind (e.g., function, method, type, const, var, interface)"),
-				"exported":      boolProp("Filter by exported status: true for exported-only, false for unexported-only. Omit to include both."),
-				"file":          stringProp("Filter by file path (substring match on pos_file, e.g., 'server.go' or 'mcp/')"),
+				keyKind:         stringProp("Symbol kind filter (substring mode)"),
+				"exported":      boolProp("true = exported-only, false = unexported-only (substring mode)"),
+				"file":          stringProp("File-path substring filter (substring mode)"),
 				keyRepo:         repoProp(),
 			},
 			"pattern"),
-		toolDef("list_packages",
-			"List all indexed Go packages with their import paths, names, and symbol counts. Use to discover what packages exist in the codebase before diving into specific symbols.",
-			map[string]any{
-				keyIncludeTests: boolProp("Include test packages"),
-			}),
 	}
 }
 
 func graphTools() []map[string]any {
 	return []map[string]any{
-		toolDef("importers_of",
-			"Find all Go packages that import the given package. Returns package paths and line numbers. Use to understand a package's downstream dependents and blast radius of changes.",
-			map[string]any{
-				keyPackagePath: stringProp("Package import path"),
-				"repo":         repoProp(),
-			},
-			"package_path"),
 		toolDef("imports_of",
-			"Find all packages imported by the given Go package. Returns import paths and line numbers. Use to understand a package's upstream dependencies.",
+			"Package import edges with file:line: direction \"out\" (default) = what it imports, \"in\" = importers; transitive: true walks the full tree (out only).",
 			map[string]any{
 				keyPackagePath: stringProp("Package import path"),
-				"repo":         repoProp(),
+				keyDirection:   stringProp("\"out\" (default) = imports, \"in\" = importers"),
+				keyTransitive:  boolProp("Direct + indirect imports (out only)"),
+				keyRepo:        repoProp(),
 			},
 			"package_path"),
-		toolDef("edges_by_type",
-			"List all edges of a specific relationship type (calls, references, satisfies, embeds, imports) across the entire indexed codebase. Edges are deduplicated per (from, to, type) pair and include aggregated sites and site counts. Use to trace a specific category of relationships globally.",
-			map[string]any{
-				keyEdgeType: stringProp("Edge type to filter by (e.g., calls, references, satisfies, embeds, imports)"),
-			},
-			"edge_type"),
 		toolDef("all_edges",
-			"List every relationship edge in the indexed codebase. Returns from/to symbol references, edge types, and source locations. Intended for bulk analysis; prefer callers_of or callees_of for targeted queries.",
-			map[string]any{}),
-		toolDef("search_text",
-			"Search file contents using a fused multi-strategy match: a ranked FTS5 pass merged with a case-insensitive substring scan (Reciprocal Rank Fusion), proximity-reranked so terms occurring close together rank first, with Levenshtein typo correction noted via corrected_terms. A top-level | in a literal pattern alternates (A B|C means (A AND B) OR C); other regex syntax is inert. When a literal search matches nothing and the pattern contains regex metacharacters, the response carries a hint to retry with is_regex: true. Regex mode bypasses fusion. Returns matching file paths, line numbers, and context lines. Use for finding text patterns in source code.",
+			"All relationship edges (calls, references, satisfies, embeds, imports), deduplicated per (from,to,type) with aggregated sites; optional edge_type filter. Bulk tool — prefer callers_of/callees_of when targeted.",
 			map[string]any{
-				keyPattern:      stringProp("Search pattern (FTS5 query or regex)"),
-				"file_pattern":  stringProp("File path filter pattern (substring match, optional)"),
-				"is_regex":      boolProp("Use regex mode instead of FTS5 (default false)"),
-				keyContextLines: intProp("Number of context lines around each match (default 0)"),
+				keyEdgeType: stringProp("Optional edge-type filter"),
+			}),
+		toolDef("search_text",
+			"Fused file-content search: FTS5 merged with substring scan (RRF), proximity-reranked, typos corrected via corrected_terms. Top-level | alternates (A B|C = (A AND B) OR C); other regex syntax is inert — a no-hit literal with metacharacters hints is_regex: true.",
+			map[string]any{
+				keyPattern:      stringProp("FTS5 query or regex"),
+				"file_pattern":  stringProp("File path filter (substring)"),
+				"is_regex":      boolProp("Regex mode instead of FTS5 (default false)"),
+				keyContextLines: intProp("Context lines per match (default 0)"),
 			},
 			"pattern"),
 		toolDef(toolContextBundle,
-			"Bundle a symbol with its body, callees, callers, and same-file symbols into a single context window. Estimates token count and trims to budget. Use for LLM context preparation.",
+			"Bundle a symbol with body, callees, callers, and same-file symbols, trimmed to a token budget (LLM context prep).",
 			map[string]any{
 				keyQualifiedName: stringProp("Fully qualified symbol name"),
-				"token_budget":   intProp("Maximum token budget for the bundle (default 8000)"),
+				"token_budget":   intProp("Token budget (default 8000)"),
 			},
 			"qualified_name"),
-		toolDef("get_hotspots",
-			"Find code hotspots by combining cyclomatic complexity with git churn. Returns symbols ranked by risk score (complexity * log(churn+1)). Use to identify risky code for refactoring.",
+		toolDef(toolHotspots,
+			"Rank symbols: churn mode (default) scores complexity x log(churn+1) for refactoring risk; pagerank mode ranks call-graph centrality (hubs first).",
 			map[string]any{
-				keyTopN:          intProp("Number of hotspots to return (default 10)"),
-				"min_complexity": intProp("Minimum complexity threshold (default 0)"),
-				"min_churn":      intProp("Minimum churn count threshold (default 0)"),
-			}),
-		toolDef("get_symbol_importance",
-			"Compute symbol importance using PageRank over symbol-to-symbol edges (calls + references + satisfies). Ranks symbols by real call-graph centrality; hub symbols outrank leaves. The `scope` parameter is reserved and has no effect.",
-			map[string]any{
-				keyTopN: intProp("Number of results to return (default 10)"),
-				"scope": intProp("Reserved; accepted for compatibility, has no effect"),
+				keyMode:          stringProp("churn (default) or pagerank"),
+				keyTopN:          intProp("Number of results to return (default 10)"),
+				"min_complexity": intProp("Min complexity (churn mode, default 0)"),
+				"min_churn":      intProp("Min churn count (churn mode, default 0)"),
+				"scope":          intProp("Reserved; no effect"),
 			}),
 	}
 }
@@ -2135,52 +2073,39 @@ func advancedTools() []map[string]any {
 func typeAndImportTools() []map[string]any {
 	return []map[string]any{
 		toolDef("type_usage",
-			"Find all symbols that use a given type in their signatures (parameters, return types, fields). Returns qualified names, kinds, signatures, and file locations. Use to find where a type is used across the codebase.",
+			"Find all symbols whose signatures use a given type (parameters, return types, fields): qualified names, kinds, signatures, file locations.",
 			map[string]any{
-				keyTypeName:     stringProp("Type name to search for (e.g., 'error', 'string', 'MyStruct')"),
+				keyTypeName:     stringProp("Type name (e.g., 'error', 'MyStruct')"),
 				keyIncludeTests: boolProp("Include test packages and symbols"),
 			},
 			"type_name"),
-		toolDef("transitive_imports",
-			"Find all packages transitively imported by a given package (direct and indirect dependencies). Returns import edges with file paths and line numbers. Use to understand the full dependency tree.",
-			map[string]any{
-				keyPackagePath: stringProp("Package import path"),
-			},
-			"package_path"),
-		toolDef("search_prefix",
-			"Search Go symbols by qualified name prefix. Returns all symbols whose qualified name starts with the given prefix. Use to find all symbols in a package or subpackage.",
-			map[string]any{
-				"prefix":        stringProp("Qualified name prefix (e.g., 'cli/codemap/' or 'encoding/json.Decoder')"),
-				keyIncludeTests: boolProp("Include test packages and symbols"),
-			},
-			"prefix"),
 	}
 }
 
 func analysisTools() []map[string]any {
 	return []map[string]any{
 		toolDef("interface_impls",
-			"Find all types that implement a given interface and their implementing methods. Returns interface name, implementing type, and method qualified names. Use to find all implementations of an interface.",
+			"Find all types implementing a given interface and their implementing methods.",
 			map[string]any{
 				"interface_name": stringProp("Interface qualified name"),
 			},
 			"interface_name"),
 		toolDef("unused",
-			"Find all unexported symbols that have zero incoming callers/references. Returns symbol names, kinds, signatures, and file locations. Use to find dead code.",
+			"Find unexported symbols with zero incoming callers/references — dead code candidates.",
 			map[string]any{
 				keyIncludeTests: boolProp("Include test packages and symbols"),
 			}),
 		toolDef(toolCycles,
-			"Detect cycles in a specific edge type graph (e.g., imports, calls). Returns every distinct cycle as a canonicalized path, rotated to its smallest node, in deterministic sorted order. Results are capped at 1000 distinct cycles; when the cap is hit the last returned cycle carries a `truncated` flag. Use to find circular dependencies or call cycles.",
+			"Cycles in one edge-type graph: canonicalized, sorted paths, capped at 1000 (truncated flag on the last).",
 			map[string]any{
-				keyEdgeType: stringProp("Edge type to check for cycles (e.g., 'imports', 'calls')"),
+				keyEdgeType: stringProp("Edge type to check (e.g., 'imports', 'calls')"),
 			},
 			"edge_type"),
 		toolDef(toolBlastRadius,
-			"Analyze the impact of changing a symbol: direct callers, transitive callers, interface implementations, embedders, and type users. Returns a summary of impact metrics. Use before refactoring to understand blast radius.",
+			"Impact summary for changing a symbol: callers, interface implementations, embedders, type users. Run before refactoring.",
 			map[string]any{
 				keyQualifiedName: stringProp("Symbol qualified name"),
-				keyDepth:         intProp("Transitive caller depth (default: 3)"),
+				keyDepth:         intProp("Transitive caller depth (default 3)"),
 				keyRepo:          repoProp(),
 			},
 			"qualified_name"),
@@ -2190,25 +2115,18 @@ func analysisTools() []map[string]any {
 func pathAndSearchTools() []map[string]any {
 	return []map[string]any{
 		toolDef("find_path",
-			"Find a call/reference path between two symbols using BFS. Returns the path as a sequence of edges. Use to understand how two symbols are connected in the code graph.",
+			"BFS call/reference path between two symbols, returned as a sequence of edges.",
 			map[string]any{
 				"from":      stringProp("Starting symbol qualified name"),
 				"to":        stringProp("Target symbol qualified name"),
-				"max_depth": intProp("Maximum traversal depth (default: 10)"),
+				"max_depth": intProp("Max traversal depth (default 10)"),
 				keyRepo:     repoProp(),
 			},
 			"from", "to"),
-		toolDef("method_search",
-			"Search for all methods with a given name across all types. Returns each method's qualified name, receiver type, signature, and file location. Use to find all implementations of a method name.",
-			map[string]any{
-				"method_name":   stringProp("Method name to search for (e.g., 'Read', 'GetName')"),
-				keyIncludeTests: boolProp("Include test packages and symbols"),
-			},
-			"method_name"),
 		toolDef("symbols_in_file",
-			"Find all symbols defined in a specific file. Returns symbol names, kinds, signatures, and line numbers. Use to understand what a file defines.",
+			"List all symbols defined in one file: names, kinds, signatures, line numbers.",
 			map[string]any{
-				"file_path": stringProp("File path (substring match, e.g., 'server.go' or 'mcp/server.go')"),
+				keyFilePath: stringProp("File path (substring match, e.g., 'server.go' or 'mcp/server.go')"),
 			},
 			"file_path"),
 	}
@@ -2231,11 +2149,11 @@ func toolDef(name, description string, properties map[string]any, required ...st
 
 // staleGuidance is appended to every tool description so agents know results
 // reflect a fresh index and how to force a manual one.
-const staleGuidance = " Results reflect a fresh index — codemap re-indexes any stale repo before answering. If you still suspect stale data, run `codemap index` (or `codemap index --workspace`)."
+const staleGuidance = " Results are fresh; reindexing is automatic."
 
 // repoProp is the optional repo scope property shared by query tools.
 func repoProp() map[string]any {
-	return stringProp("Optional workspace member (module path) to scope results to (e.g. 'krucil'). Workspace mode only.")
+	return stringProp("Optional workspace member (module path) to scope to.")
 }
 
 func stringProp(desc string) map[string]any {
@@ -2260,52 +2178,33 @@ func intProp(desc string) map[string]any {
 
 func sourceTools() []map[string]any {
 	return []map[string]any{
-		toolDef(toolSymbolBody,
-			"Get the source text of a single Go symbol (function, method, type, const, or var) by qualified name. Re-parses the file at query time to extract the exact declaration span, with optional doc comment and context-line padding. Replaces read(whole_file) for 'show me this one symbol' lookups with ~20x token reduction.",
-			map[string]any{
-				keyQualifiedName: stringProp("Fully qualified symbol name (e.g., cli/codemap/extract.Run)"),
-				keyContextLines:  intProp("Number of file lines to include before and after the declaration as context (default 0)"),
-				"include_doc":    boolProp("Prepend the leading doc comment to the body (default true)"),
-			},
-			"qualified_name"),
 		toolDef("changed_symbols",
-			"Get the symbols changed in the working tree relative to a git ref (default 'main'), classified by change_type (modified/added/removed). Each changed symbol can carry an optional blast_radius and source body. Replaces 'git diff' + manual hunk-to-symbol mapping + per-symbol blast_radius lookups.",
+			"Working-tree changed symbols vs a git ref (default main), classified by change_type, optionally with blast_radius and source body; workspace: true diffs every member repo.",
 			map[string]any{
-				"ref":               stringProp("Git ref to diff against (default: repository's default branch, e.g. main or master)"),
-				"with_blast_radius": boolProp("Attach blast_radius to each changed symbol (default true)"),
-				"include_bodies":    boolProp("Attach source body to each changed symbol (default false)"),
-				"include_tests":     boolProp("Include test packages/symbols (default false)"),
-				"compact":           boolProp("One line per changed symbol instead of the full TOON/JSON record (default false)"),
-			}),
-		toolDef("workspace_changed_symbols",
-			"Get a workspace-wide diff of changed symbols: every member repo's changed symbols, each computed against that repo's own reference and tagged with its repo. Replaces running changed_symbols per repo manually.",
-			map[string]any{
-				"with_blast_radius": boolProp("Attach blast_radius to each changed symbol (default true)"),
-				"include_bodies":    boolProp("Attach source body to each changed symbol (default false)"),
-				"include_tests":     boolProp("Include test packages/symbols (default false)"),
-				"compact":           boolProp("One line per changed symbol instead of the full TOON/JSON record (default false)"),
+				"ref":               stringProp("Git ref to diff against (default main)"),
+				keyWorkspace:        boolProp("Diff every workspace member repo (default false)"),
+				"with_blast_radius": boolProp("Attach blast_radius per symbol (default true)"),
+				"include_bodies":    boolProp("Attach source body per symbol (default false)"),
+				"include_tests":     boolProp("Include test packages (default false)"),
+				"compact":           boolProp("One line per symbol instead of full record (default false)"),
 			}),
 	}
 }
 
 func shapeTools() []map[string]any {
 	return []map[string]any{
-		toolDef("dependency_layers",
-			"Get a topological layering of the project's packages based on the stored 'imports' edges (Kahn's algorithm), plus the top packages ranked by fan-in. Scoped to intra-project packages; standard library and third-party imports are excluded. Replaces N calls to importers_of to judge 'is this a hub' or 'what's the layer order'.",
-			map[string]any{
-				keyIncludeTests: boolProp("Include _test packages in the layering (default false)"),
-				"top_hubs":      intProp("Maximum number of hub entries to return (default 5)"),
-			}),
 		toolDef("dependency_flow",
-			"Get the immediate imports, immediate importers, and transitive imports of a single package in one call. Composes imports_of, importers_of, and transitive_imports.",
+			"One package's imports, importers, and transitive imports; layers: true returns the project-wide topological layering (Kahn) with top fan-in hubs instead.",
 			map[string]any{
-				keyPackagePath: stringProp("Package import path"),
-			},
-			"package_path"),
+				keyPackagePath:  stringProp("Package import path; omit in layers mode"),
+				keyLayers:       boolProp("Project-wide topological layers instead of flow (default false)"),
+				keyIncludeTests: boolProp("Include _test packages (layers mode)"),
+				"top_hubs":      intProp("Max hub entries (layers mode, default 5)"),
+			}),
 		toolDef("entry_points",
-			"Get the entry points of the codebase: main() functions, test entry symbols, exported funcs/methods with no incoming callers, and optionally HTTP handlers. Use to surface 'where do I start reading' without grep.",
+			"Entry points: main() functions, test entries, exported funcs/methods with no callers, optionally HTTP handlers.",
 			map[string]any{
-				"heuristics":    stringArrayProp("Heuristic set to apply: main, test, uncalled_exported, handler_sig, handler_name (default [\"main\",\"test\",\"uncalled_exported\"])"),
+				"heuristics":    stringArrayProp("Heuristics: main, test, uncalled_exported, handler_sig, handler_name (default [main, test, uncalled_exported])"),
 				keyIncludeTests: boolProp("Include _test packages; required to surface test-entry symbols (default false)"),
 			}),
 	}

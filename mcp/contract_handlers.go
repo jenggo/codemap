@@ -108,27 +108,27 @@ func handleSuppressContract(st *store.Store, _ []query.Option, renderOpts []rend
 func contractTools() []map[string]any {
 	return []map[string]any{
 		toolDef(toolContracts,
-			"List contract edges linking producer/consumer symbols across repos. Filterable by repo, direction, severity, and confidence. Contract edges are inferred from shared message-type constants and CBOR-name-aware structural shape matching.",
+			"Cross-repo producer/consumer contract edges (inferred from shared message-type constants and CBOR-shape matching), filterable by repo, direction, severity, confidence.",
 			map[string]any{
 				keyRepo:          repoProp(),
-				keyDirection:     stringProp("Filter by direction: producer, consumer, shared"),
-				keySeverity:      stringProp("Filter by severity: compatible, breaking, unknown"),
-				"min_confidence": intProp("Minimum confidence threshold (0-1, default 0)"),
+				keyDirection:     stringProp("producer, consumer, or shared"),
+				keySeverity:      stringProp("compatible, breaking, or unknown"),
+				"min_confidence": intProp("Minimum confidence 0-1 (default 0)"),
 			}),
 		toolDef("contract_drift",
-			"List structural drift reports between shape-matched types across repos. Groups by severity with field-level evidence (CBOR name, type before/after, repo).",
+			"Structural drift between shape-matched types across repos, grouped by severity with field-level evidence (CBOR name, type before/after, repo).",
 			map[string]any{
 				keySeverity: stringProp("Filter by severity: compatible, breaking, unknown"),
 				keyRepo:     repoProp(),
 			}),
 		toolDef("runtime_contracts",
-			"List runtime contract entities: Redis key patterns, JetStream stream/subject names, and WS type strings. Each links to its producer/consumer sites.",
+			"Runtime contract entities — Redis key patterns, JetStream stream/subject names, WS type strings — each linked to producer/consumer sites.",
 			map[string]any{
 				keyKind: stringProp("Filter by kind: redis, jetstream, ws_type"),
 				keyRepo: repoProp(),
 			}),
 		toolDef("suppress_contract",
-			"Suppress a specific contract pair so it never appears in contracts, drift, or blast radius results. Use this to dismiss confirmed false positives.",
+			"Suppress a contract pair so it never appears in contracts, drift, or blast radius results — dismisses confirmed false positives.",
 			map[string]any{
 				keyFromRef: stringProp("Source symbol qualified name"),
 				keyToRef:   stringProp("Target symbol qualified name"),

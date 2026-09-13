@@ -215,12 +215,12 @@ func unknownResponseError(id string) string {
 func overflowTools() []map[string]any {
 	return []map[string]any{
 		toolDef(responseSectionTool,
-			"Returns stored sections of an oversized tool response that was replaced by a manifest. Pass the manifest's response_id; optionally a section index for one verbatim section, or a keyword query for ranked section search. Without section or query, every section is returned in order.",
+			"Reads back sections of an oversized response replaced by a manifest: one by index, keyword-matched, or all in order.",
 			map[string]any{
-				"response_id": stringProp("response_id from an oversized-response manifest"),
-				"section":     intProp("0-based section index; returns that section verbatim"),
-				"query":       stringProp("keyword query; returns matching sections ranked by relevance"),
-				"limit":       intProp("max sections returned in query mode (default 5)"),
+				"response_id": stringProp("response_id from the manifest"),
+				"section":     intProp("0-based section index to return verbatim"),
+				"query":       stringProp("Keyword query for ranked section search"),
+				"limit":       intProp("Max sections in query mode (default 5)"),
 			},
 			"response_id"),
 	}

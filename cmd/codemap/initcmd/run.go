@@ -18,23 +18,18 @@ const ToolsAndTipsBlock = `## Available Tools
 |---|---|---|
 | ` + "`index`" + ` | Force a full re-index | Indexing is automatic otherwise |
 | ` + "`overview`" + ` | Each package's exports + signatures | Understanding project structure |
-| ` + "`search`" + ` | Qualified names, file:line, signatures, docs | Finding symbols by name |
-| ` + "`show`" + ` | Signature, docs, file:line, incoming+outgoing edges | Understanding a single symbol |
+| ` + "`search`" + ` | Qualified names, file:line, signatures, docs; mode: substring/prefix/method | Finding symbols by name |
+| ` + "`show`" + ` | Signature, docs, file:line, incoming+outgoing edges; source: true returns raw source | Understanding a single symbol |
 | ` + "`callers_of`" + ` | Caller names, file:line, edge types | Tracing who calls a function |
 | ` + "`callees_of`" + ` | Callee names, file:line, edge types | Tracing a symbol's dependencies |
-| ` + "`package`" + ` | All symbols with signatures and docs | Inspecting a package's API |
+| ` + "`package`" + ` | All symbols with signatures and docs; without path lists all packages | Inspecting a package's API or discovering packages |
 | ` + "`methods_of`" + ` | Method names, signatures, file:line | Finding a type's method set |
-| ` + "`list_packages`" + ` | Import paths, names, symbol counts | Discovering packages |
-| ` + "`importers_of`" + ` | Importing packages with file:line | Finding downstream dependents |
-| ` + "`imports_of`" + ` | Imported packages with file:line | Finding upstream dependencies |
-| ` + "`edges_by_type`" + ` | All edges of a given type | Bulk relationship analysis |
-| ` + "`all_edges`" + ` | Every edge in the codebase | Full graph export |
+| ` + "`imports_of`" + ` | Imports (direction out) or importers (direction in); transitive: true walks the tree | Import relationships |
+| ` + "`all_edges`" + ` | Every edge in the codebase; optional edge_type filter | Bulk relationship analysis |
 | ` + "`search_text`" + ` | Matching file paths, line numbers, context | Full-text search across indexed files |
 | ` + "`get_context_bundle`" + ` | Symbol body, callees, callers, same-file symbols | LLM context preparation |
-| ` + "`get_hotspots`" + ` | Symbols ranked by complexity x churn risk | Finding risky code for refactoring |
-| ` + "`get_symbol_importance`" + ` | Symbols ranked by PageRank centrality | Identifying architecturally critical code |
-| ` + "`changed_symbols`" + ` | Symbols changed in the working tree | One line per symbol with ` + "`compact: true`" + ` |
-| ` + "`workspace_changed_symbols`" + ` | Workspace-wide changed symbols | One line per symbol with ` + "`compact: true`" + ` |
+| ` + "`get_hotspots`" + ` | Symbols ranked by complexity x churn (mode churn) or PageRank centrality (mode pagerank) | Finding risky or critical code |
+| ` + "`changed_symbols`" + ` | Symbols changed in the working tree; workspace: true covers every member repo | One line per symbol with ` + "`compact: true`" + ` |
 | ` + "`read_response_section`" + ` | Stored sections of an oversized response, by index or keyword | Reading back an oversized-response manifest |
 | ` + "`stats`" + ` | Per-tool calls, errors, response bytes, estimated raw-read bytes, reduction % | Verifying context savings and tuning output formats |
 
@@ -45,8 +40,9 @@ const ToolsAndTipsBlock = `## Available Tools
 - ` + "`full_docs: true`" + ` shows complete documentation instead of the first sentence
 - ` + "`include_unexported: true`" + ` includes private symbols (package tool)
 - ` + "`methods_of`" + ` takes a short type name (e.g., ` + "`Store`" + `, not the full path)
-- Search is case-insensitive substring match
+- ` + "`search`" + ` is case-insensitive substring match by default; ` + "`mode: \"prefix\"`" + ` matches qualified-name starts, ` + "`mode: \"method\"`" + ` finds methods by name across types
 - ` + "`search`" + ` returns exported and unexported symbols by default; ` + "`exported: true`" + ` filters to exported-only, ` + "`exported: false`" + ` to unexported-only
+- ` + "`imports_of`" + ` defaults to direction ` + "`out`" + ` (imports); use ` + "`direction: \"in\"`" + ` for importers and ` + "`transitive: true`" + ` for the full dependency tree
 - Indexing is automatic and fast (~50ms). Re-indexes when Go files change.
 `
 
@@ -65,13 +61,13 @@ This project uses ` + "`codemap`" + ` MCP tools for Go codebase analysis. These 
 | Get a package's full API | ` + "`package`" + ` | listing .go files |
 | Find all methods on a type | ` + "`methods_of`" + ` | grep for receiver patterns |
 | See project architecture | ` + "`overview`" + ` | guessing from directory structure |
-| Find where a package is imported | ` + "`importers_of`" + ` | grep for import path |
+| Find where a package is imported | ` + "`imports_of`" + ` with ` + "`direction: \"in\"`" + ` | grep for import path |
 | Find what a package depends on | ` + "`imports_of`" + ` | reading import blocks |
-| List all packages | ` + "`list_packages`" + ` | ls and guess |
+| List all packages | ` + "`package`" + ` without path | ls and guess |
 | Search file contents | ` + "`search_text`" + ` | grep |
 | Get symbol context bundle | ` + "`get_context_bundle`" + ` | manual assembly |
 | Find code hotspots | ` + "`get_hotspots`" + ` | manual review |
-| Rank symbol importance | ` + "`get_symbol_importance`" + ` | guessing |
+| Rank symbol importance | ` + "`get_hotspots`" + ` with ` + "`mode: \"pagerank\"`" + ` | guessing |
 
 ` + ToolsAndTipsBlock + `
 `
@@ -97,12 +93,12 @@ Indexing is **automatic** — the first tool call triggers indexing if needed (~
 | Get a package's full API | ` + "`package`" + ` | listing .go files |
 | All methods on a type | ` + "`methods_of`" + ` | grep for receiver |
 | Project architecture overview | ` + "`overview`" + ` | guessing from dirs |
-| Where is this package imported? | ` + "`importers_of`" + ` | grep for import path |
+| Where is this package imported? | ` + "`imports_of`" + ` with ` + "`direction: \"in\"`" + ` | grep for import path |
 | What does this package depend on? | ` + "`imports_of`" + ` | reading import blocks |
 | Search file contents | ` + "`search_text`" + ` | grep |
 | Get symbol context bundle | ` + "`get_context_bundle`" + ` | manual assembly |
 | Find code hotspots | ` + "`get_hotspots`" + ` | manual review |
-| Rank symbol importance | ` + "`get_symbol_importance`" + ` | guessing |
+| Rank symbol importance | ` + "`get_hotspots`" + ` with ` + "`mode: \"pagerank\"`" + ` | guessing |
 
 ` + ToolsAndTipsBlock + `
 `
@@ -124,8 +120,8 @@ const GO_FILE_RE = /\.go\b/
 
 const TOOL_SUGGESTIONS: Record<string, string> = {
   grep: "Use ` + "`codemap_search`" + ` (symbol names), ` + "`codemap_search_text`" + ` (file contents), or ` + "`codemap_callers_of`" + `/` + "`codemap_callees_of`" + ` (relationships) instead.",
-  glob: "Use ` + "`codemap_list_packages`" + ` or ` + "`codemap_package`" + ` to discover Go packages and their symbols.",
-  read: "Use ` + "`codemap_show`" + ` (single symbol), ` + "`codemap_package`" + ` (full package API), or ` + "`codemap_get_context_bundle`" + ` (symbol + context) instead.",
+  glob: "Use ` + "`codemap_package`" + ` (package API; without path it lists all packages) to discover Go packages and their symbols.",
+  read: "Use ` + "`codemap_show`" + ` (single symbol; source: true for raw source), ` + "`codemap_package`" + ` (full package API), or ` + "`codemap_get_context_bundle`" + ` (symbol + context) instead.",
 }
 
 function isGoTarget(args: Record<string, any>): boolean {
@@ -141,7 +137,7 @@ export const CodemapGuard: Plugin = async () => {
     "tool.execute.after": async (input, output) => {
       const tool = input.tool.toLowerCase()
 
-      const CODEMAP_SEARCH = ["search", "search_text", "search_prefix", "methods_of", "method_search"]
+      const CODEMAP_SEARCH = ["search", "search_text", "methods_of"]
       if (CODEMAP_SEARCH.includes(tool)) {
         const rendered = output.output ?? ""
         if (!rendered.trim()) {

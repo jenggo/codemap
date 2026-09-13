@@ -150,13 +150,13 @@ type rawEstimator func(st *store.Store, result any) int64
 // name. Counting itself needs zero per-handler edits; registering an estimator
 // for a new tool only requires that handler to surface its typed result.
 var rawEstimators = map[string]rawEstimator{
-	toolSymbolBody:    estimateSymbolBodyRaw,
+	toolShow:          estimateSymbolBodyRaw,
 	keyToolPackage:    estimatePackageRaw,
 	toolContextBundle: estimateBundleRaw,
 }
 
-// estimateSymbolBodyRaw models the naive alternative for get_symbol_body: the
-// reader pulls the symbol's declaration plus the requested context window,
+// estimateSymbolBodyRaw models the naive alternative for show with source: true:
+// the reader pulls the symbol's declaration plus the requested context window,
 // both already computed by the handler as SymbolBodyResult spans. Rendering
 // adds headers and fences, so a tiny symbol's rendered response can exceed
 // the estimate; those calls clamp to 0% reduction instead of claiming savings.
@@ -170,7 +170,7 @@ func estimateSymbolBodyRaw(_ *store.Store, result any) int64 {
 
 // estimatePackageRaw models the naive alternative for package: opening every
 // symbol the response lists and reading its declaration body. Bodies come
-// from the same span extraction get_symbol_body uses; a body that cannot be
+// from the same span extraction show's source mode uses; a body that cannot be
 // fetched contributes nothing, so the estimate understates rather than
 // overstates savings.
 func estimatePackageRaw(st *store.Store, result any) int64 {
@@ -243,7 +243,7 @@ func renderUsageStats(u *usageStats) string {
 func statsTools() []map[string]any {
 	return []map[string]any{
 		toolDef("stats",
-			"Session per-tool usage accounting: calls, errors, rendered response bytes, estimated raw-read bytes, and reduction per tool, plus totals. Raw bytes estimate what reading the source instead would cost: per-tool estimators model the natural raw alternative (symbol body plus context window for get_symbol_body, exported symbol bodies for package, token estimate x 4 for get_context_bundle); every other tool reports raw = response bytes, an honest 0% reduction. Reduction is 1 - response/raw clamped to [0, 1]. gated_responses counts oversized responses replaced by manifests. Counters live for the server process lifetime and reset on restart.",
+			"Session per-tool usage accounting: calls, errors, rendered response bytes, estimated raw-read bytes, and reduction per tool, plus totals. Raw bytes estimate what reading the source instead would cost: per-tool estimators model the natural raw alternative (source mode of show, exported symbol bodies for package, token estimate x 4 for get_context_bundle); every other tool reports raw = response bytes, an honest 0% reduction. gated_responses counts oversized responses replaced by manifests. Counters reset on server restart.",
 			map[string]any{}),
 	}
 }

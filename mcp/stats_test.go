@@ -195,9 +195,9 @@ func TestRecordUsageIdentityFallbackForUnregisteredTool(t *testing.T) {
 func TestStatsRecordsSymbolBodyEstimator(t *testing.T) {
 	s := newTestServer(t)
 	qn := "codemap/testdata/simple.NewParser"
-	out, isErr := s.handleTool("get_symbol_body", map[string]any{"qualified_name": qn})
+	out, isErr := s.handleTool("show", map[string]any{"qualified_name": qn, "source": true})
 	if isErr {
-		t.Fatalf("get_symbol_body failed: %s", out)
+		t.Fatalf("show source failed: %s", out)
 	}
 	body, err := query.GetSymbolBody(s.store, qn, 0, true)
 	if err != nil {
@@ -210,7 +210,7 @@ func TestStatsRecordsSymbolBodyEstimator(t *testing.T) {
 		t.Fatalf("want 1 row, got %d", len(snap.Rows))
 	}
 	row := snap.Rows[0]
-	if row.Tool != "get_symbol_body" || row.Calls != 1 {
+	if row.Tool != "show" || row.Calls != 1 {
 		t.Fatalf("unexpected row: %+v", row)
 	}
 	if row.RawBytes != wantRaw {

@@ -37,20 +37,41 @@ func TestToolsListIncludesNewTools(t *testing.T) {
 		names[name] = true
 	}
 	required := []string{
-		"get_symbol_body",
+		"show",
 		"changed_symbols",
-		"dependency_layers",
 		"dependency_flow",
 		"entry_points",
 		"search_text",
 		"get_context_bundle",
 		"get_hotspots",
-		"get_symbol_importance",
+		"imports_of",
+		"all_edges",
+		"package",
+		"search",
 	}
 	for _, r := range required {
 		if !names[r] {
 			t.Errorf("expected tool %q in tools/list, got: %v", r, names)
 		}
+	}
+	for _, gone := range []string{
+		"get_symbol_body",
+		"dependency_layers",
+		"get_symbol_importance",
+		"importers_of",
+		"transitive_imports",
+		"search_prefix",
+		"method_search",
+		"list_packages",
+		"edges_by_type",
+		"workspace_changed_symbols",
+	} {
+		if names[gone] {
+			t.Errorf("absorbed tool %q must not appear in tools/list", gone)
+		}
+	}
+	if len(tools) != 31 {
+		t.Errorf("expected 31 tools in tools/list, got %d", len(tools))
 	}
 }
 
