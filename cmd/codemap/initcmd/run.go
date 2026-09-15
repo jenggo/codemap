@@ -243,6 +243,76 @@ export default function (cmd: ModApi): void {
 }
 `
 
+const codemapGuardLua = `-- Codemap Guard — maki plugin
+-- Installed by ` + "`codemap inject`" + ` (alias: ` + "`codemap init`" + `).
+-- Soft-mode guard that warns when grep/glob target .go files instead of
+-- codemap MCP tools. Calls are NOT blocked.
+
+local SUGGESTIONS = {
+  grep = "Use codemap__search (symbol names), codemap__search_text (file contents), or codemap__callers_of/codemap__callees_of (relationships) instead.",
+  glob = "Use codemap__package (package API; without path it lists all packages) to discover Go packages and their symbols.",
+}
+
+local warned = {}
+local pending = {} -- tool -> input stashed at the input stage
+
+local function is_go_target(input)
+  for _, key in ipairs({ "pattern", "path" }) do
+    local v = input[key]
+    if type(v) == "string" and v:find("%.go") then
+      return true
+    end
+  end
+  return false
+end
+
+for _, name in ipairs({ "grep", "glob" }) do
+  maki.api.set_slot("tool." .. name .. ".input", function(prev, input, ctx)
+    pending[name] = is_go_target(input) and input or nil
+    return prev(input, ctx)
+  end)
+
+  maki.api.set_slot("tool." .. name .. ".output", function(prev, out, ctx)
+    local input = pending[name]
+    pending[name] = nil
+    if not input or out.is_error then
+      return prev(out, ctx)
+    end
+    local target = input.pattern or input.path or ""
+    local key = name .. ":" .. target
+    if warned[key] then
+      return prev(out, ctx)
+    end
+    warned[key] = true
+    out.text = '[codemap-guard] "' .. name .. '" on a Go file (' .. target .. "). "
+      .. SUGGESTIONS[name] .. "\n\n" .. (out.text or "")
+    return prev(out, ctx)
+  end)
+end
+
+-- Empty codemap results hint: the index may be stale. Slot names are fine to
+-- set before the MCP server registers.
+for _, name in ipairs({ "codemap__search", "codemap__search_text", "codemap__methods_of" }) do
+  maki.api.set_slot("tool." .. name .. ".output", function(prev, out, ctx)
+    if not out.is_error and (out.text or ""):match("^%s*$") then
+      out.text = '[codemap-guard] "' .. name .. '" returned no results. The index may be stale — run the codemap__index tool, then retry.\n\n' .. (out.text or "")
+    end
+    return prev(out, ctx)
+  end)
+end
+`
+
+const makiPluginToml = `# Grants required by codemap-guard: it wraps grep/glob tool slots, and tools
+# that declare no permission capability require the plugin to hold every
+# permission grant.
+[permissions]
+fs_read = true
+fs_write = true
+net = true
+run = true
+env = true
+`
+
 func Run() error {
 	errors := false
 
@@ -258,6 +328,11 @@ func Run() error {
 
 	if err := injectCommandCode(); err != nil {
 		fmt.Fprintf(os.Stderr, "commandcode: %v\n", err)
+		errors = true
+	}
+
+	if err := injectMaki(); err != nil {
+		fmt.Fprintf(os.Stderr, "maki: %v\n", err)
 		errors = true
 	}
 
@@ -390,6 +465,117 @@ func injectCommandCode() error {
 		return fmt.Errorf("writing codemap-guard.ts: %w", err)
 	}
 	fmt.Printf("commandcode: %s %s\n", changeVerb(changed), modPath)
+
+	return nil
+}
+
+// injectMaki installs the MCP entry and guard plugin only where maki is
+// present, so machines without it are never given a stray config directory.
+// ~/.maki wins over ~/.config/maki, matching maki's own precedence rule.
+func injectMaki() error {
+	home := os.Getenv("HOME")
+
+	dir := filepath.Join(home, ".maki")
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		dir = filepath.Join(home, ".config", "maki")
+		if _, err := os.Stat(dir); os.IsNotExist(err) {
+			fmt.Println("maki: config dir not found, skipping")
+			return nil
+		}
+	}
+
+	selfPath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("finding codemap binary: %w", err)
+	}
+
+	if err := injectMakiMCP(dir, selfPath); err != nil {
+		return err
+	}
+	return injectMakiGuard(dir)
+}
+
+func injectMakiMCP(dir, selfPath string) error {
+	cfgPath := filepath.Join(dir, "mcp.toml")
+
+	block := "[mcp.codemap]\ncommand = [\"" + selfPath + "\", \"serve\"]\nalways_load = true\n"
+
+	data, err := os.ReadFile(cfgPath)
+	if os.IsNotExist(err) {
+		if err := os.WriteFile(cfgPath, []byte(block), 0644); err != nil {
+			return fmt.Errorf("writing mcp.toml: %w", err)
+		}
+		fmt.Printf("maki: created %s\n", cfgPath)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("reading mcp.toml: %w", err)
+	}
+
+	content := string(data)
+	if strings.Contains(content, "[mcp.codemap]") {
+		fmt.Println("maki: codemap MCP entry already exists, skipping")
+		return nil
+	}
+
+	if !strings.HasSuffix(content, "\n") {
+		content += "\n"
+	}
+	if err := os.WriteFile(cfgPath, []byte(content+"\n"+block), 0644); err != nil {
+		return fmt.Errorf("writing mcp.toml: %w", err)
+	}
+
+	fmt.Printf("maki: updated %s\n", cfgPath)
+	return nil
+}
+
+func injectMakiGuard(dir string) error {
+	luaDir := filepath.Join(dir, "lua")
+	if err := os.MkdirAll(luaDir, 0755); err != nil {
+		return fmt.Errorf("creating maki lua directory: %w", err)
+	}
+
+	luaPath := filepath.Join(luaDir, "codemap-guard.lua")
+	changed, err := writeIfChanged(luaPath, codemapGuardLua)
+	if err != nil {
+		return fmt.Errorf("writing codemap-guard.lua: %w", err)
+	}
+	fmt.Printf("maki: %s %s\n", changeVerb(changed), luaPath)
+
+	initPath := filepath.Join(dir, "init.lua")
+	data, err := os.ReadFile(initPath)
+	switch {
+	case os.IsNotExist(err):
+		if err := os.WriteFile(initPath, []byte("require(\"codemap-guard\")\n"), 0644); err != nil {
+			return fmt.Errorf("writing init.lua: %w", err)
+		}
+		fmt.Printf("maki: created %s\n", initPath)
+	case err != nil:
+		return fmt.Errorf("reading init.lua: %w", err)
+	case !strings.Contains(string(data), "codemap-guard"):
+		content := string(data)
+		if !strings.HasSuffix(content, "\n") {
+			content += "\n"
+		}
+		if err := os.WriteFile(initPath, []byte(content+"require(\"codemap-guard\")\n"), 0644); err != nil {
+			return fmt.Errorf("writing init.lua: %w", err)
+		}
+		fmt.Printf("maki: updated %s\n", initPath)
+	default:
+		fmt.Println("maki: init.lua already loads codemap-guard, skipping")
+	}
+
+	permsPath := filepath.Join(dir, "plugin.toml")
+	if _, err := os.Stat(permsPath); err == nil {
+		fmt.Println("maki: plugin.toml already exists, skipping")
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("checking plugin.toml: %w", err)
+	}
+	if err := os.WriteFile(permsPath, []byte(makiPluginToml), 0644); err != nil {
+		return fmt.Errorf("writing plugin.toml: %w", err)
+	}
+	fmt.Printf("maki: created %s\n", permsPath)
 
 	return nil
 }

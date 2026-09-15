@@ -880,7 +880,7 @@ func printUsage() {
 	fmt.Println("Usage: codemap <command> [args]")
 	fmt.Println()
 	fmt.Println("Commands:")
-	fmt.Println("  inject (or init)          Install opencode plugin + context files for codemap integration")
+	fmt.Println("  inject (or init)          Install MCP + guard plugins for crush, opencode, commandcode, maki")
 	fmt.Println("  index [path]              Index a Go repository")
 	fmt.Println("  overview                  Show package overview")
 	fmt.Println("  show <qualified_name>     Show symbol details")

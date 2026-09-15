@@ -56,6 +56,190 @@ func TestInjectOpencode_WritesNavigationAndPlugin(t *testing.T) {
 	}
 }
 
+func TestInjectMaki_WritesGuardAndMCP(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	if err := os.MkdirAll(filepath.Join(tmpHome, ".config", "maki"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := injectMaki(); err != nil {
+		t.Fatalf("injectMaki failed: %v", err)
+	}
+
+	lua, err := os.ReadFile(filepath.Join(tmpHome, ".config", "maki", "lua", "codemap-guard.lua"))
+	if err != nil {
+		t.Fatalf("codemap-guard.lua not written: %v", err)
+	}
+	content := string(lua)
+	for _, want := range []string{
+		"codemap-guard",
+		"set_slot(\"tool.\" .. name .. \".input\"",
+		"set_slot(\"tool.\" .. name .. \".output\"",
+		"codemap__search",
+		"codemap__search_text",
+		"codemap__methods_of",
+		"codemap__index",
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("codemap-guard.lua missing %q", want)
+		}
+	}
+
+	init, err := os.ReadFile(filepath.Join(tmpHome, ".config", "maki", "init.lua"))
+	if err != nil {
+		t.Fatalf("init.lua not written: %v", err)
+	}
+	if !strings.Contains(string(init), `require("codemap-guard")`) {
+		t.Error("init.lua missing require(\"codemap-guard\")")
+	}
+
+	perms, err := os.ReadFile(filepath.Join(tmpHome, ".config", "maki", "plugin.toml"))
+	if err != nil {
+		t.Fatalf("plugin.toml not written: %v", err)
+	}
+	for _, want := range []string{"fs_read", "fs_write", "net", "run", "env"} {
+		if !strings.Contains(string(perms), want) {
+			t.Errorf("plugin.toml missing %q", want)
+		}
+	}
+
+	mcp, err := os.ReadFile(filepath.Join(tmpHome, ".config", "maki", "mcp.toml"))
+	if err != nil {
+		t.Fatalf("mcp.toml not written: %v", err)
+	}
+	mcpContent := string(mcp)
+	if !strings.Contains(mcpContent, "[mcp.codemap]") {
+		t.Error("mcp.toml missing [mcp.codemap]")
+	}
+	if !strings.Contains(mcpContent, "\"serve\"") {
+		t.Error("mcp.toml missing serve arg")
+	}
+	if !strings.Contains(mcpContent, "always_load = true") {
+		t.Error("mcp.toml missing always_load = true")
+	}
+}
+
+func TestInjectMaki_SkipsWithoutConfigDir(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	if err := injectMaki(); err != nil {
+		t.Fatalf("injectMaki should not fail without maki: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tmpHome, ".config", "maki")); !os.IsNotExist(err) {
+		t.Error("~/.config/maki must not be created when absent")
+	}
+	if _, err := os.Stat(filepath.Join(tmpHome, ".maki")); !os.IsNotExist(err) {
+		t.Error("~/.maki must not be created when absent")
+	}
+}
+
+func TestInjectMaki_PrefersDotMaki(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	if err := os.MkdirAll(filepath.Join(tmpHome, ".maki"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(tmpHome, ".config", "maki"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := injectMaki(); err != nil {
+		t.Fatalf("injectMaki failed: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(tmpHome, ".maki", "lua", "codemap-guard.lua")); err != nil {
+		t.Errorf("guard not written to ~/.maki: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tmpHome, ".config", "maki", "lua")); !os.IsNotExist(err) {
+		t.Error("~/.config/maki must not be touched when ~/.maki exists")
+	}
+}
+
+func TestInjectMaki_Idempotent(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	if err := os.MkdirAll(filepath.Join(tmpHome, ".config", "maki"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := injectMaki(); err != nil {
+		t.Fatalf("first injectMaki failed: %v", err)
+	}
+
+	luaPath := filepath.Join(tmpHome, ".config", "maki", "lua", "codemap-guard.lua")
+	mcpPath := filepath.Join(tmpHome, ".config", "maki", "mcp.toml")
+	initPath := filepath.Join(tmpHome, ".config", "maki", "init.lua")
+
+	lua1, _ := os.ReadFile(luaPath)
+	mcp1, _ := os.ReadFile(mcpPath)
+	init1, _ := os.ReadFile(initPath)
+
+	if err := injectMaki(); err != nil {
+		t.Fatalf("second injectMaki failed: %v", err)
+	}
+
+	lua2, _ := os.ReadFile(luaPath)
+	mcp2, _ := os.ReadFile(mcpPath)
+	init2, _ := os.ReadFile(initPath)
+
+	if string(lua1) != string(lua2) {
+		t.Error("codemap-guard.lua changed on second run")
+	}
+	if string(mcp1) != string(mcp2) {
+		t.Error("mcp.toml changed on second run")
+	}
+	if string(init1) != string(init2) {
+		t.Error("init.lua changed on second run")
+	}
+}
+
+func TestInjectMaki_RespectsExistingPluginTomlAndInitLua(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	dir := filepath.Join(tmpHome, ".config", "maki")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	existingPerms := "[permissions]\nfs_read = true\n"
+	if err := os.WriteFile(filepath.Join(dir, "plugin.toml"), []byte(existingPerms), 0644); err != nil {
+		t.Fatal(err)
+	}
+	existingInit := "-- my init\n"
+	if err := os.WriteFile(filepath.Join(dir, "init.lua"), []byte(existingInit), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := injectMaki(); err != nil {
+		t.Fatalf("injectMaki failed: %v", err)
+	}
+
+	perms, err := os.ReadFile(filepath.Join(dir, "plugin.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(perms) != existingPerms {
+		t.Error("existing plugin.toml must not be modified")
+	}
+
+	init, err := os.ReadFile(filepath.Join(dir, "init.lua"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(init), existingInit) {
+		t.Error("existing init.lua content must be preserved")
+	}
+	if strings.Count(string(init), `require("codemap-guard")`) != 1 {
+		t.Error("init.lua should gain require(\"codemap-guard\") exactly once")
+	}
+}
+
 func TestInjectAgents_SkipsExisting(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Chdir(tmpDir)
