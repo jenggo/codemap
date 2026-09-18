@@ -206,9 +206,7 @@ func TestIsStaleOnHeadChange(t *testing.T) {
 	if err := s.SetRepoMeta(repo, head, 1, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetIndexedAt(time.Now()); err != nil {
-		t.Fatal(err)
-	}
+	markIndexed(t, s, time.Now())
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -253,9 +251,7 @@ func TestIsStaleOnUncommittedChanges(t *testing.T) {
 	if err := s.SetRepoMeta(repo, head, 1, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetIndexedAt(time.Now()); err != nil {
-		t.Fatal(err)
-	}
+	markIndexed(t, s, time.Now())
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -423,9 +419,7 @@ func TestIsStaleFingerprintPreventsReindexLoop(t *testing.T) {
 	if err := s.SetRepoMeta(repo, head, 1, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetIndexedAt(time.Now()); err != nil {
-		t.Fatal(err)
-	}
+	markIndexed(t, s, time.Now())
 
 	file := filepath.Join(repo, "a.go")
 	past := time.Now().Add(-time.Hour)
@@ -505,9 +499,7 @@ func TestIsStaleOnNewerMtime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetIndexedAt(time.Now()); err != nil {
-		t.Fatal(err)
-	}
+	markIndexed(t, s, time.Now())
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}

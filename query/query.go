@@ -25,6 +25,7 @@ type Options struct {
 	Package           string
 	File              string
 	Repo              string
+	Generated         store.GeneratedFilter
 	EdgeTypes         []string
 	Depth             int
 	IncludeTests      bool
@@ -44,6 +45,11 @@ var (
 	WithPackage  = opt.New(func(o *Options, pkg string) { o.Package = pkg })
 	WithFile     = opt.New(func(o *Options, file string) { o.File = file })
 	WithDepth    = opt.New(func(o *Options, depth int) { o.Depth = depth })
+
+	// WithGenerated selects how search treats generated-code symbols: keep them
+	// (store.GeneratedAny, the default), drop them (GeneratedExclude), or keep
+	// only them (GeneratedOnly).
+	WithGenerated = opt.New(func(o *Options, filter store.GeneratedFilter) { o.Generated = filter })
 )
 
 // WithTests includes test packages and symbols in the result.
@@ -86,6 +92,7 @@ type SymbolDetail struct {
 	Repo          string `json:"repo,omitempty"`
 	PosLine       int
 	Exported      bool
+	Generated     bool
 }
 
 type EdgeDetail struct {
@@ -132,6 +139,7 @@ type SearchResult struct {
 	Repo          string `json:"repo,omitempty"`
 	PosLine       int
 	Exported      bool
+	Generated     bool
 }
 
 func edgeTypeAllowed(edgeType string, allowed []string) bool {
@@ -363,6 +371,7 @@ func Show(s *store.Store, qualifiedName string, opts ...Option) (*ShowResult, er
 			PosFile:       sym.PosFile,
 			PosLine:       sym.PosLine,
 			Exported:      sym.Exported,
+			Generated:     sym.IsGenerated,
 			Repo:          sym.Repo,
 		},
 		IncomingEdges: []EdgeDetail{},
@@ -474,6 +483,7 @@ func symbolDetails(syms []store.Symbol, includeUnexported bool) []SymbolDetail {
 			PosFile:       sym.PosFile,
 			PosLine:       sym.PosLine,
 			Exported:      sym.Exported,
+			Generated:     sym.IsGenerated,
 			Repo:          sym.Repo,
 		})
 	}
@@ -487,15 +497,20 @@ func Search(s *store.Store, pattern string, opts ...Option) ([]SearchResult, err
 	var syms []store.Symbol
 	var err error
 	if options.File != "" {
-		syms, err = s.SearchSymbolsByFile(options.File, options.Kind, options.Exported, options.IncludeTests)
+		syms, err = s.SearchSymbolsByFile(options.File, options.Kind, options.Exported, options.IncludeTests, options.Generated)
 	} else {
-		syms, err = s.SearchSymbols(pattern, options.Kind, options.Exported, options.Package, options.IncludeTests)
+		syms, err = s.SearchSymbols(pattern, options.Kind, options.Exported, options.Package, options.IncludeTests, options.Generated)
 	}
 	if err != nil {
 		return nil, err
 	}
 
-	patternLower := strings.ToLower(pattern)
+	// Rank the matches before projecting them, so the ordering keys (test and
+	// generated provenance) do not have to be carried on the result payload.
+	if options.File == "" {
+		sortSymbolsForSearch(syms, strings.ToLower(pattern))
+	}
+
 	result := make([]SearchResult, 0, len(syms))
 	for _, sym := range syms {
 		result = append(result, SearchResult{
@@ -507,13 +522,11 @@ func Search(s *store.Store, pattern string, opts ...Option) ([]SearchResult, err
 			PosFile:       sym.PosFile,
 			PosLine:       sym.PosLine,
 			Exported:      sym.Exported,
+			Generated:     sym.IsGenerated,
 			Repo:          sym.Repo,
 		})
 	}
 
-	if options.File == "" {
-		sortSearchResults(result, patternLower)
-	}
 	return filterSearchResults(result, options.Repo), nil
 }
 
@@ -538,16 +551,19 @@ func kindPriority(kind string) int {
 	}
 }
 
-func sortSearchResults(results []SearchResult, patternLower string) {
+// sortSymbolsForSearch orders search matches by name-match tier, then exported,
+// then kind, and finally pushes test and generated symbols after non-test,
+// non-generated ones at the same rank. Down-ranking never removes a match.
+func sortSymbolsForSearch(syms []store.Symbol, patternLower string) {
 	// Lowercase the qualified names once; the comparator fires O(n log n) times
 	// and would otherwise re-lower the same string per comparison.
-	keys := make([]string, len(results))
-	for i := range results {
-		keys[i] = strings.ToLower(results[i].QualifiedName)
+	keys := make([]string, len(syms))
+	for i := range syms {
+		keys[i] = strings.ToLower(syms[i].QualifiedName)
 	}
-	sort.SliceStable(results, func(i, j int) bool {
-		a := &results[i]
-		b := &results[j]
+	sort.SliceStable(syms, func(i, j int) bool {
+		a := &syms[i]
+		b := &syms[j]
 
 		aTier := matchTier(keys[i], patternLower)
 		bTier := matchTier(keys[j], patternLower)
@@ -559,8 +575,37 @@ func sortSearchResults(results []SearchResult, patternLower string) {
 			return a.Exported
 		}
 
-		return kindPriority(a.Kind) < kindPriority(b.Kind)
+		if aKind, bKind := kindPriority(a.Kind), kindPriority(b.Kind); aKind != bKind {
+			return aKind < bKind
+		}
+
+		if a.IsTest != b.IsTest {
+			return !a.IsTest
+		}
+
+		if a.IsGenerated != b.IsGenerated {
+			return !a.IsGenerated
+		}
+
+		return false
 	})
+}
+
+// filterGenerated applies the generated filter to results already fetched from
+// the store. It is used by the search modes whose store queries do not carry the
+// filter.
+func filterGenerated(results []SearchResult, filter store.GeneratedFilter) []SearchResult {
+	if filter != store.GeneratedExclude && filter != store.GeneratedOnly {
+		return results
+	}
+	keepGenerated := filter == store.GeneratedOnly
+	out := make([]SearchResult, 0, len(results))
+	for _, r := range results {
+		if r.Generated == keepGenerated {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 func MethodsOf(s *store.Store, typeName string, opts ...Option) ([]SymbolDetail, error) {
@@ -587,6 +632,7 @@ func MethodsOf(s *store.Store, typeName string, opts ...Option) ([]SymbolDetail,
 			PosFile:       sym.PosFile,
 			PosLine:       sym.PosLine,
 			Exported:      sym.Exported,
+			Generated:     sym.IsGenerated,
 			Repo:          sym.Repo,
 		})
 	}
@@ -815,6 +861,8 @@ func SearchByPrefix(s *store.Store, prefix string, opts ...Option) ([]SearchResu
 		return nil, err
 	}
 
+	sortSymbolsForSearch(syms, strings.ToLower(prefix))
+
 	result := make([]SearchResult, 0, len(syms))
 	for _, sym := range syms {
 		result = append(result, SearchResult{
@@ -826,11 +874,12 @@ func SearchByPrefix(s *store.Store, prefix string, opts ...Option) ([]SearchResu
 			PosFile:       sym.PosFile,
 			PosLine:       sym.PosLine,
 			Exported:      sym.Exported,
+			Generated:     sym.IsGenerated,
 			Repo:          sym.Repo,
 		})
 	}
 
-	return filterSearchResults(result, options.Repo), nil
+	return filterSearchResults(filterGenerated(result, options.Generated), options.Repo), nil
 }
 
 func TransitiveImports(s *store.Store, pkgPath string, opts ...Option) ([]EdgeDetail, error) {
@@ -923,6 +972,7 @@ func TypeUsage(s *store.Store, typeName string, opts ...Option) ([]SearchResult,
 			PosFile:       sym.PosFile,
 			PosLine:       sym.PosLine,
 			Exported:      sym.Exported,
+			Generated:     sym.IsGenerated,
 			Repo:          sym.Repo,
 		})
 	}
@@ -1061,6 +1111,8 @@ func MethodSearch(s *store.Store, methodName string, opts ...Option) ([]SearchRe
 		return nil, err
 	}
 
+	sortSymbolsForSearch(syms, strings.ToLower(methodName))
+
 	result := make([]SearchResult, 0, len(syms))
 	for _, sym := range syms {
 		result = append(result, SearchResult{
@@ -1072,10 +1124,11 @@ func MethodSearch(s *store.Store, methodName string, opts ...Option) ([]SearchRe
 			PosFile:       sym.PosFile,
 			PosLine:       sym.PosLine,
 			Exported:      sym.Exported,
+			Generated:     sym.IsGenerated,
 			Repo:          sym.Repo,
 		})
 	}
-	return filterSearchResults(result, options.Repo), nil
+	return filterSearchResults(filterGenerated(result, options.Generated), options.Repo), nil
 }
 
 type InterfaceImpl struct {
@@ -1152,7 +1205,7 @@ func symbolMissError(s *store.Store, qualifiedName string) error {
 // qualified-name prefix search when the short name matches nothing (e.g. a
 // package-path-only input).
 func symbolCandidates(s *store.Store, short, pkgPrefix string) []string {
-	syms, err := s.SearchSymbols(short, "", nil, "", false)
+	syms, err := s.SearchSymbols(short, "", nil, "", false, store.GeneratedAny)
 	if err != nil || len(syms) == 0 {
 		syms, err = s.SearchByQualifiedNamePrefix(short, false)
 		if err != nil {
@@ -1230,7 +1283,7 @@ func UnusedSymbols(s *store.Store, opts ...Option) ([]UnusedSymbol, error) {
 
 	unused := make([]UnusedSymbol, 0)
 	for _, sym := range allSyms {
-		if sym.Exported {
+		if sym.Exported || sym.IsGenerated {
 			continue
 		}
 		if !called[sym.QualifiedName] {
@@ -1401,7 +1454,7 @@ func canonicalCycle(cycle []string) string {
 func SymbolsInFile(s *store.Store, filePath string, opts ...Option) ([]SearchResult, error) {
 	options := &Options{}
 	opt.Apply(options, opts)
-	syms, err := s.SearchSymbolsByFile(filePath, "", nil, false)
+	syms, err := s.SearchSymbolsByFile(filePath, "", nil, false, store.GeneratedAny)
 	if err != nil {
 		return nil, err
 	}
@@ -1417,6 +1470,7 @@ func SymbolsInFile(s *store.Store, filePath string, opts ...Option) ([]SearchRes
 			PosFile:       sym.PosFile,
 			PosLine:       sym.PosLine,
 			Exported:      sym.Exported,
+			Generated:     sym.IsGenerated,
 			Repo:          sym.Repo,
 		})
 	}
@@ -2484,7 +2538,7 @@ func incSummary(ct string, result *ChangedSymbolsResult) {
 }
 
 func processChangedFile(s *store.Store, result *ChangedSymbolsResult, file, changeType string, withBlast, includeBodies, includeTests bool, seen map[string]bool, hunks []vcs.Hunk) error {
-	syms, err := s.SearchSymbolsByFile(file, "", nil, includeTests)
+	syms, err := s.SearchSymbolsByFile(file, "", nil, includeTests, store.GeneratedAny)
 	if err != nil {
 		return fmt.Errorf("changed_symbols: symbols in %s: %w", file, err)
 	}
@@ -2745,6 +2799,19 @@ func trimBundle(b *Bundle, budget int) {
 	}
 }
 
+// filterOutGenerated drops generated-code symbols. hotspots, importance, and
+// unused make claims ("top risk", "dead code") that generated output cannot
+// meaningfully satisfy, so provenance is excluded there rather than ranked.
+func filterOutGenerated(syms []store.Symbol) []store.Symbol {
+	out := make([]store.Symbol, 0, len(syms))
+	for _, sym := range syms {
+		if !sym.IsGenerated {
+			out = append(out, sym)
+		}
+	}
+	return out
+}
+
 type Hotspot struct {
 	QualifiedName string  `json:"qualified_name"`
 	Kind          string  `json:"kind"`
@@ -2772,6 +2839,7 @@ func Hotspots(s *store.Store, topN, minComplexity, minChurn int) ([]Hotspot, err
 	if err != nil {
 		return nil, err
 	}
+	allSyms = filterOutGenerated(allSyms)
 
 	var hotspots []Hotspot
 	for _, sym := range allSyms {
@@ -2825,6 +2893,7 @@ func SymbolImportance(s *store.Store, topN, scope int, opts ...Option) ([]Import
 	if err != nil {
 		return nil, err
 	}
+	allSyms = filterOutGenerated(allSyms)
 	if options.Repo != "" {
 		filtered := make([]store.Symbol, 0, len(allSyms))
 		for _, sym := range allSyms {

@@ -17,7 +17,7 @@ func singleFuncComplexity(t *testing.T, code string) int {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	res := Run("main", map[string]*ast.File{"test.go": f}, fset, false)
+	res := Run("main", map[string]*ast.File{"test.go": f}, fset, false, nil)
 
 	var funcSyms []Symbol
 	for _, s := range res.Symbols {
@@ -125,7 +125,7 @@ var g = func(x int) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	res := Run("main", map[string]*ast.File{"test.go": f}, fset, false)
+	res := Run("main", map[string]*ast.File{"test.go": f}, fset, false, nil)
 
 	for _, s := range res.Symbols {
 		switch s.Name {

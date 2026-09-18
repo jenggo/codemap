@@ -15,7 +15,8 @@
           "Doc": "AnotherBase provides different common functionality.\n",
           "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/embedding/embedding.go",
           "PosLine": 25,
-          "Exported": true
+          "Exported": true,
+          "Generated": false
         },
         {
           "QualifiedName": "codemap/testdata/embedding.AnotherBase.GetValue",
@@ -25,7 +26,8 @@
           "Doc": "GetValue returns the base value.\n",
           "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/embedding/embedding.go",
           "PosLine": 30,
-          "Exported": true
+          "Exported": true,
+          "Generated": false
         },
         {
           "QualifiedName": "codemap/testdata/embedding.Base",
@@ -35,7 +37,8 @@
           "Doc": "Base provides common functionality.\n",
           "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/embedding/embedding.go",
           "PosLine": 4,
-          "Exported": true
+          "Exported": true,
+          "Generated": false
         },
         {
           "QualifiedName": "codemap/testdata/embedding.Base.GetName",
@@ -45,7 +48,8 @@
           "Doc": "GetName returns the base name.\n",
           "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/embedding/embedding.go",
           "PosLine": 9,
-          "Exported": true
+          "Exported": true,
+          "Generated": false
         },
         {
           "QualifiedName": "codemap/testdata/embedding.Extended",
@@ -55,7 +59,8 @@
           "Doc": "Extended embeds Base and adds more functionality.\n",
           "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/embedding/embedding.go",
           "PosLine": 14,
-          "Exported": true
+          "Exported": true,
+          "Generated": false
         },
         {
           "QualifiedName": "codemap/testdata/embedding.Extended.GetFullName",
@@ -65,7 +70,8 @@
           "Doc": "GetFullName returns the full name combining base and extended.\n",
           "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/embedding/embedding.go",
           "PosLine": 20,
-          "Exported": true
+          "Exported": true,
+          "Generated": false
         },
         {
           "QualifiedName": "codemap/testdata/embedding.MultiEmbed",
@@ -75,7 +81,8 @@
           "Doc": "MultiEmbed embeds both Base and AnotherBase.\n",
           "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/embedding/embedding.go",
           "PosLine": 35,
-          "Exported": true
+          "Exported": true,
+          "Generated": false
         },
         {
           "QualifiedName": "codemap/testdata/embedding.MultiEmbed.GetInfo",
@@ -85,7 +92,8 @@
           "Doc": "GetInfo returns combined information from all embedded types.\n",
           "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/embedding/embedding.go",
           "PosLine": 42,
-          "Exported": true
+          "Exported": true,
+          "Generated": false
         }
       ],
       "ImportCount": 0
@@ -97,7 +105,8 @@
       "Name": "embedding",
       "Dir": "/home/jenggo/go/src/cli/codemap/testdata/embedding",
       "SymCount": 8,
-      "IsTest": false
+      "IsTest": false,
+      "IsGenerated": false
     }
   ]
 }

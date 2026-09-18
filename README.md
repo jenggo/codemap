@@ -33,15 +33,16 @@ codemap serve
 | `package <path>` | All symbols in a package with signatures and docs |
 | `methods-of <type>` | All methods on a type |
 | `list-packages` | List every indexed package |
+| `search-text <pattern>` | Search file contents (FTS5, or regex with `--regex`) |
+| `pattern <pattern>` | Match Go AST subtrees against a Go source snippet with `$UPPERCASE` metavariables (ast-grep style), e.g. `defer $CALL`; syntactic only, repeated metavariables must bind identical nodes |
 
 ### Graph Queries
 | Command | What it does |
 |---|---|
-| `callers-of <name>` | Find all callers of a symbol (transitively via `--edge-types` + `--depth`) |
+| `callers-of <name>` | Find all callers of a symbol (filter edge types with `--edge-types`; MCP `callers_of` adds transitive traversal via `depth`) |
 | `callees-of <name>` | Find all symbols a function depends on |
 | `importers-of <pkg>` | Packages that import the given package |
 | `imports-of <pkg>` | Packages imported by the given package |
-| `transitive-imports <pkg>` | Full dependency tree |
 | `edges-by-type <type>` | All edges of a type: calls, references, satisfies (impl), embeds, imports |
 | `all-edges` | Every relationship in the index |
 
@@ -57,6 +58,7 @@ codemap serve
 | **Symbols in file** | Find all symbols defined in a given file |
 | **Search by prefix** | Find all symbols whose qualified name starts with a prefix |
 | **Method search** | Find all methods with a given name across all types |
+| **Generated-code handling** | Generated files (code-generation markers or filename conventions) are flagged in the index; search down-ranks (never hides) them by default, `--generated exclude|only` filters them, and hotspots, importance, and unused reports skip them |
 
 ### Cross-Repo Contract Intelligence
 
@@ -94,6 +96,7 @@ Commands: `contracts`, `contract-drift`, `runtime-contracts` (MCP: `contracts`, 
 - **Plugin** — installs a soft-mode guard to `~/.config/opencode/plugins/codemap-guard.ts` that warns agents when they use grep/glob/read on `.go` files instead of codemap MCP tools
 - **Crush** — injects MCP config into `~/.config/crush/crush.json`
 - **Command Code** — installs a soft-mode guard mod to `~/.commandcode/mods/codemap-guard.ts` (skipped when `~/.commandcode` is absent)
+- **Maki** — installs a Lua guard plugin (`codemap-guard.lua`) and permission grants into `~/.maki` (or `~/.config/maki`), skipped when neither config dir exists
 - **AGENTS.md** — creates project-level guidance for AI agents (skipped if already exists)
 
 Re-run `codemap init` after upgrading codemap to refresh the installed opencode plugin, navigation doc, and Command Code mod; the command reports `updated` or `unchanged` per artifact, and each guard carries a `Version:` marker.
@@ -116,6 +119,16 @@ codemap <command> [args] [flags]
 | `--exported <bool>` | Filter by exported status |
 | `--edge-types <types>` | Comma-separated edge type filter (calls, references, satisfies, embeds, imports) |
 | `--package <pkg>` | Filter by package path |
+| `--repo <module>` | Scope query to one workspace repo (search/show/callers-of/callees-of/importers-of/imports-of/blast-radius/pattern) |
+| `--generated <mode>` | Generated-code handling for search: `any` (default), `exclude`, or `only` |
+| `--file-pattern <glob>` | Filter by file-path substring (for `pattern`) |
+| `--regex` | Use regex mode (for `search-text`) |
+| `--context-lines <n>` | Context lines around matches (for `search-text`) |
+| `--top-n <n>` | Number of results (for `hotspots`/`importance`) |
+| `--min-complexity <n>` / `--min-churn <n>` | Minimum thresholds (for `hotspots`) |
+| `--workspace` | Index as a workspace (with `index`) |
+| `--discover` | Auto-discover sibling Go modules as a workspace (with `index --workspace`) |
+| `--severity <level>` / `--direction <dir>` / `--min-confidence <f>` | Filter contract results (severity: compatible/breaking/unknown; direction: producer/consumer/shared; for `contracts` and `contract-drift`) |
 
 ## How It Works
 
@@ -126,10 +139,3 @@ codemap <command> [args] [flags]
 
 Indexing is automatic on first query and re-indexes when source files change. A manual `index` command is available to force re-indexing.
 
-## Installation
-
-```bash
-go install codemap/cmd/codemap@latest
-```
-
-Requires Go 1.26+.

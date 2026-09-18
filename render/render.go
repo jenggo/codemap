@@ -71,6 +71,7 @@ type symJSON struct {
 	Doc           string `json:"doc"`
 	PosLine       int    `json:"pos_line"`
 	Exported      bool   `json:"exported"`
+	Generated     bool   `json:"generated"`
 }
 
 func renderOverviewJSON(result *query.OverviewResult, fullDocs bool) string {
@@ -291,14 +292,14 @@ func RenderSearch(results []query.SearchResult, opts ...Option) string {
 	case FormatCompact:
 		var b strings.Builder
 		for _, r := range results {
-			fmt.Fprintf(&b, "%s %s\n", r.Kind, r.QualifiedName)
+			fmt.Fprintf(&b, "%s %s%s\n", r.Kind, r.QualifiedName, generatedMark(r.Generated))
 		}
 		return b.String()
 	case FormatText:
 		var b strings.Builder
 		for _, r := range results {
 			doc := firstSentence(r.Doc)
-			fmt.Fprintf(&b, "%s %s\n", r.QualifiedName, r.Kind)
+			fmt.Fprintf(&b, "%s %s%s\n", r.QualifiedName, r.Kind, generatedMark(r.Generated))
 			if doc != "" {
 				fmt.Fprintf(&b, "  %s\n", doc)
 			}
@@ -376,13 +377,13 @@ func RenderMethodsOf(methods []query.SymbolDetail, opts ...Option) string {
 	case FormatCompact:
 		var b strings.Builder
 		for _, m := range methods {
-			fmt.Fprintf(&b, "%s %s\n", m.Kind, m.QualifiedName)
+			fmt.Fprintf(&b, "%s %s%s\n", m.Kind, m.QualifiedName, generatedMark(m.Generated))
 		}
 		return b.String()
 	case FormatText:
 		var b strings.Builder
 		for _, m := range methods {
-			fmt.Fprintf(&b, "%s (%s)\n", m.QualifiedName, m.Kind)
+			fmt.Fprintf(&b, "%s (%s)%s\n", m.QualifiedName, m.Kind, generatedMark(m.Generated))
 			fmt.Fprintf(&b, "  receiver: %s\n", m.Receiver)
 			fmt.Fprintf(&b, "  signature: %s\n", m.Signature)
 			fmt.Fprintf(&b, "  pos: %s:%d\n", m.PosFile, m.PosLine)
@@ -436,7 +437,7 @@ func renderPackageText(pkg *query.PackageResult) string {
 		if !sym.Exported {
 			label = "unexported " + label
 		}
-		fmt.Fprintf(&b, "    - %s (%s)\n", label, sym.Kind)
+		fmt.Fprintf(&b, "    - %s (%s)%s\n", label, sym.Kind, generatedMark(sym.Generated))
 		if sym.Receiver != "" {
 			fmt.Fprintf(&b, "      receiver: %s\n", sym.Receiver)
 		}
@@ -586,8 +587,18 @@ func symToJSON(sym query.SymbolDetail, fullDocs bool) symJSON {
 		PosFile:       sym.PosFile,
 		PosLine:       sym.PosLine,
 		Exported:      sym.Exported,
+		Generated:     sym.Generated,
 		Doc:           doc,
 	}
+}
+
+// generatedMark annotates a symbol line rendered as text, where the structured
+// generated field is not visible.
+func generatedMark(generated bool) string {
+	if generated {
+		return " [generated]"
+	}
+	return ""
 }
 
 func firstSentence(s string) string {
@@ -997,7 +1008,7 @@ func renderChangedSymbolsText(r *query.ChangedSymbolsResult) string {
 		}
 		if sym.Body != "" {
 			b.WriteString("  ```go\n")
-			b.WriteString(indentEach(sym.Body, "  "))
+			b.WriteString(indentEach(sym.Body))
 			b.WriteString("  ```\n")
 		}
 	}
@@ -1022,7 +1033,7 @@ func renderChangedSymbolsCompact(r *query.ChangedSymbolsResult) string {
 	return b.String()
 }
 
-func indentEach(s, prefix string) string {
+func indentEach(s string) string {
 	lines := strings.Split(s, "\n")
 	var b strings.Builder
 	for i, line := range lines {
@@ -1030,7 +1041,7 @@ func indentEach(s, prefix string) string {
 			b.WriteString("\n")
 		}
 		if line != "" {
-			b.WriteString(prefix)
+			b.WriteString("  ")
 		}
 		b.WriteString(line)
 	}
@@ -1058,11 +1069,11 @@ func RenderTextMatches(matches []store.FileMatch, opts ...Option) string {
 				fmt.Fprintf(&b, "  %s\n", m.Line)
 			}
 			if m.ContextBefore != "" {
-				b.WriteString(indentEach(m.ContextBefore, "  "))
+				b.WriteString(indentEach(m.ContextBefore))
 				b.WriteString("\n")
 			}
 			if m.ContextAfter != "" {
-				b.WriteString(indentEach(m.ContextAfter, "  "))
+				b.WriteString(indentEach(m.ContextAfter))
 				b.WriteString("\n")
 			}
 		}
@@ -1077,6 +1088,49 @@ func RenderTextMatches(matches []store.FileMatch, opts ...Option) string {
 		}
 		return b.String()
 	}
+}
+
+func RenderPatternMatches(matches []query.PatternMatch, opts ...Option) string {
+	options := &Options{}
+	opt.Apply(options, opts)
+
+	switch options.Format {
+	case FormatJSON:
+		return marshalJSON(matches)
+	case FormatCompact:
+		var b strings.Builder
+		for _, m := range matches {
+			fmt.Fprintf(&b, "%s:%d%s %s\n", m.File, m.Line, symbolTag(m.Symbol), oneLine(m.Text))
+		}
+		return b.String()
+	case FormatTOON, FormatText:
+		var b strings.Builder
+		for _, m := range matches {
+			fmt.Fprintf(&b, "%s:%d%s\n", m.File, m.Line, symbolTag(m.Symbol))
+			if text := strings.TrimSpace(m.Text); text != "" {
+				b.WriteString(indentEach(text))
+				b.WriteString("\n")
+			}
+		}
+		return b.String()
+	default:
+		return marshalJSON(matches)
+	}
+}
+
+// symbolTag annotates a match line with its enclosing symbol. The empty string
+// keeps the line clean for matches that lie outside every indexed symbol.
+func symbolTag(symbol string) string {
+	if symbol == "" {
+		return ""
+	}
+	return " [" + symbol + "]"
+}
+
+// oneLine collapses a multi-line match text into a single line for compact
+// output.
+func oneLine(text string) string {
+	return strings.Join(strings.Fields(text), " ")
 }
 
 func RenderBundle(bundle *query.Bundle, opts ...Option) string {

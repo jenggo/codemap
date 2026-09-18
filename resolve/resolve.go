@@ -36,6 +36,7 @@ type parseContext struct {
 	fileToDir map[string]string      // file path -> owning package dir
 	pkgFiles  map[string][]*ast.File // package import path -> AST files
 	pathByAST map[*ast.File]string   // AST pointer -> file path
+	generated map[string]bool        // file path -> generated code
 }
 
 func newParseContext(pr *parse.Result) *parseContext {
@@ -45,6 +46,7 @@ func newParseContext(pr *parse.Result) *parseContext {
 		fileToDir: make(map[string]string),
 		pkgFiles:  make(map[string][]*ast.File),
 		pathByAST: make(map[*ast.File]string, len(pr.Files)),
+		generated: pr.GeneratedFiles,
 	}
 	for path, af := range pr.Files {
 		ctx.pathByAST[af] = path
@@ -222,7 +224,7 @@ func processPackage(conf *types.Config, ctx *parseContext, pkgInfo parse.Package
 			fileMap[path] = f
 		}
 	}
-	extResult := extract.Run(pkgInfo.ImportPath, fileMap, ctx.fset, pkgInfo.IsTest)
+	extResult := extract.Run(pkgInfo.ImportPath, fileMap, ctx.fset, pkgInfo.IsTest, ctx.generated)
 
 	for _, sym := range extResult.Symbols {
 		result.Symbols = append(result.Symbols, ResolvedSymbol{Symbol: sym})

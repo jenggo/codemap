@@ -92,7 +92,7 @@ func TestFileSearchMatchesPercentLiterally(t *testing.T) {
 
 	// Pattern "100%" must match only the file whose name literally contains
 	// "100%" and not the file containing "100x".
-	syms, err := s.SearchSymbolsByFile("100%", "", nil, false)
+	syms, err := s.SearchSymbolsByFile("100%", "", nil, false, GeneratedAny)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +117,7 @@ func TestFileSearchMatchesBackslashLiterally(t *testing.T) {
 	s := seedSearchModule(t)
 
 	// Pattern "a\b" must match the file named `a\b.go` and not `ab.go`.
-	syms, err := s.SearchSymbolsByFile(`a\b`, "", nil, false)
+	syms, err := s.SearchSymbolsByFile(`a\b`, "", nil, false, GeneratedAny)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -518,7 +518,7 @@ func TestSearchSymbolsPartialIdentifier(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			syms, err := s.SearchSymbols(tc.pattern, "", nil, "", false)
+			syms, err := s.SearchSymbols(tc.pattern, "", nil, "", false, GeneratedAny)
 			if err != nil {
 				t.Fatalf("search %q: %v", tc.pattern, err)
 			}

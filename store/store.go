@@ -113,12 +113,13 @@ CREATE TABLE IF NOT EXISTS repos (
 );
 
 CREATE TABLE IF NOT EXISTS packages (
-    id          INTEGER PRIMARY KEY,
-    path        TEXT    NOT NULL UNIQUE,
-    name        TEXT    NOT NULL,
-    dir         TEXT    NOT NULL,
-    is_test     BOOLEAN NOT NULL DEFAULT FALSE,
-    repo_id     INTEGER REFERENCES repos(id)
+    id           INTEGER PRIMARY KEY,
+    path         TEXT    NOT NULL UNIQUE,
+    name         TEXT    NOT NULL,
+    dir          TEXT    NOT NULL,
+    is_test      BOOLEAN NOT NULL DEFAULT FALSE,
+    is_generated BOOLEAN NOT NULL DEFAULT FALSE,
+    repo_id      INTEGER REFERENCES repos(id)
 );
 
 CREATE TABLE IF NOT EXISTS symbols (
@@ -134,6 +135,7 @@ CREATE TABLE IF NOT EXISTS symbols (
     pos_line        INTEGER NOT NULL,
     exported        BOOLEAN NOT NULL DEFAULT FALSE,
     is_test         BOOLEAN NOT NULL DEFAULT FALSE,
+    is_generated    BOOLEAN NOT NULL DEFAULT FALSE,
     complexity      INTEGER NOT NULL DEFAULT 0,
     churn_count     INTEGER NOT NULL DEFAULT 0,
     importance      REAL    NOT NULL DEFAULT 0.0,
@@ -264,7 +266,40 @@ CREATE VIRTUAL TABLE IF NOT EXISTS response_chunks USING fts5(
 `
 
 const andIsTestFalse = " AND s.is_test = FALSE"
+const andGeneratedFalse = " AND s.is_generated = FALSE"
+const andGeneratedTrue = " AND s.is_generated = TRUE"
 const orderByQualifiedName = " ORDER BY s.qualified_name"
+
+// GeneratedFilter selects how a search treats generated-code symbols.
+type GeneratedFilter string
+
+const (
+	// GeneratedAny keeps generated symbols (the default).
+	GeneratedAny GeneratedFilter = "any"
+	// GeneratedExclude drops generated symbols from the results.
+	GeneratedExclude GeneratedFilter = "exclude"
+	// GeneratedOnly returns only generated symbols.
+	GeneratedOnly GeneratedFilter = "only"
+)
+
+// GeneratedFilterNames lists the accepted filter values, for CLI and MCP
+// argument validation.
+var GeneratedFilterNames = []string{string(GeneratedAny), string(GeneratedExclude), string(GeneratedOnly)}
+
+// generatedClause returns the SQL predicate for a generated filter. GeneratedAny
+// (and any unrecognized value) does not filter.
+func generatedClause(filter GeneratedFilter) string {
+	switch filter {
+	case GeneratedExclude:
+		return andGeneratedFalse
+	case GeneratedOnly:
+		return andGeneratedTrue
+	case GeneratedAny:
+		return ""
+	default:
+		return ""
+	}
+}
 
 type Store struct {
 	db *sql.DB
@@ -368,6 +403,11 @@ func ensureSchema(db *sql.DB) error {
 		return err
 	}
 
+	// Generated-code provenance (additive boolean columns).
+	if err := ensureGeneratedColumns(ctx, db); err != nil {
+		return err
+	}
+
 	// Struct field info for contract shape matching (additive).
 	hasFields, err := columnExists(db, "symbols", "fields_json")
 	if err != nil {
@@ -454,6 +494,46 @@ func ensureRepoIDColumns(ctx context.Context, db *sql.DB) error {
 		}
 	}
 	return nil
+}
+
+// ensureGeneratedColumns adds the generated-code provenance column to the
+// packages and symbols tables when missing (additive migration from the
+// pre-provenance schema). Existing rows default to FALSE; the one-time reindex
+// triggered by a missing generatedProvenanceKey repopulates them with real
+// values.
+func ensureGeneratedColumns(ctx context.Context, db *sql.DB) error {
+	for _, table := range []string{"packages", "symbols"} {
+		hasCol, err := columnExists(db, table, generatedColumn)
+		if err != nil {
+			return fmt.Errorf("ensure schema: inspect %s.%s: %w", table, generatedColumn, err)
+		}
+		if !hasCol {
+			if _, err := db.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN "+generatedColumn+" BOOLEAN NOT NULL DEFAULT FALSE"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// generatedColumn is the shared provenance column name on packages and symbols.
+const generatedColumn = "is_generated"
+
+// generatedProvenanceKey records the generated-code provenance version an index
+// was built with. Its absence marks an index built before generated detection
+// existed: the staleness checks report such an index as stale so it is rebuilt
+// once, populating real values instead of the column default.
+const generatedProvenanceKey = "generated_provenance_version"
+
+// generatedProvenanceVersion is the current generated-code provenance version.
+const generatedProvenanceVersion = "1"
+
+// setGeneratedProvenanceTx records the provenance version inside an index write
+// transaction, so staleness checks stop reindexing once provenance is populated.
+func setGeneratedProvenanceTx(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`,
+		generatedProvenanceKey, generatedProvenanceVersion)
+	return err
 }
 
 // migrateFileContentFTS recreates file_content_fts with the trigram tokenizer.
@@ -789,7 +869,18 @@ func (s *Store) writeTx(ctx context.Context, tx *sql.Tx, result *resolve.Result,
 
 	// Overflow response chunks are a cache keyed to the previous index
 	// generation; any successful full index write invalidates them.
-	return deleteResponseChunksTx(ctx, tx)
+	return completeIndexWrite(ctx, tx)
+}
+
+// completeIndexWrite runs the bookkeeping shared by every successful index
+// write: the overflow response cache is keyed to the previous index generation,
+// and the generated-code provenance version records that this index populated
+// the provenance columns (so staleness checks stop rebuilding for it).
+func completeIndexWrite(ctx context.Context, tx *sql.Tx) error {
+	if err := deleteResponseChunksTx(ctx, tx); err != nil {
+		return err
+	}
+	return setGeneratedProvenanceTx(ctx, tx)
 }
 
 // registerRepos upserts every member into the repos table (workspace mode) and
@@ -867,7 +958,7 @@ func (s *Store) ReplaceRepo(result *resolve.Result, files map[string]string, chu
 			}
 		}
 		// A per-member re-index also invalidates the overflow cache.
-		return deleteResponseChunksTx(ctx, tx)
+		return completeIndexWrite(ctx, tx)
 	})
 }
 
@@ -974,8 +1065,8 @@ func writePackages(ctx context.Context, tx *sql.Tx, packages []parse.PackageInfo
 	for _, pkg := range packages {
 		repoID := repoByModule[pkg.ModulePath]
 		var id int64
-		_, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO packages (path, name, dir, is_test, repo_id) VALUES (?, ?, ?, ?, ?)`,
-			pkg.ImportPath, pkg.Name, pkg.Dir, pkg.IsTest, nullableRepo(repoID))
+		_, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO packages (path, name, dir, is_test, is_generated, repo_id) VALUES (?, ?, ?, ?, ?, ?)`,
+			pkg.ImportPath, pkg.Name, pkg.Dir, pkg.IsTest, pkg.IsGenerated, nullableRepo(repoID))
 		if err != nil {
 			return nil, err
 		}
@@ -1053,7 +1144,7 @@ func longestPackagePrefix(ref string, paths map[string]int64) string {
 }
 
 func writeSymbols(ctx context.Context, tx *sql.Tx, symbols []resolve.ResolvedSymbol, attrib *pkgAttribution) error {
-	symInsert := `INSERT OR IGNORE INTO symbols (qualified_name, package_id, name, kind, receiver, signature, doc, pos_file, pos_line, exported, is_test, complexity, repo_id, fields_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	symInsert := `INSERT OR IGNORE INTO symbols (qualified_name, package_id, name, kind, receiver, signature, doc, pos_file, pos_line, exported, is_test, is_generated, complexity, repo_id, fields_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	for _, sym := range symbols {
 		pkgID, repoID := attrib.pkgFor(sym.Symbol.QualifiedName)
@@ -1082,6 +1173,7 @@ func writeSymbols(ctx context.Context, tx *sql.Tx, symbols []resolve.ResolvedSym
 			sym.Symbol.Pos.Line,
 			sym.Symbol.Exported,
 			sym.Symbol.IsTest,
+			sym.Symbol.IsGenerated,
 			sym.Symbol.Complexity,
 			nullableRepo(repoID),
 			fieldsJSON,
@@ -1302,12 +1394,13 @@ func ftsNeedsFullScan(pattern string) bool {
 }
 
 type Package struct {
-	Path     string
-	Name     string
-	Dir      string
-	Repo     string `json:"repo,omitempty"`
-	SymCount int
-	IsTest   bool
+	Path        string
+	Name        string
+	Dir         string
+	Repo        string `json:"repo,omitempty"`
+	SymCount    int
+	IsTest      bool
+	IsGenerated bool
 }
 
 // SymbolField mirrors extract.StructField: one struct field's Go name,
@@ -1335,6 +1428,7 @@ type Symbol struct {
 	Importance    float64
 	Exported      bool
 	IsTest        bool
+	IsGenerated   bool
 }
 
 type FileMatch struct {
@@ -1489,7 +1583,7 @@ const (
 	repoStateMissing = "missing"
 )
 
-const symbolColumns = `s.qualified_name, p.path, s.name, s.kind, s.receiver, s.signature, s.doc, s.pos_file, s.pos_line, s.exported, s.is_test, s.complexity, s.churn_count, s.importance, s.repo_id, r.module_path, s.fields_json`
+const symbolColumns = `s.qualified_name, p.path, s.name, s.kind, s.receiver, s.signature, s.doc, s.pos_file, s.pos_line, s.exported, s.is_test, s.is_generated, s.complexity, s.churn_count, s.importance, s.repo_id, r.module_path, s.fields_json`
 
 const symbolFrom = `FROM symbols s
 		JOIN packages p ON s.package_id = p.id
@@ -1500,7 +1594,7 @@ func scanSymbol(rows *sql.Rows) (Symbol, error) {
 	var repoID sql.NullInt64
 	var repo sql.NullString
 	var fieldsJSON sql.NullString
-	err := rows.Scan(&sym.QualifiedName, &sym.PackagePath, &sym.Name, &sym.Kind, &sym.Receiver, &sym.Signature, &sym.Doc, &sym.PosFile, &sym.PosLine, &sym.Exported, &sym.IsTest, &sym.Complexity, &sym.ChurnCount, &sym.Importance, &repoID, &repo, &fieldsJSON)
+	err := rows.Scan(&sym.QualifiedName, &sym.PackagePath, &sym.Name, &sym.Kind, &sym.Receiver, &sym.Signature, &sym.Doc, &sym.PosFile, &sym.PosLine, &sym.Exported, &sym.IsTest, &sym.IsGenerated, &sym.Complexity, &sym.ChurnCount, &sym.Importance, &repoID, &repo, &fieldsJSON)
 	sym.Repo = repo.String
 	if err != nil {
 		return sym, err
@@ -1531,7 +1625,7 @@ func scanSymbols(rows *sql.Rows) ([]Symbol, error) {
 
 func (s *Store) ListPackages() ([]Package, error) {
 	rows, err := s.db.QueryContext(context.Background(), `
-		SELECT p.path, p.name, p.dir, p.is_test, COUNT(s.id), r.module_path
+		SELECT p.path, p.name, p.dir, p.is_test, p.is_generated, COUNT(s.id), r.module_path
 		FROM packages p
 		LEFT JOIN symbols s ON s.package_id = p.id
 		LEFT JOIN repos r ON r.id = p.repo_id
@@ -1547,7 +1641,7 @@ func (s *Store) ListPackages() ([]Package, error) {
 	for rows.Next() {
 		var p Package
 		var repo sql.NullString
-		if err := rows.Scan(&p.Path, &p.Name, &p.Dir, &p.IsTest, &p.SymCount, &repo); err != nil {
+		if err := rows.Scan(&p.Path, &p.Name, &p.Dir, &p.IsTest, &p.IsGenerated, &p.SymCount, &repo); err != nil {
 			return nil, err
 		}
 		p.Repo = repo.String
@@ -1587,7 +1681,7 @@ func (s *Store) SymbolByName(qualifiedName string) (*Symbol, error) {
 	err := s.db.QueryRowContext(context.Background(), `SELECT `+symbolColumns+`
 		`+symbolFrom+`
 		WHERE s.qualified_name = ?
-	`, qualifiedName).Scan(&sym.QualifiedName, &sym.PackagePath, &sym.Name, &sym.Kind, &sym.Receiver, &sym.Signature, &sym.Doc, &sym.PosFile, &sym.PosLine, &sym.Exported, &sym.IsTest, &sym.Complexity, &sym.ChurnCount, &sym.Importance, &repoID, &repo, &fieldsJSON)
+	`, qualifiedName).Scan(&sym.QualifiedName, &sym.PackagePath, &sym.Name, &sym.Kind, &sym.Receiver, &sym.Signature, &sym.Doc, &sym.PosFile, &sym.PosLine, &sym.Exported, &sym.IsTest, &sym.IsGenerated, &sym.Complexity, &sym.ChurnCount, &sym.Importance, &repoID, &repo, &fieldsJSON)
 	sym.Repo = repo.String
 	if err != nil {
 		return nil, err
@@ -2148,7 +2242,7 @@ func scanEdges(rows *sql.Rows) ([]Edge, error) {
 	return edges, nil
 }
 
-func (s *Store) SearchSymbolsByFile(filePattern, kind string, exported *bool, includeTests bool) ([]Symbol, error) {
+func (s *Store) SearchSymbolsByFile(filePattern, kind string, exported *bool, includeTests bool, generated GeneratedFilter) ([]Symbol, error) {
 	query := `SELECT ` + symbolColumns + `
 		` +
 		symbolFrom + `
@@ -2168,6 +2262,7 @@ func (s *Store) SearchSymbolsByFile(filePattern, kind string, exported *bool, in
 	if !includeTests {
 		query += andIsTestFalse
 	}
+	query += generatedClause(generated)
 	query += orderByQualifiedName
 
 	rows, err := s.db.QueryContext(context.Background(), query, args...)
@@ -2177,7 +2272,7 @@ func (s *Store) SearchSymbolsByFile(filePattern, kind string, exported *bool, in
 	return scanSymbols(rows)
 }
 
-func (s *Store) SearchSymbols(pattern, kind string, exported *bool, pkgPath string, includeTests bool) ([]Symbol, error) {
+func (s *Store) SearchSymbols(pattern, kind string, exported *bool, pkgPath string, includeTests bool, generated GeneratedFilter) ([]Symbol, error) {
 	ftsQuery := buildSymbolFTSQuery(pattern)
 	if ftsQuery == "" {
 		return nil, nil
@@ -2207,6 +2302,7 @@ func (s *Store) SearchSymbols(pattern, kind string, exported *bool, pkgPath stri
 	if !includeTests {
 		query += andIsTestFalse
 	}
+	query += generatedClause(generated)
 	query += orderByQualifiedName
 
 	rows, err := s.db.QueryContext(context.Background(), query, args...)
@@ -2547,6 +2643,11 @@ func (s *Store) IsRepoStale(modulePath string) (bool, error) {
 		return false, err
 	}
 	if !ok {
+		return true, nil
+	}
+	// Same provenance rule as StaleReason: a member indexed before generated
+	// detection must be rebuilt once so its symbols carry real values.
+	if _, ok := readMetaDB(s.db, generatedProvenanceKey); !ok {
 		return true, nil
 	}
 	var dir string
@@ -2951,6 +3052,55 @@ func (s *Store) FileContentsByRepo() (map[string]map[string]string, error) {
 	return out, rows.Err()
 }
 
+// IndexedFile is one indexed file row: its stored content and the module path
+// of the workspace member that owns it ("" when the index is single-repo).
+type IndexedFile struct {
+	Path    string
+	Content string
+	Repo    string
+}
+
+// IndexedFiles returns indexed files filtered to one workspace member (module
+// path) and a substring file-path filter, ordered by path. An empty repo
+// matches every row, including single-repo rows that carry no repo assignment —
+// unlike FileContentsByRepo, which groups by repo and drops those rows, and
+// which cannot filter by path.
+func (s *Store) IndexedFiles(repo, filePattern string) ([]IndexedFile, error) {
+	query := `SELECT f.path, f.content, COALESCE(r.module_path, '')
+		FROM files f
+		LEFT JOIN repos r ON r.id = f.repo_id`
+	var conds []string
+	var args []any
+	if repo != "" {
+		conds = append(conds, "COALESCE(r.module_path, '') = ?")
+		args = append(args, repo)
+	}
+	if filePattern != "" {
+		conds = append(conds, likeMatch("f.path"))
+		args = append(args, likePattern(filePattern))
+	}
+	if len(conds) > 0 {
+		query += " WHERE " + strings.Join(conds, " AND ")
+	}
+	query += " ORDER BY f.path"
+
+	rows, err := s.db.QueryContext(context.Background(), query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []IndexedFile
+	for rows.Next() {
+		var f IndexedFile
+		if err := rows.Scan(&f.Path, &f.Content, &f.Repo); err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
 // applyChurn applies git-churn counts to every symbol in the given files using
 // a single UPDATE backed by a temporary staging table. The statement count is
 // independent of the number of changed files; the pos_file lookup is serviced
@@ -3034,6 +3184,13 @@ func StaleReason(dbPath, repoPath string) (bool, string, error) {
 
 	if mismatch, known := repoIdentityMismatchDB(db, repoPath); known && mismatch {
 		return true, "indexed for a different repo path or git HEAD than the served repo", nil
+	}
+
+	// An index built before generated-code detection has no provenance marker and
+	// every is_generated column reads its FALSE default. Treat it as stale so it
+	// is rebuilt once and generated symbols become distinguishable.
+	if _, ok := readMetaDB(db, generatedProvenanceKey); !ok {
+		return true, "index predates generated-code provenance", nil
 	}
 
 	// Uncommitted edits do not change HEAD, so mtime-based checks can miss them

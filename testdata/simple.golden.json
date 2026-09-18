@@ -15,7 +15,8 @@
           "Doc": "NewParser creates a new Parser.\n",
           "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/simple/parser.go",
           "PosLine": 9,
-          "Exported": true
+          "Exported": true,
+          "Generated": false
         },
         {
           "QualifiedName": "codemap/testdata/simple.Parser",
@@ -25,7 +26,8 @@
           "Doc": "Parser parses input and produces output.\n",
           "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/simple/parser.go",
           "PosLine": 4,
-          "Exported": true
+          "Exported": true,
+          "Generated": false
         },
         {
           "QualifiedName": "codemap/testdata/simple.Parser.Parse",
@@ -35,7 +37,8 @@
           "Doc": "Parse processes the input and returns a result.\n",
           "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/simple/parser.go",
           "PosLine": 14,
-          "Exported": true
+          "Exported": true,
+          "Generated": false
         }
       ],
       "ImportCount": 0
@@ -47,7 +50,8 @@
       "Name": "simple",
       "Dir": "/home/jenggo/go/src/cli/codemap/testdata/simple",
       "SymCount": 4,
-      "IsTest": false
+      "IsTest": false,
+      "IsGenerated": false
     }
   ]
 }

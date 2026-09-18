@@ -15,7 +15,8 @@
           "Doc": "HelperA is a helper function in package A.\n",
           "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/multipackage/pkgA/service.go",
           "PosLine": 20,
-          "Exported": true
+          "Exported": true,
+          "Generated": false
         },
         {
           "QualifiedName": "codemap/testdata/multipackage/pkgA.NewServiceA",
@@ -25,7 +26,8 @@
           "Doc": "NewServiceA creates a new ServiceA.\n",
           "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/multipackage/pkgA/service.go",
           "PosLine": 9,
-          "Exported": true
+          "Exported": true,
+          "Generated": false
         },
         {
           "QualifiedName": "codemap/testdata/multipackage/pkgA.ServiceA",
@@ -35,7 +37,8 @@
           "Doc": "ServiceA provides service A functionality.\n",
           "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/multipackage/pkgA/service.go",
           "PosLine": 6,
-          "Exported": true
+          "Exported": true,
+          "Generated": false
         },
         {
           "QualifiedName": "codemap/testdata/multipackage/pkgA.ServiceA.DoSomething",
@@ -45,7 +48,8 @@
           "Doc": "DoSomething uses ServiceB internally.\n",
           "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/multipackage/pkgA/service.go",
           "PosLine": 14,
-          "Exported": true
+          "Exported": true,
+          "Generated": false
         }
       ],
       "ImportCount": 1
@@ -62,7 +66,8 @@
           "Doc": "HelperB is a helper function in package B.\n",
           "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/multipackage/pkgB/service.go",
           "PosLine": 17,
-          "Exported": true
+          "Exported": true,
+          "Generated": false
         },
         {
           "QualifiedName": "codemap/testdata/multipackage/pkgB.NewServiceB",
@@ -72,7 +77,8 @@
           "Doc": "NewServiceB creates a new ServiceB.\n",
           "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/multipackage/pkgB/service.go",
           "PosLine": 7,
-          "Exported": true
+          "Exported": true,
+          "Generated": false
         },
         {
           "QualifiedName": "codemap/testdata/multipackage/pkgB.ServiceB",
@@ -82,7 +88,8 @@
           "Doc": "ServiceB provides service B functionality.\n",
           "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/multipackage/pkgB/service.go",
           "PosLine": 4,
-          "Exported": true
+          "Exported": true,
+          "Generated": false
         },
         {
           "QualifiedName": "codemap/testdata/multipackage/pkgB.ServiceB.DoWork",
@@ -92,7 +99,8 @@
           "Doc": "DoWork performs some work.\n",
           "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/multipackage/pkgB/service.go",
           "PosLine": 12,
-          "Exported": true
+          "Exported": true,
+          "Generated": false
         }
       ],
       "ImportCount": 0
@@ -104,14 +112,16 @@
       "Name": "pkgA",
       "Dir": "/home/jenggo/go/src/cli/codemap/testdata/multipackage/pkgA",
       "SymCount": 4,
-      "IsTest": false
+      "IsTest": false,
+      "IsGenerated": false
     },
     {
       "Path": "codemap/testdata/multipackage/pkgB",
       "Name": "pkgB",
       "Dir": "/home/jenggo/go/src/cli/codemap/testdata/multipackage/pkgB",
       "SymCount": 4,
-      "IsTest": false
+      "IsTest": false,
+      "IsGenerated": false
     }
   ]
 }

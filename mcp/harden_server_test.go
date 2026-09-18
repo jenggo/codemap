@@ -46,7 +46,7 @@ func resultText(t *testing.T, resp map[string]any) string {
 	content, _ := res["content"].([]any)
 	for _, c := range content {
 		if m, ok := c.(map[string]any); ok {
-			if txt, ok := m["text"].(string); ok {
+			if txt, ok := m[keyText].(string); ok {
 				return txt
 			}
 		}
@@ -174,6 +174,7 @@ func TestArgumentValidationRejectsBadInput(t *testing.T) {
 		{"unknown import direction", `{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"imports_of","arguments":{"package_path":"x","direction":"both"}}}`, "direction must be one of"},
 		{"unknown rank mode", `{"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"get_hotspots","arguments":{"mode":"random"}}}`, "mode must be one of"},
 		{"unknown symbol kind", `{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"search","arguments":{"pattern":"x","kind":"banana"}}}`, "kind must be one of"},
+		{"unknown generated filter", `{"jsonrpc":"2.0","id":18,"method":"tools/call","params":{"name":"search","arguments":{"pattern":"x","generated":"sometimes"}}}`, "generated must be one of"},
 		{"unknown runtime kind", `{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"runtime_contracts","arguments":{"kind":"kafka"}}}`, "kind must be one of"},
 		{"unknown heuristic", `{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"entry_points","arguments":{"heuristics":["shadow"]}}}`, "heuristics must be one of"},
 		{"bad edge_types entry", `{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"callers_of","arguments":{"qualified_name":"x","edge_types":["calls","nope"]}}}`, "edge_types must be one of"},

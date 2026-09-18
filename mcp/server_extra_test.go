@@ -42,6 +42,7 @@ func TestToolsListIncludesNewTools(t *testing.T) {
 		"dependency_flow",
 		"entry_points",
 		"search_text",
+		"pattern",
 		"get_context_bundle",
 		"get_hotspots",
 		"imports_of",
@@ -70,8 +71,8 @@ func TestToolsListIncludesNewTools(t *testing.T) {
 			t.Errorf("absorbed tool %q must not appear in tools/list", gone)
 		}
 	}
-	if len(tools) != 31 {
-		t.Errorf("expected 31 tools in tools/list, got %d", len(tools))
+	if len(tools) != 32 {
+		t.Errorf("expected 32 tools in tools/list, got %d", len(tools))
 	}
 }
 

@@ -25,7 +25,7 @@ func TestInjectOpencode_WritesNavigationAndPlugin(t *testing.T) {
 	if !strings.Contains(string(nav), "Codemap MCP Tools") {
 		t.Error("navigation.md missing expected content")
 	}
-	if !strings.Contains(string(nav), "Version: 1.3") {
+	if !strings.Contains(string(nav), "Version: 1.4") {
 		t.Error("navigation.md missing version marker")
 	}
 

@@ -145,7 +145,7 @@ func TestWriteFTSFailureLeavesConsistentIndex(t *testing.T) {
 	}
 
 	// The new symbol never becomes queryable (symbol rows rolled back with the FTS).
-	syms, err := s.SearchSymbols("New", "", nil, "", false)
+	syms, err := s.SearchSymbols("New", "", nil, "", false, GeneratedAny)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +153,7 @@ func TestWriteFTSFailureLeavesConsistentIndex(t *testing.T) {
 		t.Fatalf("stranded symbol queryable after FTS rollback: %+v", syms)
 	}
 	// The prior index is still queryable through the FTS.
-	syms, err = s.SearchSymbols("Keep", "", nil, "", false)
+	syms, err = s.SearchSymbols("Keep", "", nil, "", false, GeneratedAny)
 	if err != nil {
 		t.Fatal(err)
 	}

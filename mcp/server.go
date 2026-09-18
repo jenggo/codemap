@@ -497,7 +497,7 @@ func (s *Server) handleToolsCall(id json.RawMessage, msg map[string]json.RawMess
 		result = strings.Join(notices, "\n") + "\n\n" + result
 	}
 	res := map[string]any{
-		"content": []map[string]any{{keyType: "text", "text": result}},
+		"content": []map[string]any{{keyType: keyText, keyText: result}},
 	}
 	if isErr {
 		res["isError"] = true
@@ -621,6 +621,7 @@ func queryHandlers() map[string]toolHandler {
 		"entry_points":      handleEntryPoints,
 		"changed_symbols":   handleChangedSymbols,
 		"search_text":       handleSearchText,
+		"pattern":           handlePattern,
 		toolContextBundle:   handleContextBundle,
 		toolHotspots:        handleHotspots,
 		"health":            handleHealth,
@@ -743,6 +744,10 @@ func handleSearch(st *store.Store, opts []query.Option, renderOpts []render.Opti
 	if v, ok := args[keyMode].(string); ok && v != "" {
 		mode = v
 	}
+	// The generated filter applies to every search mode.
+	if v, ok := args[keyGenerated].(string); ok && v != "" {
+		opts = append(opts, query.WithGenerated(store.GeneratedFilter(v)))
+	}
 	var results []query.SearchResult
 	var err error
 	switch mode {
@@ -757,7 +762,7 @@ func handleSearch(st *store.Store, opts []query.Option, renderOpts []render.Opti
 		if b, ok := args["exported"].(bool); ok {
 			opts = append(opts, query.WithExported(b))
 		}
-		if v, ok := args["file"].(string); ok && v != "" {
+		if v, ok := args[keyFile].(string); ok && v != "" {
 			opts = append(opts, query.WithFile(v))
 		}
 		results, err = query.Search(st, requiredString(args, keyPattern), opts...)
@@ -1402,7 +1407,7 @@ var toolFloatArgs = map[string][]floatArgSpec{
 var toolEnumArgs = map[string][]enumArgSpec{
 	toolCallersOf:       {{key: keyEdgeTypes, allowed: validEdgeTypes, slice: true}},
 	toolCalleesOf:       {{key: keyEdgeTypes, allowed: validEdgeTypes, slice: true}},
-	"search":            {{key: keyKind, allowed: validKinds}, {key: keyMode, allowed: validSearchModes}},
+	"search":            {{key: keyKind, allowed: validKinds}, {key: keyMode, allowed: validSearchModes}, {key: keyGenerated, allowed: store.GeneratedFilterNames}},
 	"all_edges":         {{key: keyEdgeType, allowed: validEdgeTypes}},
 	toolCycles:          {{key: keyEdgeType, allowed: validEdgeTypes}},
 	"imports_of":        {{key: keyDirection, allowed: validImportDirs}},
@@ -1573,8 +1578,13 @@ const (
 	keyContextLines  = "context_lines"
 	keyEdgeTypes     = "edge_types"
 	keyFilePath      = "file_path"
+	keyText          = "text"
+	keyFile          = "file"
+	keyLine          = "line"
+	keySymbol        = "symbol"
 	keyMode          = "mode"
 	keySource        = "source"
+	keyGenerated     = "generated"
 	keyIncludeDoc    = "include_doc"
 	keyTransitive    = "transitive"
 	keyLayers        = "layers"
@@ -1623,8 +1633,8 @@ var returnTypeSchemas = map[string]any{
 		"site_count": "int — number of distinct occurrence locations (equals len(sites))",
 	},
 	"Site": map[string]any{
-		"file": "string — repo-relative file path where the edge occurs",
-		"line": "int — line number where the edge occurs",
+		keyFile: "string — repo-relative file path where the edge occurs",
+		keyLine: "int — line number where the edge occurs",
 	},
 	"SearchResult": map[string]any{
 		keyQualifiedName: descFullyQualifiedName,
@@ -1637,7 +1647,7 @@ var returnTypeSchemas = map[string]any{
 		keyExported:      "bool — whether exported",
 	},
 	"ShowResult": map[string]any{
-		"symbol":         "SymbolDetail — the symbol being shown",
+		keySymbol:        "SymbolDetail — the symbol being shown",
 		"incoming_edges": "[]EdgeDetail — edges pointing TO this symbol",
 		"outgoing_edges": "[]EdgeDetail — edges pointing FROM this symbol",
 	},
@@ -1721,13 +1731,20 @@ var returnTypeSchemas = map[string]any{
 	"FileMatch": map[string]any{
 		"file_path":      "string — path to the matching file",
 		"line_number":    "int — line number of the match",
-		"line":           "string — the matching line content",
+		keyLine:          "string — the matching line content",
 		"context_before": "string — lines before the match",
 		"context_after":  "string — lines after the match",
 	},
+	"PatternMatch": map[string]any{
+		keyFile:   descSourceFilePath,
+		keyLine:   "int — line number of the matched node",
+		"text":    "string — matched source text",
+		keySymbol: "string — enclosing indexed symbol qualified name (empty when the match is outside every symbol)",
+		"repo":    descRepoModulePath,
+	},
 	"Bundle": map[string]any{
 		keyQualifiedName: descFullyQualifiedName,
-		"symbol":         "SymbolDetail — the symbol details",
+		keySymbol:        "SymbolDetail — the symbol details",
 		keyBody:          "string — symbol source body",
 		"callees":        "[]EdgeDetail — direct callees (depth=1)",
 		"callers":        "[]EdgeDetail — direct callers (depth=1)",
@@ -1880,6 +1897,23 @@ func handleSearchText(st *store.Store, qOpts []query.Option, rOpts []render.Opti
 	return out, matches, false
 }
 
+func handlePattern(st *store.Store, _ []query.Option, rOpts []render.Option, args map[string]any) (string, any, bool) {
+	src := requiredString(args, keyPattern)
+	if strings.TrimSpace(src) == "" {
+		return "Error: pattern is required", nil, true
+	}
+	filePattern, _ := args["file_pattern"].(string)
+	repo, _ := args[keyRepo].(string)
+	matches, err := query.PatternSearch(st, src, filePattern, repo)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err), nil, true
+	}
+	if len(matches) == 0 {
+		return "no matches", matches, false
+	}
+	return render.RenderPatternMatches(matches, rOpts...), matches, false
+}
+
 func handleContextBundle(st *store.Store, qOpts []query.Option, rOpts []render.Option, args map[string]any) (string, any, bool) {
 	qn := requiredString(args, "qualified_name")
 	tokenBudget := 8000
@@ -2023,14 +2057,15 @@ func symbolTools() []map[string]any {
 			},
 			"type_name"),
 		toolDef("search",
-			"Search Go symbols (functions, types, methods, interfaces, consts, vars) by name: qualified names, file:line, signatures, docs. mode: substring (default) matches anywhere, prefix matches qualified-name starts, method finds methods with that name across all types.",
+			"Search Go symbols (functions, types, methods, interfaces, consts, vars) by name: qualified names, file:line, signatures, docs. mode: substring (default) matches anywhere, prefix matches qualified-name starts, method finds methods with that name across all types. Generated and test symbols are down-ranked (never hidden) behind hand-written ones unless filtered.",
 			map[string]any{
 				keyPattern:      stringProp("Pattern (case-insensitive; semantics per mode)"),
 				keyMode:         stringProp("substring (default), prefix, or method"),
 				keyIncludeTests: boolProp("Include test packages and symbols"),
 				keyKind:         stringProp("Symbol kind filter (substring mode)"),
 				"exported":      boolProp("true = exported-only, false = unexported-only (substring mode)"),
-				"file":          stringProp("File-path substring filter (substring mode)"),
+				keyFile:         stringProp("File-path substring filter (substring mode)"),
+				keyGenerated:    stringProp("any (default), exclude, or only — generated-code handling; matches are down-ranked, not hidden"),
 				keyRepo:         repoProp(),
 			},
 			"pattern"),
@@ -2060,6 +2095,14 @@ func graphTools() []map[string]any {
 				"file_pattern":  stringProp("File path filter (substring)"),
 				"is_regex":      boolProp("Regex mode instead of FTS5 (default false)"),
 				keyContextLines: intProp("Context lines per match (default 0)"),
+			},
+			"pattern"),
+		toolDef("pattern",
+			"Match Go AST subtrees against a pattern written as Go source with $UPPERCASE metavariables (ast-grep style), e.g. 'defer $CALL', 'if err != nil { return $ERR }', '$A() && $A()'. Matching is syntactic — go/types is never consulted — and repeated metavariables must bind structurally identical nodes. Reports file, line, matched source, and enclosing symbol.",
+			map[string]any{
+				keyPattern:     stringProp("Go source snippet with $UPPERCASE metavariables"),
+				"file_pattern": stringProp("File path filter (substring)"),
+				keyRepo:        repoProp(),
 			},
 			"pattern"),
 		toolDef(toolContextBundle,

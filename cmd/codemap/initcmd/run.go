@@ -25,13 +25,29 @@ const ToolsAndTipsBlock = `## Available Tools
 | ` + "`package`" + ` | All symbols with signatures and docs; without path lists all packages | Inspecting a package's API or discovering packages |
 | ` + "`methods_of`" + ` | Method names, signatures, file:line | Finding a type's method set |
 | ` + "`imports_of`" + ` | Imports (direction out) or importers (direction in); transitive: true walks the tree | Import relationships |
+| ` + "`dependency_flow`" + ` | One package's imports/importers; layers: true gives project-wide layering | Package dependency structure |
 | ` + "`all_edges`" + ` | Every edge in the codebase; optional edge_type filter | Bulk relationship analysis |
-| ` + "`search_text`" + ` | Matching file paths, line numbers, context | Full-text search across indexed files |
+| ` + "`type_usage`" + ` | All symbols whose signatures use a given type | Finding where a type matters |
+| ` + "`interface_impls`" + ` | All types implementing an interface and their methods | Finding implementations |
+| ` + "`blast_radius`" + ` | Callers, interface implementations, embedders, type users (transitive) | Impact check before refactoring |
+| ` + "`find_path`" + ` | BFS edge path between two symbols | How two symbols connect |
+| ` + "`cycles`" + ` | Cycles in one edge-type graph (imports, calls) | Detecting circular dependencies |
+| ` + "`symbols_in_file`" + ` | All symbols defined in one file | File-level inventory |
+| ` + "`entry_points`" + ` | main(), test entries, uncalled exported funcs, HTTP handlers | Finding where execution starts |
+| ` + "`unused`" + ` | Unexported symbols with zero callers | Finding dead code |
+| ` + "`search_text`" + ` | Matching file paths, line numbers, context; regex mode and context lines available | Full-text search across indexed files |
+| ` + "`pattern`" + ` | Matching file paths, line numbers, matched source, enclosing symbol | Structural AST search when name/text search is not enough |
 | ` + "`get_context_bundle`" + ` | Symbol body, callees, callers, same-file symbols | LLM context preparation |
 | ` + "`get_hotspots`" + ` | Symbols ranked by complexity x churn (mode churn) or PageRank centrality (mode pagerank) | Finding risky or critical code |
 | ` + "`changed_symbols`" + ` | Symbols changed in the working tree; workspace: true covers every member repo | One line per symbol with ` + "`compact: true`" + ` |
 | ` + "`read_response_section`" + ` | Stored sections of an oversized response, by index or keyword | Reading back an oversized-response manifest |
 | ` + "`stats`" + ` | Per-tool calls, errors, response bytes, estimated raw-read bytes, reduction % | Verifying context savings and tuning output formats |
+| ` + "`contracts`" + ` | Cross-repo producer/consumer contract edges (shared constants + shape match) | Tracking wire contracts in multi-repo workspaces |
+| ` + "`contract_drift`" + ` | Structural drift between shape-matched types across repos, with field-level evidence | Detecting breaking protocol changes |
+| ` + "`runtime_contracts`" + ` | Redis key patterns, JetStream subjects, WS type strings with producer/consumer sites | Tracking infra contracts |
+| ` + "`suppress_contract`" + ` | Suppress a confirmed false-positive contract pair | Cleaning false positives |
+| ` + "`health`" + ` | Per-repo index freshness (indexed/stale/missing) | Diagnosing stale results |
+| ` + "`schema`" + ` | Schema of all result types | Understanding response shapes |
 
 ## Tips
 
@@ -43,6 +59,8 @@ const ToolsAndTipsBlock = `## Available Tools
 - ` + "`search`" + ` is case-insensitive substring match by default; ` + "`mode: \"prefix\"`" + ` matches qualified-name starts, ` + "`mode: \"method\"`" + ` finds methods by name across types
 - ` + "`search`" + ` returns exported and unexported symbols by default; ` + "`exported: true`" + ` filters to exported-only, ` + "`exported: false`" + ` to unexported-only
 - ` + "`imports_of`" + ` defaults to direction ` + "`out`" + ` (imports); use ` + "`direction: \"in\"`" + ` for importers and ` + "`transitive: true`" + ` for the full dependency tree
+- ` + "`pattern`" + ` takes Go source with ` + "`$UPPERCASE`" + ` metavariables (ast-grep style); matching is syntactic and repeated metavariables must bind identical nodes; ` + "`file_pattern`" + ` and ` + "`repo`" + ` narrow the scan
+- ` + "`search`" + ` down-ranks generated and test symbols (never hides them); ` + "`generated: \"exclude\"|\"only\"`" + ` filters them
 - Indexing is automatic and fast (~50ms). Re-indexes when Go files change.
 `
 
@@ -65,6 +83,9 @@ This project uses ` + "`codemap`" + ` MCP tools for Go codebase analysis. These 
 | Find what a package depends on | ` + "`imports_of`" + ` | reading import blocks |
 | List all packages | ` + "`package`" + ` without path | ls and guess |
 | Search file contents | ` + "`search_text`" + ` | grep |
+| Find code by structural shape (e.g. every ` + "`defer X.Close()`" + `) | ` + "`pattern`" + ` | grep with context flags |
+| Find all types implementing an interface | ` + "`interface_impls`" + ` | grep for method sets |
+| Measure impact before refactoring | ` + "`blast_radius`" + ` | manual search |
 | Get symbol context bundle | ` + "`get_context_bundle`" + ` | manual assembly |
 | Find code hotspots | ` + "`get_hotspots`" + ` | manual review |
 | Rank symbol importance | ` + "`get_hotspots`" + ` with ` + "`mode: \"pagerank\"`" + ` | guessing |
@@ -72,7 +93,7 @@ This project uses ` + "`codemap`" + ` MCP tools for Go codebase analysis. These 
 ` + ToolsAndTipsBlock + `
 `
 
-const opencodeNavContent = `<!-- Context: codemap/navigation | Priority: high | Version: 1.3 -->
+const opencodeNavContent = `<!-- Context: codemap/navigation | Priority: high | Version: 1.4 -->
 
 # Codemap MCP Tools
 
@@ -96,6 +117,9 @@ Indexing is **automatic** — the first tool call triggers indexing if needed (~
 | Where is this package imported? | ` + "`imports_of`" + ` with ` + "`direction: \"in\"`" + ` | grep for import path |
 | What does this package depend on? | ` + "`imports_of`" + ` | reading import blocks |
 | Search file contents | ` + "`search_text`" + ` | grep |
+| Find code by structural shape (e.g. every ` + "`defer X.Close()`" + `) | ` + "`pattern`" + ` | grep with context flags |
+| Find all types implementing an interface | ` + "`interface_impls`" + ` | grep for method sets |
+| Measure impact before refactoring | ` + "`blast_radius`" + ` | manual search |
 | Get symbol context bundle | ` + "`get_context_bundle`" + ` | manual assembly |
 | Find code hotspots | ` + "`get_hotspots`" + ` | manual review |
 | Rank symbol importance | ` + "`get_hotspots`" + ` with ` + "`mode: \"pagerank\"`" + ` | guessing |

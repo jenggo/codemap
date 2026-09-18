@@ -36,6 +36,7 @@ type Symbol struct {
 	Complexity    int
 	Exported      bool
 	IsTest        bool
+	IsGenerated   bool
 }
 
 type Edge struct {
@@ -50,18 +51,19 @@ type Result struct {
 	Edges   []Edge
 }
 
-func Run(pkgImportPath string, files map[string]*ast.File, fset *token.FileSet, isTest bool) *Result {
+func Run(pkgImportPath string, files map[string]*ast.File, fset *token.FileSet, isTest bool, generated map[string]bool) *Result {
 	result := &Result{}
 	typeSpecs := collectTypeSpecs(files)
 
-	for _, astFile := range files {
+	for path, astFile := range files {
 		extractor := &fileExtractor{
-			pkgPath:   pkgImportPath,
-			astFile:   astFile,
-			fset:      fset,
-			isTest:    isTest,
-			result:    result,
-			typeSpecs: typeSpecs,
+			pkgPath:     pkgImportPath,
+			astFile:     astFile,
+			fset:        fset,
+			isTest:      isTest,
+			isGenerated: generated[path],
+			result:      result,
+			typeSpecs:   typeSpecs,
 		}
 		extractor.extract()
 	}
@@ -90,12 +92,13 @@ func collectTypeSpecs(files map[string]*ast.File) map[string]*ast.TypeSpec {
 }
 
 type fileExtractor struct {
-	astFile   *ast.File
-	fset      *token.FileSet
-	result    *Result
-	typeSpecs map[string]*ast.TypeSpec
-	pkgPath   string
-	isTest    bool
+	astFile     *ast.File
+	fset        *token.FileSet
+	result      *Result
+	typeSpecs   map[string]*ast.TypeSpec
+	pkgPath     string
+	isTest      bool
+	isGenerated bool
 }
 
 func (e *fileExtractor) extract() {
@@ -186,9 +189,10 @@ func (e *fileExtractor) symbolForFuncDecl(fd *ast.FuncDecl) Symbol {
 			File: pos.Filename,
 			Line: pos.Line,
 		},
-		Exported:   fd.Name.IsExported(),
-		IsTest:     e.isTest,
-		Complexity: 1,
+		Exported:    fd.Name.IsExported(),
+		IsTest:      e.isTest,
+		IsGenerated: e.isGenerated,
+		Complexity:  1,
 	}
 }
 
@@ -249,8 +253,9 @@ func (e *fileExtractor) extractTypeSpec(ts *ast.TypeSpec, kind string, doc *ast.
 			File: pos.Filename,
 			Line: pos.Line,
 		},
-		Exported: ts.Name.IsExported(),
-		IsTest:   e.isTest,
+		Exported:    ts.Name.IsExported(),
+		IsTest:      e.isTest,
+		IsGenerated: e.isGenerated,
 	}
 	if st, ok := ts.Type.(*ast.StructType); ok {
 		sym.Fields = extractStructFields(st)
@@ -311,8 +316,9 @@ func (e *fileExtractor) extractInterfaceMethods(ifaceName string, methods *ast.F
 					File: pos.Filename,
 					Line: pos.Line,
 				},
-				Exported: true,
-				IsTest:   e.isTest,
+				Exported:    true,
+				IsTest:      e.isTest,
+				IsGenerated: e.isGenerated,
 			}
 			e.result.Symbols = append(e.result.Symbols, sym)
 		}
@@ -394,8 +400,9 @@ func (e *fileExtractor) extractValueSpec(vs *ast.ValueSpec, kind string, doc *as
 				File: pos.Filename,
 				Line: pos.Line,
 			},
-			Exported: name.IsExported(),
-			IsTest:   e.isTest,
+			Exported:    name.IsExported(),
+			IsTest:      e.isTest,
+			IsGenerated: e.isGenerated,
 		})
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -34,8 +35,10 @@ type parsedFlags struct {
 	packageFilter     string
 	dbPath            string
 	repo              string
+	filePattern       string
 	severity          string
 	direction         string
+	generated         string
 	edgeTypes         []string
 	format            render.Format
 	contextLines      int
@@ -114,6 +117,10 @@ func handleValueFlags(arg string, args []string, i int, flags *parsedFlags) (boo
 		return consumeStringArg(args, i, &flags.packageFilter)
 	case "--repo":
 		return consumeStringArg(args, i, &flags.repo)
+	case "--file-pattern":
+		return consumeStringArg(args, i, &flags.filePattern)
+	case "--generated":
+		return consumeStringArg(args, i, &flags.generated)
 	case "--context-lines":
 		return consumeIntArg(args, i, &flags.contextLines)
 	case "--top-n":
@@ -187,13 +194,16 @@ func run() error {
 	cmd := os.Args[1]
 	flags, filteredArgs := parseArgs(os.Args[2:], store.DefaultPath())
 
-	queryOpts := buildQueryOpts(flags)
+	queryOpts, err := buildQueryOpts(flags)
+	if err != nil {
+		return err
+	}
 	renderOpts := buildRenderOpts(flags)
 
 	return dispatchCommand(cmd, filteredArgs, flags, queryOpts, renderOpts)
 }
 
-func buildQueryOpts(flags parsedFlags) []query.Option {
+func buildQueryOpts(flags parsedFlags) ([]query.Option, error) {
 	var opts []query.Option
 	if flags.includeTests {
 		opts = append(opts, query.WithTests())
@@ -216,7 +226,13 @@ func buildQueryOpts(flags parsedFlags) []query.Option {
 	if flags.repo != "" {
 		opts = append(opts, query.WithRepo(flags.repo))
 	}
-	return opts
+	if flags.generated != "" {
+		if !slices.Contains(store.GeneratedFilterNames, flags.generated) {
+			return nil, fmt.Errorf("--generated must be one of [%s], got %q", strings.Join(store.GeneratedFilterNames, ", "), flags.generated)
+		}
+		opts = append(opts, query.WithGenerated(store.GeneratedFilter(flags.generated)))
+	}
+	return opts, nil
 }
 
 func buildRenderOpts(flags parsedFlags) []render.Option {
@@ -279,6 +295,11 @@ func dispatchQueryCommand(cmd string, args []string, dbPath string, flags parsed
 		cmdListPackages(dbPath, queryOpts, renderOpts)
 	case "search-text":
 		return withRequiredArg(args, "search-text", func(arg string) { cmdSearchText(arg, dbPath, renderOpts) })
+	case "pattern":
+		if len(args) < 1 {
+			return fmt.Errorf("pattern requires an argument")
+		}
+		return cmdPattern(args[0], dbPath, flags, renderOpts)
 	case "hotspots":
 		cmdHotspots(dbPath, renderOpts)
 	case "importance":
@@ -834,6 +855,21 @@ func cmdSearchText(pattern, dbPath string, rOpts []render.Option) {
 	fmt.Print(render.RenderTextMatches(matches, rOpts...))
 }
 
+func cmdPattern(patternSrc, dbPath string, flags parsedFlags, rOpts []render.Option) error {
+	s, err := store.Open(dbPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = s.Close() }()
+
+	matches, err := query.PatternSearch(s, patternSrc, flags.filePattern, flags.repo)
+	if err != nil {
+		return err
+	}
+	fmt.Print(render.RenderPatternMatches(matches, rOpts...))
+	return nil
+}
+
 func cmdHotspots(dbPath string, rOpts []render.Option) {
 	s, err := store.Open(dbPath)
 	if err != nil {
@@ -895,6 +931,7 @@ func printUsage() {
 	fmt.Println("  package <path>            Show package details")
 	fmt.Println("  methods-of <type_name>    Show methods of a type")
 	fmt.Println("  search-text <pattern>     Search file contents (FTS5 or regex)")
+	fmt.Println("  pattern <pattern>         Match Go AST subtrees; $UPPERCASE metavariables (syntactic)")
 	fmt.Println("  hotspots                  Show code hotspots (complexity x churn)")
 	fmt.Println("  importance                Show symbol importance (PageRank)")
 	fmt.Println("  contracts                 List contract edges across repos")
@@ -919,7 +956,9 @@ func printUsageFlags() {
 	fmt.Println("  --kind <kind>             Filter by symbol kind (for search)")
 	fmt.Println("  --exported [bool]         Filter by exported status (for search)")
 	fmt.Println("  --package <pkg>           Filter by package path (for search)")
-	fmt.Println("  --repo <module>           Scope query to one workspace repo (search/show/callers-of/callees-of/importers-of/imports-of/blast-radius)")
+	fmt.Println("  --generated <mode>        Generated-code handling for search: any (default), exclude, or only (generated matches are down-ranked, never hidden)")
+	fmt.Println("  --repo <module>           Scope query to one workspace repo (search/show/callers-of/callees-of/importers-of/imports-of/blast-radius/pattern)")
+	fmt.Println("  --file-pattern <glob>     Filter by file-path substring (for pattern)")
 	fmt.Println("  --regex                   Use regex mode (for search-text)")
 	fmt.Println("  --context-lines <n>       Context lines around matches (for search-text)")
 	fmt.Println("  --top-n <n>               Number of results (for hotspots/importance)")

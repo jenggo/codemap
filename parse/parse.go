@@ -28,6 +28,9 @@ type PackageInfo struct {
 	ModulePath string
 	Files      []string
 	IsTest     bool
+	// IsGenerated is set when every file defining the package is generated
+	// code. Per-file provenance lives in Result.GeneratedFiles.
+	IsGenerated bool
 }
 
 type Error struct {
@@ -38,9 +41,12 @@ type Error struct {
 type Result struct {
 	Packages []PackageInfo
 	Files    map[string]*ast.File
-	Fset     *token.FileSet
-	Errors   []Error
-	Fallback bool // true when go list failed and the dir-walk fallback was used
+	// GeneratedFiles holds the absolute path of every parsed file classified as
+	// generated code (marker or filename convention).
+	GeneratedFiles map[string]bool
+	Fset           *token.FileSet
+	Errors         []Error
+	Fallback       bool // true when go list failed and the dir-walk fallback was used
 }
 
 // Run resolves the Go packages under pattern. It prefers `go list` (the same
@@ -52,6 +58,7 @@ func Run(pattern string) (*Result, error) {
 		return nil, err
 	}
 	if result, err := goList(absPattern); err == nil {
+		finalizeGenerated(result)
 		return result, nil
 	}
 	result, err := runDirWalk(absPattern)
@@ -59,7 +66,70 @@ func Run(pattern string) (*Result, error) {
 		return nil, err
 	}
 	result.Fallback = true
+	finalizeGenerated(result)
 	return result, nil
+}
+
+// isGeneratedFile classifies a parsed file as generated code: the canonical
+// "// Code generated ... DO NOT EDIT." leading marker (go/ast.IsGenerated, which
+// requires the file to have been parsed with parser.ParseComments), or a
+// well-known generated-output filename convention.
+func isGeneratedFile(path string, f *ast.File) bool {
+	if ast.IsGenerated(f) {
+		return true
+	}
+	base := filepath.Base(path)
+	switch {
+	case strings.HasSuffix(base, ".pb.go"),
+		strings.HasSuffix(base, "_string.go"),
+		strings.HasPrefix(base, "mock_"),
+		strings.HasSuffix(base, "_mock.go"),
+		strings.HasPrefix(base, "zz_generated"):
+		return true
+	}
+	return false
+}
+
+// parseFile parses one file with comments (a precondition for the generated
+// marker check), recording the AST, its generated provenance, and any parse
+// error on result. It reports whether the file was parsed.
+func parseFile(result *Result, path string) bool {
+	astFile, err := parser.ParseFile(result.Fset, path, nil, parser.ParseComments)
+	if err != nil {
+		result.Errors = append(result.Errors, Error{File: path, Err: err.Error()})
+		return false
+	}
+	result.Files[path] = astFile
+	if isGeneratedFile(path, astFile) {
+		result.GeneratedFiles[path] = true
+	}
+	return true
+}
+
+// finalizeGenerated marks each package generated when every file defining it is
+// generated code, deriving package-level provenance once from the per-file facts
+// recorded during parsing.
+func finalizeGenerated(result *Result) {
+	for i := range result.Packages {
+		pkg := &result.Packages[i]
+		if len(pkg.Files) == 0 {
+			continue
+		}
+		pkg.IsGenerated = true
+		for _, f := range pkg.Files {
+			if !result.GeneratedFiles[f] {
+				pkg.IsGenerated = false
+				break
+			}
+		}
+	}
+}
+
+// File parses one file's source into an *ast.File with comments, without
+// walking directories or resolving packages. It is the single-file entry point
+// for callers that already hold indexed content (e.g. pattern search).
+func File(fset *token.FileSet, path string, src []byte) (*ast.File, error) {
+	return parser.ParseFile(fset, path, src, parser.ParseComments)
 }
 
 // FileContents reads the source of every parsed file, keyed by absolute path.
@@ -104,8 +174,9 @@ type WorkspaceRoot struct {
 // All files share a single FileSet so cross-package references resolve.
 func RunWorkspace(roots []WorkspaceRoot) (*Result, error) {
 	result := &Result{
-		Files: make(map[string]*ast.File),
-		Fset:  token.NewFileSet(),
+		Files:          make(map[string]*ast.File),
+		GeneratedFiles: make(map[string]bool),
+		Fset:           token.NewFileSet(),
 	}
 	seen := make(map[string]bool)
 
@@ -123,6 +194,8 @@ func RunWorkspace(roots []WorkspaceRoot) (*Result, error) {
 			return nil, err
 		}
 	}
+
+	finalizeGenerated(result)
 
 	return result, nil
 }
@@ -259,15 +332,9 @@ func parseFilesInto(result *Result, pkgInfo *PackageInfo, files []string, dir st
 		if _, exists := result.Files[fullPath]; exists {
 			continue
 		}
-		astFile, err := parser.ParseFile(result.Fset, fullPath, nil, parser.ParseComments)
-		if err != nil {
-			result.Errors = append(result.Errors, Error{
-				File: fullPath,
-				Err:  err.Error(),
-			})
+		if !parseFile(result, fullPath) {
 			continue
 		}
-		result.Files[fullPath] = astFile
 		pkgInfo.Files = append(pkgInfo.Files, fullPath)
 	}
 }
@@ -285,15 +352,9 @@ func processTestFilesWorkspace(result *Result, dir, importPath, pkgName string, 
 		if _, exists := result.Files[fullPath]; exists {
 			continue
 		}
-		astFile, err := parser.ParseFile(result.Fset, fullPath, nil, parser.ParseComments)
-		if err != nil {
-			result.Errors = append(result.Errors, Error{
-				File: fullPath,
-				Err:  err.Error(),
-			})
+		if !parseFile(result, fullPath) {
 			continue
 		}
-		result.Files[fullPath] = astFile
 		testPkgInfo.Files = append(testPkgInfo.Files, fullPath)
 	}
 	if len(testPkgInfo.Files) > 0 {
@@ -368,15 +429,9 @@ func addGoListPkgInto(result *Result, p goListPkg, modulePath string, seen map[s
 		if _, exists := result.Files[fullPath]; exists {
 			continue
 		}
-		astFile, err := parser.ParseFile(result.Fset, fullPath, nil, parser.ParseComments)
-		if err != nil {
-			result.Errors = append(result.Errors, Error{
-				File: fullPath,
-				Err:  err.Error(),
-			})
+		if !parseFile(result, fullPath) {
 			continue
 		}
-		result.Files[fullPath] = astFile
 		pkgInfo.Files = append(pkgInfo.Files, fullPath)
 	}
 
@@ -408,8 +463,9 @@ func goList(abs string) (*Result, error) {
 	}
 
 	result := &Result{
-		Files: make(map[string]*ast.File),
-		Fset:  token.NewFileSet(),
+		Files:          make(map[string]*ast.File),
+		GeneratedFiles: make(map[string]bool),
+		Fset:           token.NewFileSet(),
 	}
 	dec := json.NewDecoder(&stdout)
 	for {
@@ -457,15 +513,9 @@ func addGoListPkg(result *Result, p goListPkg) {
 
 	for _, f := range files {
 		fullPath := filepath.Join(p.Dir, f)
-		astFile, err := parser.ParseFile(result.Fset, fullPath, nil, parser.ParseComments)
-		if err != nil {
-			result.Errors = append(result.Errors, Error{
-				File: fullPath,
-				Err:  err.Error(),
-			})
+		if !parseFile(result, fullPath) {
 			continue
 		}
-		result.Files[fullPath] = astFile
 		pkgInfo.Files = append(pkgInfo.Files, fullPath)
 	}
 
@@ -482,8 +532,9 @@ const dirVendor = "vendor"
 
 func runDirWalk(pattern string) (*Result, error) {
 	result := &Result{
-		Files: make(map[string]*ast.File),
-		Fset:  token.NewFileSet(),
+		Files:          make(map[string]*ast.File),
+		GeneratedFiles: make(map[string]bool),
+		Fset:           token.NewFileSet(),
 	}
 
 	absPattern, err := filepath.Abs(pattern)
@@ -555,15 +606,9 @@ func processDir(result *Result, dir string) error {
 
 	for _, f := range files {
 		fullPath := filepath.Join(dir, f)
-		astFile, err := parser.ParseFile(result.Fset, fullPath, nil, parser.ParseComments)
-		if err != nil {
-			result.Errors = append(result.Errors, Error{
-				File: fullPath,
-				Err:  err.Error(),
-			})
+		if !parseFile(result, fullPath) {
 			continue
 		}
-		result.Files[fullPath] = astFile
 		pkgInfo.Files = append(pkgInfo.Files, fullPath)
 	}
 
@@ -590,15 +635,9 @@ func processTestFiles(result *Result, dir, importPath, pkgName string, externalT
 		if _, exists := result.Files[fullPath]; exists {
 			continue
 		}
-		astFile, err := parser.ParseFile(result.Fset, fullPath, nil, parser.ParseComments)
-		if err != nil {
-			result.Errors = append(result.Errors, Error{
-				File: fullPath,
-				Err:  err.Error(),
-			})
+		if !parseFile(result, fullPath) {
 			continue
 		}
-		result.Files[fullPath] = astFile
 		testPkgInfo.Files = append(testPkgInfo.Files, fullPath)
 	}
 	if len(testPkgInfo.Files) > 0 {
