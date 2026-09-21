@@ -20,7 +20,7 @@ codemap search Server
 codemap callers-of "pkg.Serve"
 
 # Start an MCP server (for use with AI tools)
-codemap serve
+codemap mcp
 ```
 
 ## Features
@@ -34,6 +34,7 @@ codemap serve
 | `methods-of <type>` | All methods on a type |
 | `list-packages` | List every indexed package |
 | `search-text <pattern>` | Search file contents (FTS5, or regex with `--regex`) |
+| `diagnostics [file]` | Indexed compile errors (type-check and parse errors captured at index time; auto-refreshed via stale reindex) |
 | `pattern <pattern>` | Match Go AST subtrees against a Go source snippet with `$UPPERCASE` metavariables (ast-grep style), e.g. `defer $CALL`; syntactic only, repeated metavariables must bind identical nodes |
 
 ### Graph Queries
@@ -87,7 +88,7 @@ Commands: `contracts`, `contract-drift`, `runtime-contracts` (MCP: `contracts`, 
 
 ### MCP Server
 
-`codemap serve` starts a JSON-RPC MCP server over stdio, exposing all query capabilities as tools for AI coding assistants. This enables AI agents to navigate Go codebases faster and more precisely than grep/glob.
+`codemap mcp` (alias: `codemap serve`) starts a JSON-RPC MCP server over stdio, exposing all query capabilities as tools for AI coding assistants. This enables AI agents to navigate Go codebases faster and more precisely than grep/glob.
 
 ### Init Command
 

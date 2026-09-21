@@ -71,8 +71,8 @@ func TestToolsListIncludesNewTools(t *testing.T) {
 			t.Errorf("absorbed tool %q must not appear in tools/list", gone)
 		}
 	}
-	if len(tools) != 32 {
-		t.Errorf("expected 32 tools in tools/list, got %d", len(tools))
+	if len(tools) != 33 {
+		t.Errorf("expected 33 tools in tools/list, got %d", len(tools))
 	}
 }
 

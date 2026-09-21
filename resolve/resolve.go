@@ -3,13 +3,20 @@ package resolve
 import (
 	"codemap/extract"
 	"codemap/parse"
+	"context"
+	"errors"
 	"fmt"
 	"go/ast"
 	goimporter "go/importer"
 	"go/token"
 	"go/types"
+	"io"
+	"os"
+	"os/exec"
 	"sort"
+	"strings"
 	"sync"
+	"time"
 )
 
 type ResolvedSymbol struct {
@@ -21,10 +28,19 @@ type ResolvedEdge struct {
 }
 
 type Result struct {
-	Packages []parse.PackageInfo
-	Symbols  []ResolvedSymbol
-	Edges    []ResolvedEdge
-	Warnings []string
+	Packages    []parse.PackageInfo
+	Symbols     []ResolvedSymbol
+	Edges       []ResolvedEdge
+	Warnings    []string
+	Diagnostics []Diagnostic
+}
+
+// Diagnostic is one type-check or parse error captured during indexing.
+type Diagnostic struct {
+	File    string
+	Message string
+	Line    int
+	Col     int
 }
 
 // parseContext precomputes the file-indexed maps shared across package
@@ -86,17 +102,14 @@ func Run(parseResult *parse.Result) *Result {
 		warn(fmt.Sprintf("%s: %v", pkgPath, err))
 	}
 
-	conf := &types.Config{
-		Importer: imp,
-		Error: func(err error) {
-			warn(err.Error())
-		},
-	}
+	conf := &types.Config{Importer: imp}
 
 	ctx := newParseContext(parseResult)
+	collectParseDiagnostics(parseResult, result)
 
 	var typePackages []*types.Package
 	for _, pkgInfo := range parseResult.Packages {
+		conf.Error = packageDiagCollector(warn, result)
 		typePkg := processPackage(conf, ctx, pkgInfo, result, warn)
 		if typePkg != nil {
 			typePackages = append(typePackages, typePkg)
@@ -110,6 +123,63 @@ func Run(parseResult *parse.Result) *Result {
 	})
 
 	return result
+}
+
+// collectParseDiagnostics folds files that failed to parse (and package-load
+// errors) into the diagnostics list so "is this file broken" covers syntax
+// errors, not just type errors.
+func collectParseDiagnostics(parseResult *parse.Result, result *Result) {
+	for _, perr := range parseResult.Errors {
+		msg := perr.Err
+		if parsed, ok := parseParseError(perr.File, msg); ok {
+			result.Diagnostics = append(result.Diagnostics, parsed)
+			continue
+		}
+		result.Diagnostics = append(result.Diagnostics, Diagnostic{File: perr.File, Message: msg})
+	}
+}
+
+// parseParseError splits a go/parser error string of the form
+// "<file>:<line>:<col>" into a positioned diagnostic. Best effort: unparseable
+// shapes fall back to the unpositioned message.
+func parseParseError(file, msg string) (Diagnostic, bool) {
+	var line, col int
+	n, _ := fmt.Sscanf(msg, "%d:%d:", &line, &col)
+	if n < 2 {
+		return Diagnostic{}, false
+	}
+	return Diagnostic{File: file, Line: line, Col: col, Message: strings.TrimPrefix(msg, fmt.Sprintf("%d:%d:", line, col))}, true
+}
+
+// packageDiagCollector returns an Error handler for types.Config that records
+// positioned type errors as diagnostics (and warns, preserving the
+// pre-existing warnings behavior).
+func packageDiagCollector(warn func(string), result *Result) func(error) {
+	return func(err error) {
+		warn(err.Error())
+		// Unpositioned errors and indexer-side importer failures (there is no
+		// compile problem blamed on the file) stay in Warnings only.
+		if d := typedDiagnostic(err); d.File != "" && !isImporterNoise(d.Message) {
+			result.Diagnostics = append(result.Diagnostics, d)
+		}
+	}
+}
+
+// isImporterNoise reports whether a type error is an "indexer could not load
+// external module" message rather than a problem in the indexed source.
+func isImporterNoise(msg string) bool {
+	return strings.HasPrefix(msg, "could not import")
+}
+
+// typedDiagnostic extracts file/line/col when the error is a types.Error and
+// degrades gracefully to an unpositioned diagnostic otherwise.
+func typedDiagnostic(err error) Diagnostic {
+	var terr types.Error
+	if !errors.As(err, &terr) {
+		return Diagnostic{Message: err.Error()}
+	}
+	pos := terr.Fset.Position(terr.Pos)
+	return Diagnostic{File: pos.Filename, Line: pos.Line, Col: pos.Column, Message: terr.Msg}
 }
 
 func getExportedNamedTypes(pkg *types.Package) map[string]*types.Named {
@@ -751,10 +821,14 @@ func (i *importer) Import(path string) (*types.Package, error) {
 	return pkg, nil
 }
 
+// importExternal loads compiled export data for external (module/stdlib)
+// imports. The default gc importer cannot locate module-cache export data, so
+// `go list -export` resolves the path first (also populating the build cache);
+// the result is handed to the gc importer through a lookup function.
 func (i *importer) importExternal(path string) (*types.Package, error) {
 	i.mu.Lock()
 	if i.gc == nil {
-		i.gc = goimporter.ForCompiler(i.fset, "gc", nil)
+		i.gc = goimporter.ForCompiler(i.fset, "gc", exportLookup)
 	}
 	i.mu.Unlock()
 
@@ -767,6 +841,23 @@ func (i *importer) importExternal(path string) (*types.Package, error) {
 	i.memo[path] = pkg
 	i.mu.Unlock()
 	return pkg, nil
+}
+
+// exportLookup shells out to `go list -export` to get the compiled export
+// data path for an external import (it builds on demand), so module-cache
+// packages resolve even though they have no installed .a file.
+func exportLookup(path string) (io.ReadCloser, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "go", "list", "-export", "-f", "{{.Export}}", path).Output()
+	if err != nil {
+		return nil, fmt.Errorf("go list -export %s: %w", path, err)
+	}
+	exportFile := strings.TrimSpace(string(out))
+	if exportFile == "" {
+		return nil, fmt.Errorf("no export data for %s", path)
+	}
+	return os.Open(exportFile)
 }
 
 // resolveCgoRefs detects cgo files (those importing "C"), emits a per-file

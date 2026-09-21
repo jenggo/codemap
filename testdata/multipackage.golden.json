@@ -13,7 +13,7 @@
           "Receiver": "",
           "Signature": "func () string",
           "Doc": "HelperA is a helper function in package A.\n",
-          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/multipackage/pkgA/service.go",
+          "PosFile": "testdata/multipackage/pkgA/service.go",
           "PosLine": 20,
           "Exported": true,
           "Generated": false
@@ -24,7 +24,7 @@
           "Receiver": "",
           "Signature": "func () *ServiceA",
           "Doc": "NewServiceA creates a new ServiceA.\n",
-          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/multipackage/pkgA/service.go",
+          "PosFile": "testdata/multipackage/pkgA/service.go",
           "PosLine": 9,
           "Exported": true,
           "Generated": false
@@ -35,7 +35,7 @@
           "Receiver": "",
           "Signature": "struct{}",
           "Doc": "ServiceA provides service A functionality.\n",
-          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/multipackage/pkgA/service.go",
+          "PosFile": "testdata/multipackage/pkgA/service.go",
           "PosLine": 6,
           "Exported": true,
           "Generated": false
@@ -46,7 +46,7 @@
           "Receiver": "ServiceA",
           "Signature": "func () string",
           "Doc": "DoSomething uses ServiceB internally.\n",
-          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/multipackage/pkgA/service.go",
+          "PosFile": "testdata/multipackage/pkgA/service.go",
           "PosLine": 14,
           "Exported": true,
           "Generated": false
@@ -64,7 +64,7 @@
           "Receiver": "",
           "Signature": "func () string",
           "Doc": "HelperB is a helper function in package B.\n",
-          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/multipackage/pkgB/service.go",
+          "PosFile": "testdata/multipackage/pkgB/service.go",
           "PosLine": 17,
           "Exported": true,
           "Generated": false
@@ -75,7 +75,7 @@
           "Receiver": "",
           "Signature": "func () *ServiceB",
           "Doc": "NewServiceB creates a new ServiceB.\n",
-          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/multipackage/pkgB/service.go",
+          "PosFile": "testdata/multipackage/pkgB/service.go",
           "PosLine": 7,
           "Exported": true,
           "Generated": false
@@ -86,7 +86,7 @@
           "Receiver": "",
           "Signature": "struct{}",
           "Doc": "ServiceB provides service B functionality.\n",
-          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/multipackage/pkgB/service.go",
+          "PosFile": "testdata/multipackage/pkgB/service.go",
           "PosLine": 4,
           "Exported": true,
           "Generated": false
@@ -97,7 +97,7 @@
           "Receiver": "ServiceB",
           "Signature": "func () string",
           "Doc": "DoWork performs some work.\n",
-          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/multipackage/pkgB/service.go",
+          "PosFile": "testdata/multipackage/pkgB/service.go",
           "PosLine": 12,
           "Exported": true,
           "Generated": false
@@ -110,7 +110,7 @@
     {
       "Path": "codemap/testdata/multipackage/pkgA",
       "Name": "pkgA",
-      "Dir": "/home/jenggo/go/src/cli/codemap/testdata/multipackage/pkgA",
+      "Dir": "testdata/multipackage/pkgA",
       "SymCount": 4,
       "IsTest": false,
       "IsGenerated": false
@@ -118,7 +118,7 @@
     {
       "Path": "codemap/testdata/multipackage/pkgB",
       "Name": "pkgB",
-      "Dir": "/home/jenggo/go/src/cli/codemap/testdata/multipackage/pkgB",
+      "Dir": "testdata/multipackage/pkgB",
       "SymCount": 4,
       "IsTest": false,
       "IsGenerated": false

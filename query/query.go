@@ -1451,6 +1451,29 @@ func canonicalCycle(cycle []string) string {
 	return strings.Join(rot, "\x00")
 }
 
+// Diagnostics returns indexed type-check/parse errors, optionally narrowed to
+// one file (suffix match as passed) and one workspace repo.
+func Diagnostics(s *store.Store, file string, opts ...Option) ([]store.Diagnostic, error) {
+	options := &Options{}
+	opt.Apply(options, opts)
+	diags, err := s.Diagnostics(file)
+	if err != nil {
+		return nil, err
+	}
+	if options.Repo == "" {
+		return diags, nil
+	}
+	out := make([]store.Diagnostic, 0, len(diags))
+	for _, d := range diags {
+		if d.Repo == options.Repo {
+			out = append(out, d)
+		}
+	}
+	return out, nil
+}
+
+// SymbolsInFile returns every symbol defined in the given file (path or
+// substring, following the store's file matching).
 func SymbolsInFile(s *store.Store, filePath string, opts ...Option) ([]SearchResult, error) {
 	options := &Options{}
 	opt.Apply(options, opts)

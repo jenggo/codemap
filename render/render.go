@@ -1090,6 +1090,25 @@ func RenderTextMatches(matches []store.FileMatch, opts ...Option) string {
 	}
 }
 
+// RenderDiagnostics renders indexed compile errors in compiler notice style
+// ("file:line:col: message"), one per line, with repo tag in workspace mode.
+func RenderDiagnostics(diags []store.Diagnostic, opts ...Option) string {
+	options := &Options{}
+	opt.Apply(options, opts)
+
+	if options.Format == FormatJSON {
+		return marshalJSON(diags)
+	}
+	var b strings.Builder
+	for _, d := range diags {
+		fmt.Fprintf(&b, "%s:%d:%d: %s\n", d.File, d.Line, d.Col, d.Message)
+		if d.Repo != "" {
+			fmt.Fprintf(&b, "  [%s]\n", d.Repo)
+		}
+	}
+	return b.String()
+}
+
 func RenderPatternMatches(matches []query.PatternMatch, opts ...Option) string {
 	options := &Options{}
 	opt.Apply(options, opts)

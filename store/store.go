@@ -160,6 +160,15 @@ CREATE TABLE IF NOT EXISTS files (
     repo_id INTEGER REFERENCES repos(id)
 );
 
+CREATE TABLE IF NOT EXISTS diagnostics (
+    id      INTEGER PRIMARY KEY,
+    file    TEXT NOT NULL,
+    line    INTEGER NOT NULL DEFAULT 0,
+    col     INTEGER NOT NULL DEFAULT 0,
+    message TEXT NOT NULL,
+    repo_id INTEGER REFERENCES repos(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_symbols_package   ON symbols(package_id);
 CREATE INDEX IF NOT EXISTS idx_symbols_qualified  ON symbols(qualified_name);
 CREATE INDEX IF NOT EXISTS idx_symbols_kind        ON symbols(kind);
@@ -171,6 +180,8 @@ CREATE INDEX IF NOT EXISTS idx_edges_type          ON edges(edge_type);
 CREATE INDEX IF NOT EXISTS idx_edges_repo          ON edges(repo_id);
 CREATE UNIQUE INDEX IF NOT EXISTS edges_pair       ON edges(COALESCE(repo_id, 0), from_ref, to_ref, edge_type);
 CREATE INDEX IF NOT EXISTS idx_packages_repo       ON packages(repo_id);
+CREATE INDEX IF NOT EXISTS idx_diagnostics_file    ON diagnostics(file);
+CREATE INDEX IF NOT EXISTS idx_diagnostics_repo    ON diagnostics(repo_id);
 
 CREATE TABLE IF NOT EXISTS contracts (
     id          INTEGER PRIMARY KEY,
@@ -683,6 +694,21 @@ var contractTables = []schemaTable{
 			PRIMARY KEY (from_ref, to_ref)
 		)`,
 	},
+	{
+		name: "diagnostics",
+		create: `CREATE TABLE diagnostics (
+			id      INTEGER PRIMARY KEY,
+			file    TEXT NOT NULL,
+			line    INTEGER NOT NULL DEFAULT 0,
+			col     INTEGER NOT NULL DEFAULT 0,
+			message TEXT NOT NULL,
+			repo_id INTEGER REFERENCES repos(id)
+		)`,
+		indexes: []string{
+			`CREATE INDEX IF NOT EXISTS idx_diagnostics_file ON diagnostics(file)`,
+			`CREATE INDEX IF NOT EXISTS idx_diagnostics_repo ON diagnostics(repo_id)`,
+		},
+	},
 }
 
 // migrateEdgesDedup upgrades the edges table to the deduplicated schema: it adds
@@ -831,16 +857,14 @@ func (s *Store) writeTx(ctx context.Context, tx *sql.Tx, result *resolve.Result,
 		return err
 	}
 
-	if churn != nil {
-		if err := applyChurn(ctx, tx, churn); err != nil {
-			return err
-		}
-	}
-
 	var repoIDFor func(string) int64
 	if workspace {
 		repoIDFor = buildRepoIDFor(repos, repoByModule)
 	}
+	if err := writeDeferredRows(ctx, tx, result, churn, repoIDFor); err != nil {
+		return err
+	}
+
 	scope := fileScope{repoID: 0}
 	fileDirty, err := s.writeFiles(ctx, tx, files, repoIDFor, scope)
 	if err != nil {
@@ -945,6 +969,9 @@ func (s *Store) ReplaceRepo(result *resolve.Result, files map[string]string, chu
 		if err := writeRepoRows(ctx, tx, result, repoByModule, churn); err != nil {
 			return err
 		}
+		if err := writeDiagnostics(ctx, tx, result.Diagnostics, func(string) int64 { return repoID }); err != nil {
+			return err
+		}
 		fileDirty, err := s.writeFiles(ctx, tx, files, func(string) int64 { return repoID }, fileScope{repoID: repoID})
 		if err != nil {
 			return err
@@ -974,6 +1001,7 @@ func deleteRepoRows(ctx context.Context, tx *sql.Tx, repoID int64) error {
 		`DELETE FROM contracts WHERE repo_id = ?`,
 		`DELETE FROM runtime_contracts WHERE repo_id = ?`,
 		`DELETE FROM drift WHERE repo_id = ?`,
+		`DELETE FROM diagnostics WHERE repo_id = ?`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt, repoID); err != nil {
 			return err
@@ -1015,6 +1043,7 @@ func clearWorkspaceRows(ctx context.Context, tx *sql.Tx) error {
 		`DELETE FROM contracts WHERE repo_id IS NOT NULL`,
 		`DELETE FROM runtime_contracts WHERE repo_id IS NOT NULL`,
 		`DELETE FROM drift WHERE repo_id IS NOT NULL`,
+		`DELETE FROM diagnostics WHERE repo_id IS NOT NULL`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return err
@@ -1033,6 +1062,7 @@ func clearSingleRepoRows(ctx context.Context, tx *sql.Tx) error {
 		`DELETE FROM edges WHERE repo_id IS NULL`,
 		`DELETE FROM symbols WHERE repo_id IS NULL`,
 		`DELETE FROM packages WHERE repo_id IS NULL`,
+		`DELETE FROM diagnostics WHERE repo_id IS NULL`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return err
@@ -1431,12 +1461,88 @@ type Symbol struct {
 	IsGenerated   bool
 }
 
+// Diagnostic is one indexed type-check or parse error: the file (absolute),
+// position within it, and the compiler message.
+type Diagnostic struct {
+	File    string
+	Message string
+	Repo    string `json:"repo,omitempty"`
+	Line    int
+	Col     int
+}
+
 type FileMatch struct {
 	FilePath      string
 	Line          string
 	ContextBefore string
 	ContextAfter  string
 	LineNumber    int
+}
+
+// writeDeferredRows applies churn counters and compile diagnostics after the
+// core symbol/edge rows; diagnostics use repoIDFor for workspace attribution.
+func writeDeferredRows(ctx context.Context, tx *sql.Tx, result *resolve.Result, churn map[string]int, repoIDFor func(string) int64) error {
+	if churn != nil {
+		if err := applyChurn(ctx, tx, churn); err != nil {
+			return err
+		}
+	}
+	return writeDiagnostics(ctx, tx, result.Diagnostics, repoIDFor)
+}
+
+// writeDiagnostics persists type-check/parse errors with repo attribution.
+// repoIDFor resolves a file's owning repo in workspace mode; nil (or a miss)
+// leaves the row unattributed, matching the single-repo path.
+func writeDiagnostics(ctx context.Context, tx *sql.Tx, diags []resolve.Diagnostic, repoIDFor func(string) int64) error {
+	diagInsert := `INSERT INTO diagnostics (file, line, col, message, repo_id) VALUES (?, ?, ?, ?, ?)`
+	stmt, err := tx.PrepareContext(ctx, diagInsert)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = stmt.Close() }()
+
+	for _, d := range diags {
+		var repoID any
+		if repoIDFor != nil {
+			if id := repoIDFor(d.File); id != 0 {
+				repoID = id
+			}
+		}
+		if _, err := stmt.ExecContext(ctx, d.File, d.Line, d.Col, d.Message, repoID); err != nil {
+			return fmt.Errorf("inserting diagnostic %s: %w", d.File, err)
+		}
+	}
+	return nil
+}
+
+// Diagnostics returns indexed type-check/parse errors ordered by file and
+// position. A non-empty file argument is a suffix match (agents pass paths
+// as they appear, absolute or relative).
+func (s *Store) Diagnostics(file string) ([]Diagnostic, error) {
+	rows, err := s.db.QueryContext(context.Background(), `
+		SELECT d.file, d.line, d.col, d.message, r.module_path
+		FROM diagnostics d
+		LEFT JOIN repos r ON r.id = d.repo_id
+		ORDER BY d.file, d.line, d.col`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []Diagnostic
+	for rows.Next() {
+		var d Diagnostic
+		var repo any
+		if err := rows.Scan(&d.File, &d.Line, &d.Col, &d.Message, &repo); err != nil {
+			return nil, err
+		}
+		got, _ := repo.(string)
+		d.Repo = got
+		if file == "" || strings.HasSuffix(d.File, file) {
+			out = append(out, d)
+		}
+	}
+	return out, rows.Err()
 }
 
 // Site is one occurrence location of an edge: the repo-relative file path and

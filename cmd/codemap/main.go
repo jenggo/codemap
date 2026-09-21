@@ -257,7 +257,7 @@ func dispatchCommand(cmd string, args []string, flags parsedFlags, queryOpts []q
 		if err := initcmd.UpdateAgents(); err != nil {
 			return err
 		}
-	case "serve":
+	case "serve", "mcp":
 		cmdServe(flags.dbPath)
 	case "workspace":
 		return cmdWorkspace(args, flags.dbPath, flags, renderOpts)
@@ -293,6 +293,28 @@ func dispatchQueryCommand(cmd string, args []string, dbPath string, flags parsed
 		cmdAllEdges(dbPath, queryOpts, renderOpts)
 	case "list-packages":
 		cmdListPackages(dbPath, queryOpts, renderOpts)
+	case "search-text", "pattern":
+		return dispatchSearchLikeCommand(cmd, args, dbPath, flags, renderOpts)
+	case "hotspots":
+		cmdHotspots(dbPath, renderOpts)
+	case "importance":
+		cmdImportance(dbPath, queryOpts, renderOpts)
+	case "diagnostics":
+		file := ""
+		if len(args) > 0 {
+			file = args[0]
+		}
+		cmdDiagnostics(file, dbPath, queryOpts, renderOpts)
+	default:
+		return dispatchDataCommand(cmd, dbPath, flags)
+	}
+	return nil
+}
+
+// dispatchSearchLikeCommand handles text/AST search commands that read the
+// file-content index rather than the symbol graph.
+func dispatchSearchLikeCommand(cmd string, args []string, dbPath string, flags parsedFlags, renderOpts []render.Option) error {
+	switch cmd {
 	case "search-text":
 		return withRequiredArg(args, "search-text", func(arg string) { cmdSearchText(arg, dbPath, renderOpts) })
 	case "pattern":
@@ -300,12 +322,6 @@ func dispatchQueryCommand(cmd string, args []string, dbPath string, flags parsed
 			return fmt.Errorf("pattern requires an argument")
 		}
 		return cmdPattern(args[0], dbPath, flags, renderOpts)
-	case "hotspots":
-		cmdHotspots(dbPath, renderOpts)
-	case "importance":
-		cmdImportance(dbPath, queryOpts, renderOpts)
-	default:
-		return dispatchDataCommand(cmd, dbPath, flags)
 	}
 	return nil
 }
@@ -820,6 +836,26 @@ func cmdListPackages(dbPath string, qOpts []query.Option, rOpts []render.Option)
 	fmt.Print(render.RenderListPackages(pkgs, rOpts...))
 }
 
+func cmdDiagnostics(file, dbPath string, qOpts []query.Option, rOpts []render.Option) {
+	s, err := store.Open(dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	defer func() { _ = s.Close() }()
+
+	diags, err := query.Diagnostics(s, file, qOpts...)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	if len(diags) == 0 {
+		fmt.Println("No diagnostics: all inspected code type-checks clean.")
+		return
+	}
+	fmt.Print(render.RenderDiagnostics(diags, rOpts...))
+}
+
 func cmdInit() {
 	if err := initcmd.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -934,11 +970,12 @@ func printUsage() {
 	fmt.Println("  pattern <pattern>         Match Go AST subtrees; $UPPERCASE metavariables (syntactic)")
 	fmt.Println("  hotspots                  Show code hotspots (complexity x churn)")
 	fmt.Println("  importance                Show symbol importance (PageRank)")
+	fmt.Println("  diagnostics [file]        Show indexed compile errors (type-check/parse)")
 	fmt.Println("  contracts                 List contract edges across repos")
 	fmt.Println("  contract-drift            List structural drift reports")
 	fmt.Println("  runtime-contracts         List runtime contract entities (Redis/JetStream/WS)")
 	fmt.Println("  workspace                 Workspace commands (index/status/reindex/changed-symbols)")
-	fmt.Println("  serve                     Start MCP server")
+	fmt.Println("  serve (or mcp)            Start MCP stdio server")
 	fmt.Println()
 	printUsageFlags()
 }

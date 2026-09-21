@@ -13,7 +13,7 @@
           "Receiver": "",
           "Signature": "func (input string) *Parser",
           "Doc": "NewParser creates a new Parser.\n",
-          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/simple/parser.go",
+          "PosFile": "testdata/simple/parser.go",
           "PosLine": 9,
           "Exported": true,
           "Generated": false
@@ -24,7 +24,7 @@
           "Receiver": "",
           "Signature": "struct { input string }",
           "Doc": "Parser parses input and produces output.\n",
-          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/simple/parser.go",
+          "PosFile": "testdata/simple/parser.go",
           "PosLine": 4,
           "Exported": true,
           "Generated": false
@@ -35,7 +35,7 @@
           "Receiver": "Parser",
           "Signature": "func () (string, error)",
           "Doc": "Parse processes the input and returns a result.\n",
-          "PosFile": "/home/jenggo/go/src/cli/codemap/testdata/simple/parser.go",
+          "PosFile": "testdata/simple/parser.go",
           "PosLine": 14,
           "Exported": true,
           "Generated": false
@@ -48,7 +48,7 @@
     {
       "Path": "codemap/testdata/simple",
       "Name": "simple",
-      "Dir": "/home/jenggo/go/src/cli/codemap/testdata/simple",
+      "Dir": "testdata/simple",
       "SymCount": 4,
       "IsTest": false,
       "IsGenerated": false

@@ -135,6 +135,11 @@ func buildTestOutput(t *testing.T, s *store.Store) string {
 		t.Fatalf("json marshal error: %v", err)
 	}
 
+	// Keep golden files machine-independent: absolute source paths (PosFile,
+	// Dir) would otherwise encode the repo's location and churn on every move.
+	if root, werr := os.Getwd(); werr == nil {
+		return strings.ReplaceAll(string(data), root+string(filepath.Separator), "")
+	}
 	return string(data)
 }
 

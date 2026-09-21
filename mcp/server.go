@@ -614,6 +614,7 @@ func queryHandlers() map[string]toolHandler {
 		"find_path":         handleFindPath,
 		"interface_impls":   handleInterfaceImpls,
 		"unused":            handleUnused,
+		"diagnostics":       handleDiagnostics,
 		toolCycles:          handleCycles,
 		"symbols_in_file":   handleSymbolsInFile,
 		toolBlastRadius:     handleBlastRadius,
@@ -854,6 +855,18 @@ func handleAllEdges(st *store.Store, opts []query.Option, renderOpts []render.Op
 		return fmt.Sprintf("Error: %v", err), nil, true
 	}
 	return render.RenderEdges(edges, renderOpts...), edges, false
+}
+
+func handleDiagnostics(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
+	file := requiredString(args, keyFile)
+	diags, err := query.Diagnostics(st, file, opts...)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err), nil, true
+	}
+	if len(diags) == 0 {
+		return healthNotice(st) + " No compile errors.", nil, false
+	}
+	return render.RenderDiagnostics(diags, renderOpts...), diags, false
 }
 
 func handleTypeUsage(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
@@ -2141,6 +2154,12 @@ func typeAndImportTools() []map[string]any {
 				keyIncludeTests: boolProp("Include test packages and symbols"),
 			},
 			"type_name"),
+		toolDef("diagnostics",
+			"Indexed compile errors: type-check and parse errors captured during indexing (auto-refreshed on stale reindex). List all, or narrow to one file (suffix match).",
+			map[string]any{
+				keyFile: stringProp("File path suffix to narrow to (optional, e.g. 'parser.go')"),
+				keyRepo: repoProp(),
+			}),
 	}
 }
 
