@@ -75,14 +75,24 @@ func TestInjectMaki_WritesGuardAndMCP(t *testing.T) {
 	content := string(lua)
 	for _, want := range []string{
 		"codemap-guard",
-		"set_slot(\"tool.\" .. name .. \".input\"",
-		"set_slot(\"tool.\" .. name .. \".output\"",
+		"set_slot(\"tool.index.input\"",
+		"set_slot(\"tool.index.output\"",
 		"codemap__search",
 		"codemap__callers_of",
-		"codemap__package",
+		"codemap__blast_radius",
+		"codemap__interface_impls",
 	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("codemap-guard.lua missing %q", want)
+		}
+	}
+	// The guard must not re-introduce grep/glob warnings.
+	for _, unwanted := range []string{
+		`set_slot("tool.grep`,
+		`set_slot("tool.glob`,
+	} {
+		if strings.Contains(content, unwanted) {
+			t.Errorf("codemap-guard.lua should not hook %q", unwanted)
 		}
 	}
 

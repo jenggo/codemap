@@ -2420,15 +2420,24 @@ type ChangedSymbol struct {
 	PosLine       int
 }
 
+// RenamedFile records a file that moved, so a changed symbol's PosFile can be
+// traced back to the path callers and imports still reference.
+type RenamedFile struct {
+	From string
+	To   string
+}
+
 type ChangedSymbolsSummary struct {
 	Modified     int
 	Added        int
 	Removed      int
 	FilesChanged int
+	Renamed      int
 }
 
 type ChangedSymbolsResult struct {
 	Symbols []ChangedSymbol
+	Renamed []RenamedFile
 	Summary ChangedSymbolsSummary
 }
 
@@ -2465,6 +2474,10 @@ func ChangedSymbols(s *store.Store, repoDir, ref string, withBlast, includeBodie
 		ct := changeTypeModified
 		if strings.HasPrefix(st.Status, "A") {
 			ct = changeTypeAdded
+		}
+		if st.Status != "" && (st.Status[0] == 'R' || st.Status[0] == 'C') {
+			result.Renamed = append(result.Renamed, RenamedFile{From: st.OldPath, To: st.Path})
+			result.Summary.Renamed++
 		}
 		if err := processChangedFile(s, result, st.Path, ct, withBlast, includeBodies, includeTests, seen, hunks); err != nil {
 			return nil, err

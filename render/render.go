@@ -998,8 +998,16 @@ func renderChangedSymbolsTOON(r *query.ChangedSymbolsResult) string {
 
 func renderChangedSymbolsText(r *query.ChangedSymbolsResult) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Files changed: %d, modified: %d, added: %d, removed: %d\n\n",
+	fmt.Fprintf(&b, "Files changed: %d, modified: %d, added: %d, removed: %d",
 		r.Summary.FilesChanged, r.Summary.Modified, r.Summary.Added, r.Summary.Removed)
+	if r.Summary.Renamed > 0 {
+		fmt.Fprintf(&b, ", renamed: %d", r.Summary.Renamed)
+	}
+	b.WriteString("\n")
+	for _, rn := range r.Renamed {
+		fmt.Fprintf(&b, "renamed: %s -> %s\n", rn.From, rn.To)
+	}
+	b.WriteString("\n")
 	for _, sym := range r.Symbols {
 		fmt.Fprintf(&b, "[%s] %s (%s) %s:%d\n", sym.ChangeType, sym.QualifiedName, sym.Kind, sym.PosFile, sym.PosLine)
 		if sym.BlastRadius != nil {
@@ -1017,8 +1025,15 @@ func renderChangedSymbolsText(r *query.ChangedSymbolsResult) string {
 
 func renderChangedSymbolsCompact(r *query.ChangedSymbolsResult) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "files=%d modified=%d added=%d removed=%d\n",
+	fmt.Fprintf(&b, "files=%d modified=%d added=%d removed=%d",
 		r.Summary.FilesChanged, r.Summary.Modified, r.Summary.Added, r.Summary.Removed)
+	if r.Summary.Renamed > 0 {
+		fmt.Fprintf(&b, " renamed=%d", r.Summary.Renamed)
+	}
+	b.WriteString("\n")
+	for _, rn := range r.Renamed {
+		fmt.Fprintf(&b, "renamed %s -> %s\n", rn.From, rn.To)
+	}
 	for _, sym := range r.Symbols {
 		repo := ""
 		if sym.Repo != "" {

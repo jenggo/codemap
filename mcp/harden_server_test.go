@@ -206,7 +206,7 @@ func TestArgumentValidationStillAllowsValidInput(t *testing.T) {
 func TestIndexRejectsOutsideAllowlist(t *testing.T) {
 	s := newTestServer(t)
 	out := captureStdout(func() {
-		s.dispatchLine(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"index","arguments":{"path":"/etc"}}}`)
+		s.dispatchLine(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"reindex","arguments":{"path":"/etc"}}}`)
 	})
 	resp := parseResponse(t, out)
 	text := resultText(t, resp)
@@ -267,7 +267,7 @@ func TestIndexAcceptsAllowedTarget(t *testing.T) {
 	s := NewLazy("")
 	s.allowedPaths = []string{dst}
 	out := captureStdout(func() {
-		s.dispatchLine(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"index","arguments":{"path":%q}}}`, dst))
+		s.dispatchLine(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"reindex","arguments":{"path":%q}}}`, dst))
 	})
 	if strings.Contains(out, `"isError":true`) {
 		t.Fatalf("index of an allowed target failed: %s", out)
@@ -349,7 +349,10 @@ func TestAutoReindexNoMisleadingNoticeOnFailure(t *testing.T) {
 }
 
 func TestFailedIndexMemoization(t *testing.T) {
-	s := NewLazy("")
+	// A temp DB path keeps getStore on the auto-index branch: an empty path
+	// resolves to the repo's .codemap/codemap.db, which exists in a working
+	// checkout and would be opened instead of triggering indexFn.
+	s := NewLazy(filepath.Join(t.TempDir(), "absent.db"))
 	var calls int
 	fail := true
 	s.indexFn = func(absPath string) error {

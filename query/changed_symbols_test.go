@@ -261,3 +261,36 @@ func TestChangedSymbolsDefaultBranch(t *testing.T) {
 		t.Errorf("expected at least one modified symbol with default ref, got %+v", result.Summary)
 	}
 }
+
+// TestChangedSymbolsReportsRename verifies a moved file surfaces as a rename on
+// the result, not only as a modified symbol: the symbol's PosFile is the new
+// path, so without this the old path callers still reference is lost.
+// Fixtures carry distinct content because git pairs renames by similarity.
+func TestChangedSymbolsReportsRename(t *testing.T) {
+	repo := setupGitRepo(t)
+	srcDir := filepath.Join(repo, "pkg")
+	if err := os.MkdirAll(srcDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeFile0644(t, filepath.Join(repo, "go.mod"), "module example.com/rename\n\ngo 1.26.2\n")
+	writeFile0644(t, filepath.Join(srcDir, "old.go"), "package pkg\n\nfunc Moved() string { return \"moved\" }\n")
+	writeFile0644(t, filepath.Join(srcDir, "keep.go"), "package pkg\n\nfunc Keep() string { return \"keep\" }\n")
+	runGitIn(t, repo, "add", ".")
+	runGitIn(t, repo, "commit", "-q", "-m", "initial")
+
+	runGitIn(t, repo, "mv", filepath.Join("pkg", "old.go"), filepath.Join("pkg", "new.go"))
+
+	s := indexRepo(t, repo)
+	result, err := ChangedSymbols(s, repo, "HEAD", false, false, false)
+	if err != nil {
+		t.Fatalf("ChangedSymbols: %v", err)
+	}
+
+	if result.Summary.Renamed != 1 {
+		t.Fatalf("expected 1 rename, got %d (renamed=%+v)", result.Summary.Renamed, result.Renamed)
+	}
+	got := result.Renamed[0]
+	if filepath.Base(got.From) != "old.go" || filepath.Base(got.To) != "new.go" {
+		t.Errorf("expected old.go -> new.go, got %q -> %q", got.From, got.To)
+	}
+}

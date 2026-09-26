@@ -518,7 +518,9 @@ func (s *Server) handleTool(name string, args map[string]any) (string, bool) {
 		record(nil, msg, true)
 		return msg, true
 	}
-	if name == "index" {
+	// reindex is spelled "index" on the CLI; the MCP name avoids colliding with
+	// a host agent's own file-skeleton tool of the same name.
+	if name == "reindex" {
 		msg, isErr := s.handleIndex(args)
 		record(nil, msg, isErr)
 		return msg, isErr
@@ -1987,7 +1989,7 @@ func buildToolsList() []map[string]any {
 
 func indexTools() []map[string]any {
 	return []map[string]any{
-		toolDef("index",
+		toolDef("reindex",
 			"Index the repo at path (or its codemap.yaml workspace). Automatic on first tool call; this forces a full re-index. Returns package/symbol/edge counts.",
 			map[string]any{
 				"path": stringProp("Repository root; defaults to current directory."),
@@ -2070,9 +2072,9 @@ func symbolTools() []map[string]any {
 			},
 			"type_name"),
 		toolDef("search",
-			"Search Go symbols (functions, types, methods, interfaces, consts, vars) by name: qualified names, file:line, signatures, docs. mode: substring (default) matches anywhere, prefix matches qualified-name starts, method finds methods with that name across all types. Generated and test symbols are down-ranked (never hidden) behind hand-written ones unless filtered.",
+			"Search Go symbols (functions, types, methods, interfaces, consts, vars): qualified names, file:line, signatures, docs. mode: substring (default) matches anywhere, prefix matches qualified-name starts, method finds methods with that name across all types. Generated and test symbols are down-ranked (never hidden) behind hand-written ones unless filtered.\n\nMatching spans every indexed field, not only the name: qualified_name, name, kind, receiver, signature and doc. A const's signature is its full literal value, so a short pattern can match a large const body and return a wide result; narrow with kind or exported. Responses over 16 KiB come back as a section manifest instead of the full text.",
 			map[string]any{
-				keyPattern:      stringProp("Pattern (case-insensitive; semantics per mode)"),
+				keyPattern:      stringProp("Pattern (case-insensitive; matches name, signature, doc, receiver, kind, not just the name)"),
 				keyMode:         stringProp("substring (default), prefix, or method"),
 				keyIncludeTests: boolProp("Include test packages and symbols"),
 				keyKind:         stringProp("Symbol kind filter (substring mode)"),
@@ -2260,7 +2262,7 @@ func intProp(desc string) map[string]any {
 func sourceTools() []map[string]any {
 	return []map[string]any{
 		toolDef("changed_symbols",
-			"Working-tree changed symbols vs a git ref (default main), classified by change_type, optionally with blast_radius and source body; workspace: true diffs every member repo.",
+			"Working-tree changed symbols vs a git ref (default main), classified by change_type, optionally with blast_radius and source body; workspace: true diffs every member repo. Renamed files are listed separately as from -> to, since a symbol's PosFile is the new path while callers still reference the old one.",
 			map[string]any{
 				"ref":               stringProp("Git ref to diff against (default main)"),
 				keyWorkspace:        boolProp("Diff every workspace member repo (default false)"),

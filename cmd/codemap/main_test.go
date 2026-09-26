@@ -48,3 +48,33 @@ func TestBuildQueryOptsGenerated(t *testing.T) {
 		t.Fatal("expected an error for an unknown --generated value")
 	}
 }
+
+// TestParseArgsDropsBooleanFlagsFromPositionals guards a leak that corrupted
+// every positional command: handleFlag reported failure for boolean flags, so
+// they landed in filteredArgs and displaced the real arguments. The symptom was
+// "search-text foo --regex" searching for files matching "--regex".
+func TestParseArgsDropsBooleanFlagsFromPositionals(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{"trailing bool flag", []string{"foo", "--regex"}, []string{"foo"}},
+		{"pattern and file pattern", []string{"foo", "vcs", "--regex"}, []string{"foo", "vcs"}},
+		{"leading bool flag", []string{"--regex", "foo"}, []string{"foo"}},
+		{"value flag keeps its value out of positionals", []string{"foo", "--kind", "function"}, []string{"foo"}},
+		{"empty string is skipped", []string{"", "foo"}, []string{"foo"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, got := parseArgs(tc.args, "unused.db")
+			if len(got) != len(tc.want) {
+				t.Fatalf("parseArgs(%q) positionals = %q, want %q", tc.args, got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Fatalf("parseArgs(%q) positionals = %q, want %q", tc.args, got, tc.want)
+				}
+			}
+		})
+	}
+}

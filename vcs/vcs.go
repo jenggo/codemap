@@ -152,6 +152,8 @@ func filterGoPaths(records []string) []string {
 type FileStatus struct {
 	Path   string
 	Status string
+	// OldPath is the pre-rename path for an R/C status, empty otherwise.
+	OldPath string
 }
 
 // GitFileStatuses returns each changed .go file with its diff status. -z is
@@ -173,17 +175,19 @@ func GitFileStatuses(repoDir, ref string) ([]FileStatus, error) {
 	for i := 0; i+1 < len(records); i += 2 {
 		status := records[i]
 		path := records[i+1]
+		oldPath := ""
 		if isRenameStatus(status) {
 			if i+2 >= len(records) {
 				break
 			}
+			oldPath = path
 			path = records[i+2]
 			i++
 		}
 		if !strings.HasSuffix(path, ".go") {
 			continue
 		}
-		statuses = append(statuses, FileStatus{Status: status, Path: path})
+		statuses = append(statuses, FileStatus{Status: status, Path: path, OldPath: oldPath})
 	}
 	return statuses, nil
 }

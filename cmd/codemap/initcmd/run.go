@@ -16,7 +16,7 @@ const ToolsAndTipsBlock = `## Available Tools
 
 | Tool | Returns / Does | When to use |
 |---|---|---|
-| ` + "`index`" + ` | Force a full re-index | Indexing is automatic otherwise |
+| ` + "`reindex`" + ` | Force a full re-index | Indexing is automatic otherwise |
 | ` + "`overview`" + ` | Each package's exports + signatures | Understanding project structure |
 | ` + "`search`" + ` | Qualified names, file:line, signatures, docs; mode: substring/prefix/method | Finding symbols by name |
 | ` + "`show`" + ` | Signature, docs, file:line, incoming+outgoing edges; source: true returns raw source | Understanding a single symbol |
@@ -39,7 +39,7 @@ const ToolsAndTipsBlock = `## Available Tools
 | ` + "`pattern`" + ` | Matching file paths, line numbers, matched source, enclosing symbol | Structural AST search when name/text search is not enough |
 | ` + "`get_context_bundle`" + ` | Symbol body, callees, callers, same-file symbols | LLM context preparation |
 | ` + "`get_hotspots`" + ` | Symbols ranked by complexity x churn (mode churn) or PageRank centrality (mode pagerank) | Finding risky or critical code |
-| ` + "`changed_symbols`" + ` | Symbols changed in the working tree; workspace: true covers every member repo | One line per symbol with ` + "`compact: true`" + ` |
+| ` + "`changed_symbols`" + ` | Symbols changed in the working tree; renames reported as from -> to; workspace: true covers every member repo | One line per symbol with ` + "`compact: true`" + ` |
 | ` + "`read_response_section`" + ` | Stored sections of an oversized response, by index or keyword | Reading back an oversized-response manifest |
 | ` + "`stats`" + ` | Per-tool calls, errors, response bytes, estimated raw-read bytes, reduction % | Verifying context savings and tuning output formats |
 | ` + "`contracts`" + ` | Cross-repo producer/consumer contract edges (shared constants + shape match) | Tracking wire contracts in multi-repo workspaces |
@@ -57,6 +57,7 @@ const ToolsAndTipsBlock = `## Available Tools
 - ` + "`include_unexported: true`" + ` includes private symbols (package tool)
 - ` + "`methods_of`" + ` takes a short type name (e.g., ` + "`Store`" + `, not the full path)
 - ` + "`search`" + ` is case-insensitive substring match by default; ` + "`mode: \"prefix\"`" + ` matches qualified-name starts, ` + "`mode: \"method\"`" + ` finds methods by name across types
+- ` + "`search`" + ` matches every indexed field, not only the name (qualified_name, name, kind, receiver, signature, doc). A const's signature is its full literal value, so a short pattern can match a large const body and return a wide result; narrow with ` + "`kind`" + ` or ` + "`exported`" + `
 - ` + "`search`" + ` returns exported and unexported symbols by default; ` + "`exported: true`" + ` filters to exported-only, ` + "`exported: false`" + ` to unexported-only
 - ` + "`imports_of`" + ` defaults to direction ` + "`out`" + ` (imports); use ` + "`direction: \"in\"`" + ` for importers and ` + "`transitive: true`" + ` for the full dependency tree
 - ` + "`pattern`" + ` takes Go source with ` + "`$UPPERCASE`" + ` metavariables (ast-grep style); matching is syntactic and repeated metavariables must bind identical nodes; ` + "`file_pattern`" + ` and ` + "`repo`" + ` narrow the scan
@@ -101,7 +102,7 @@ Codemap provides Go code analysis via MCP tools. **Use codemap tools instead of 
 
 ## How It Works
 
-Indexing is **automatic** — the first tool call triggers indexing if needed (~50ms). If Go files change, the index refreshes automatically. No manual ` + "`index`" + ` call required.
+Indexing is **automatic** — the first tool call triggers indexing if needed (~50ms). If Go files change, the index refreshes automatically. No manual ` + "`reindex`" + ` call required.
 
 ## Decision Guide
 
@@ -179,7 +180,7 @@ export const CodemapGuard: Plugin = async () => {
       if (CODEMAP_SEARCH.includes(name)) {
         const rendered = output.output ?? ""
         if (!rendered.trim()) {
-          output.output = ` + "`[codemap-guard] \"${input.tool}\" returned no results. The index may be stale or incomplete — run the 'index' tool to rebuild it, then retry.\\n\\n`" + ` + rendered
+          output.output = ` + "`[codemap-guard] \"${input.tool}\" returned no results. The index may be stale or incomplete — run the 'reindex' tool to rebuild it, then retry.\\n\\n`" + ` + rendered
         }
         return
       }
@@ -268,85 +269,77 @@ export default function (cmd: ModApi): void {
 `
 
 const codemapGuardLua = `-- Codemap Guard — maki plugin
--- Version: 2.0
+-- Version: 3.0
 -- Installed by ` + "`codemap inject`" + ` (alias: ` + "`codemap init`" + `).
--- Soft-mode guard that warns when grep/glob target .go files instead of
--- codemap MCP tools. Calls are NOT blocked.
+-- Soft-mode guard that rides along with the host index tool: when a skeleton is
+-- produced for a Go file, it points at the codemap tool that answers what a
+-- skeleton structurally cannot (relationships, interface implementations,
+-- blast radius). Calls are NOT blocked and grep/glob are left alone.
 --
 -- The escalation ladder is question-typed rather than tool-typed:
---   unfamiliar file            -> index tool (skeleton), then read
---   no .go target in pattern or path -> silent, grep is the right tool
---   relationship question      -> codemap__callers_of/codemap__callees_of
---   symbol/package discovery   -> codemap__search / codemap__package
-
-local SUGGESTIONS = {
-  grep = "For relationships use codemap__callers_of/codemap__callees_of; for symbol names codemap__search. To explore an unfamiliar file use the index tool then read.",
-  glob = "Use codemap__package (package API; without path it lists all packages) to discover Go packages and their symbols.",
-}
+--   shape of one file         -> index (skeleton), then read
+--   who calls / what breaks   -> codemap__callers_of / codemap__blast_radius
+--   symbol or package lookup  -> codemap__search / codemap__package
 
 local warned = {}
-local pending = {} -- tool -> input stashed at the input stage
 
--- ".go" must end at a boundary, or "a.gox"/"dir.golang/" would match.
+-- Appended only after a successful, non-empty skeleton of a Go file.
+local NUDGE = "codemap-guard: this skeleton lists declarations, not relationships. "
+  .. "For who calls a symbol use codemap__callers_of, for what an edit affects "
+  .. "codemap__blast_radius, for interface implementers codemap__interface_impls, "
+  .. "and for symbols by name codemap__search."
+
+-- True when v ends in a .go path. The extension must sit at a real boundary:
+-- "a.gox" and "a.go.bak" are not Go files, while "dir.golang/m.go" is.
 local function has_go_ext(v)
   local i = 1
   while true do
-    local _, e = v:find("%.[Gg][Oo]", i)
+    local s, e = v:find("%.[Gg][Oo]", i)
     if not e then
       return false
     end
     local after = v:sub(e + 1, e + 1)
-    if after == "" or not after:match("[%w_]") then
+    local before = s > 1 and v:sub(s - 1, s - 1) or ""
+    if before ~= "." and (after == "" or after == "/" or after:match("[%s\"',]")) then
       return true
     end
     i = e + 1
   end
 end
 
--- A bare ".go" matches any character plus "go", so it hits every path and is
--- not a Go-target signal. Only the escaped form (%.go) names a literal .go.
-local function pattern_has_go_literal(pat)
-  return pat:find("%%%%.go") ~= nil
-end
+local pending = {} -- path stashed at the input stage
 
-local function is_go_target(input)
-  local path = input.path
+maki.api.set_slot("tool.index.input", function(prev, input, ctx)
+  local path = input and input.path
+  -- A directory index is a listing, not a skeleton, so it is left alone.
   if type(path) == "string" and has_go_ext(path) then
-    return true
+    pending[path] = true
   end
-  local pat = input.pattern
-  if type(pat) ~= "string" then
-    return false
-  end
-  return has_go_ext(pat) or pattern_has_go_literal(pat)
-end
+  return prev(input, ctx)
+end)
 
-for _, name in ipairs({ "grep", "glob" }) do
-  maki.api.set_slot("tool." .. name .. ".input", function(prev, input, ctx)
-    pending[name] = is_go_target(input) and input or nil
-    return prev(input, ctx)
-  end)
-
-  maki.api.set_slot("tool." .. name .. ".output", function(prev, out, ctx)
-    local input = pending[name]
-    pending[name] = nil
-    if not input or out.is_error then
-      return prev(out, ctx)
-    end
-    local target = input.pattern or input.path or ""
-    local key = name .. ":" .. target
-    if warned[key] then
-      return prev(out, ctx)
-    end
-    warned[key] = true
-    out.text = '[codemap-guard] "' .. name .. '" on a Go file (' .. target .. "). "
-      .. SUGGESTIONS[name] .. "\n\n" .. (out.text or "")
+maki.api.set_slot("tool.index.output", function(prev, out, ctx)
+  local path = next(pending)
+  pending = {}
+  if not path or out.is_error then
     return prev(out, ctx)
-  end)
-end
+  end
+  -- An empty skeleton means the file declares nothing or the parser failed;
+  -- either way there is no structure to explain, so stay quiet.
+  local text = out.text or ""
+  if text == "" or text:match("^%s*%(no entries") then
+    return prev(out, ctx)
+  end
+  if warned[path] then
+    return prev(out, ctx)
+  end
+  warned[path] = true
+  out.text = text .. "\n\n" .. NUDGE
+  return prev(out, ctx)
+end)
 `
 
-const makiPluginToml = `# Grants required by codemap-guard: it wraps grep/glob tool slots, and tools
+const makiPluginToml = `# Grants required by codemap-guard: it wraps the index tool slot, and tools
 # that declare no permission capability require the plugin to hold every
 # permission grant.
 [permissions]

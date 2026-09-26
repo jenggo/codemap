@@ -39,6 +39,7 @@ type parsedFlags struct {
 	severity          string
 	direction         string
 	generated         string
+	ref               string
 	edgeTypes         []string
 	format            render.Format
 	contextLines      int
@@ -105,7 +106,10 @@ func handleFlag(arg string, args []string, i int, flags *parsedFlags) (bool, int
 	default:
 		return handleValueFlags(arg, args, i, flags)
 	}
-	return false, i
+	// Boolean flags must report as handled, or they leak into the positional
+	// args and corrupt commands that read args[0]/args[1] (package, show,
+	// diagnostics, pattern, search-text, index).
+	return true, i
 }
 
 // handleValueFlags consumes the flag forms that take a following value.
@@ -117,6 +121,8 @@ func handleValueFlags(arg string, args []string, i int, flags *parsedFlags) (boo
 		return consumeStringArg(args, i, &flags.packageFilter)
 	case "--repo":
 		return consumeStringArg(args, i, &flags.repo)
+	case "--ref":
+		return consumeStringArg(args, i, &flags.ref)
 	case "--file-pattern":
 		return consumeStringArg(args, i, &flags.filePattern)
 	case "--generated":
@@ -253,6 +259,8 @@ func dispatchCommand(cmd string, args []string, flags parsedFlags, queryOpts []q
 		cmdIndex(path, flags.dbPath, flags.workspace, flags.discover)
 	case "init", "inject":
 		cmdInit()
+	case "changed-symbols":
+		return cmdChangedSymbols(flags.dbPath, flags.ref, renderOpts)
 	case "update-agents":
 		if err := initcmd.UpdateAgents(); err != nil {
 			return err
@@ -316,7 +324,15 @@ func dispatchQueryCommand(cmd string, args []string, dbPath string, flags parsed
 func dispatchSearchLikeCommand(cmd string, args []string, dbPath string, flags parsedFlags, renderOpts []render.Option) error {
 	switch cmd {
 	case "search-text":
-		return withRequiredArg(args, "search-text", func(arg string) { cmdSearchText(arg, dbPath, renderOpts) })
+		if len(args) < 1 {
+			return fmt.Errorf("search-text requires a pattern")
+		}
+		filePattern := ""
+		if len(args) > 1 {
+			filePattern = args[1]
+		}
+		cmdSearchText(args[0], filePattern, dbPath, renderOpts)
+		return nil
 	case "pattern":
 		if len(args) < 1 {
 			return fmt.Errorf("pattern requires an argument")
@@ -622,6 +638,37 @@ func cmdWorkspaceChangedSymbols(dbPath string, renderOpts []render.Option) error
 	return nil
 }
 
+// cmdChangedSymbols mirrors the changed_symbols MCP tool: it diffs the served
+// repo against ref, falling back to the workspace-wide diff only when the
+// database actually holds workspace members.
+func cmdChangedSymbols(dbPath, ref string, renderOpts []render.Option) error {
+	s, err := store.Open(dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return err
+	}
+	defer func() { _ = s.Close() }()
+
+	repos, err := s.ListRepos()
+	if err == nil && len(repos) > 0 {
+		result, werr := query.WorkspaceChangedSymbols(s, true, false, false)
+		if werr != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", werr)
+			return werr
+		}
+		fmt.Print(render.RenderChangedSymbols(result, renderOpts...))
+		return nil
+	}
+
+	result, err := query.ChangedSymbols(s, ".", ref, true, false, false)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return err
+	}
+	fmt.Print(render.RenderChangedSymbols(result, renderOpts...))
+	return nil
+}
+
 func printWorkspaceUsage() {
 	fmt.Println("Usage: codemap workspace <subcommand> [args]")
 	fmt.Println()
@@ -870,7 +917,7 @@ func cmdServe(dbPath string) {
 	}
 }
 
-func cmdSearchText(pattern, dbPath string, rOpts []render.Option) {
+func cmdSearchText(pattern, filePattern, dbPath string, rOpts []render.Option) {
 	s, err := store.Open(dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -879,10 +926,6 @@ func cmdSearchText(pattern, dbPath string, rOpts []render.Option) {
 	defer func() { _ = s.Close() }()
 
 	flags, _ := parseArgs(os.Args[2:], store.DefaultPath())
-	filePattern := ""
-	if len(os.Args) > 3 {
-		filePattern = os.Args[3]
-	}
 	matches, err := query.SearchText(s, pattern, filePattern, flags.regex, flags.contextLines)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -970,6 +1013,7 @@ func printUsage() {
 	fmt.Println("  pattern <pattern>         Match Go AST subtrees; $UPPERCASE metavariables (syntactic)")
 	fmt.Println("  hotspots                  Show code hotspots (complexity x churn)")
 	fmt.Println("  importance                Show symbol importance (PageRank)")
+	fmt.Println("  changed-symbols [--ref R] Show symbols changed vs R (default: integration branch)")
 	fmt.Println("  diagnostics [file]        Show indexed compile errors (type-check/parse)")
 	fmt.Println("  contracts                 List contract edges across repos")
 	fmt.Println("  contract-drift            List structural drift reports")
@@ -995,6 +1039,7 @@ func printUsageFlags() {
 	fmt.Println("  --package <pkg>           Filter by package path (for search)")
 	fmt.Println("  --generated <mode>        Generated-code handling for search: any (default), exclude, or only (generated matches are down-ranked, never hidden)")
 	fmt.Println("  --repo <module>           Scope query to one workspace repo (search/show/callers-of/callees-of/importers-of/imports-of/blast-radius/pattern)")
+	fmt.Println("  --ref <git-ref>           Diff base for changed-symbols (default: integration branch)")
 	fmt.Println("  --file-pattern <glob>     Filter by file-path substring (for pattern)")
 	fmt.Println("  --regex                   Use regex mode (for search-text)")
 	fmt.Println("  --context-lines <n>       Context lines around matches (for search-text)")
