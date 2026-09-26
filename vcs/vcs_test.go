@@ -211,3 +211,97 @@ func TestGitFileChurnNoCommits(t *testing.T) {
 		t.Fatalf("expected ErrNoCommits for a repo with no commits, got: %v", err)
 	}
 }
+
+// oddGoNames are the filenames git C-quotes in its default output. Every one is
+// a valid Go filename that a plain newline-split parser drops silently.
+var oddGoNames = []string{
+	"with space.go",
+	`with"quote.go`,
+	"with\\backslash.go",
+	"sub/tab\tname.go",
+}
+
+// TestOddFilenamesAreNotDropped guards the -z change: quoted paths end in a
+// quote, not ".go", so both HasSuffix filtering and TrimSpace mangled them.
+func TestOddFilenamesAreNotDropped(t *testing.T) {
+	repo := t.TempDir()
+	initGitRepo(t, repo)
+
+	for _, name := range oddGoNames {
+		if dir := filepath.Dir(name); dir != "." {
+			if err := os.MkdirAll(filepath.Join(repo, dir), 0755); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+		}
+		writeFile(t, filepath.Join(repo, name), "package p\n")
+	}
+	runGitIn(t, repo, "add", ".")
+	runGitIn(t, repo, "commit", "-q", "-m", "initial")
+
+	for _, name := range oddGoNames {
+		writeFile(t, filepath.Join(repo, name), "package p\n// changed\n")
+	}
+
+	changed, err := GitChangedFiles(repo, "HEAD")
+	if err != nil {
+		t.Fatalf("GitChangedFiles: %v", err)
+	}
+	for _, name := range oddGoNames {
+		if !slices.Contains(changed, name) {
+			t.Errorf("expected %q in changed files, got %q", name, changed)
+		}
+	}
+
+	churn, err := GitFileChurn(repo, "HEAD")
+	if err != nil {
+		t.Fatalf("GitFileChurn: %v", err)
+	}
+	for _, name := range oddGoNames {
+		if churn[name] != 1 {
+			t.Errorf("expected churn[%q]=1, got %d (map=%v)", name, churn[name], churn)
+		}
+	}
+}
+
+// TestGitFileStatusesRename verifies a rename yields the new path. The old code
+// split "R100\told\tnew" on the first tab, leaving Status="R100" and
+// Path="old\tnew", so the rename pointed at a file that no longer existed.
+//
+// The fixtures carry distinct content on purpose: git pairs renames and
+// deletions by content similarity, so identical files make it report a
+// deletion under one name paired with a rename under another.
+func TestGitFileStatusesRename(t *testing.T) {
+	repo := t.TempDir()
+	initGitRepo(t, repo)
+
+	writeFile(t, filepath.Join(repo, "old.go"), "package p\n\nfunc Old() {}\n")
+	writeFile(t, filepath.Join(repo, "mod.go"), "package p\n\nfunc Mod() {}\n")
+	writeFile(t, filepath.Join(repo, "gone.go"), "package p\n\nvar Gone = 1\n")
+	runGitIn(t, repo, "add", ".")
+	runGitIn(t, repo, "commit", "-q", "-m", "initial")
+
+	runGitIn(t, repo, "mv", "old.go", "new.go")
+	writeFile(t, filepath.Join(repo, "mod.go"), "package p\n\nfunc Mod() {}\n// changed\n")
+	if err := os.Remove(filepath.Join(repo, "gone.go")); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	statuses, err := GitFileStatuses(repo, "HEAD")
+	if err != nil {
+		t.Fatalf("GitFileStatuses: %v", err)
+	}
+	byPath := make(map[string]string, len(statuses))
+	for _, st := range statuses {
+		byPath[st.Path] = st.Status
+	}
+
+	if got := byPath["new.go"]; !strings.HasPrefix(got, "R") {
+		t.Errorf("expected new.go with a rename status, got %q (all=%v)", got, byPath)
+	}
+	if got := byPath["mod.go"]; got != "M" {
+		t.Errorf("expected mod.go status M, got %q", got)
+	}
+	if got := byPath["gone.go"]; got != "D" {
+		t.Errorf("expected gone.go status D, got %q (all=%v)", got, byPath)
+	}
+}

@@ -268,26 +268,57 @@ export default function (cmd: ModApi): void {
 `
 
 const codemapGuardLua = `-- Codemap Guard — maki plugin
+-- Version: 2.0
 -- Installed by ` + "`codemap inject`" + ` (alias: ` + "`codemap init`" + `).
 -- Soft-mode guard that warns when grep/glob target .go files instead of
 -- codemap MCP tools. Calls are NOT blocked.
+--
+-- The escalation ladder is question-typed rather than tool-typed:
+--   unfamiliar file            -> index tool (skeleton), then read
+--   no .go target in pattern or path -> silent, grep is the right tool
+--   relationship question      -> codemap__callers_of/codemap__callees_of
+--   symbol/package discovery   -> codemap__search / codemap__package
 
 local SUGGESTIONS = {
-  grep = "Use codemap__search (symbol names), codemap__search_text (file contents), or codemap__callers_of/codemap__callees_of (relationships) instead.",
+  grep = "For relationships use codemap__callers_of/codemap__callees_of; for symbol names codemap__search. To explore an unfamiliar file use the index tool then read.",
   glob = "Use codemap__package (package API; without path it lists all packages) to discover Go packages and their symbols.",
 }
 
 local warned = {}
 local pending = {} -- tool -> input stashed at the input stage
 
-local function is_go_target(input)
-  for _, key in ipairs({ "pattern", "path" }) do
-    local v = input[key]
-    if type(v) == "string" and v:find("%.go") then
+-- ".go" must end at a boundary, or "a.gox"/"dir.golang/" would match.
+local function has_go_ext(v)
+  local i = 1
+  while true do
+    local _, e = v:find("%.[Gg][Oo]", i)
+    if not e then
+      return false
+    end
+    local after = v:sub(e + 1, e + 1)
+    if after == "" or not after:match("[%w_]") then
       return true
     end
+    i = e + 1
   end
-  return false
+end
+
+-- A bare ".go" matches any character plus "go", so it hits every path and is
+-- not a Go-target signal. Only the escaped form (%.go) names a literal .go.
+local function pattern_has_go_literal(pat)
+  return pat:find("%%%%.go") ~= nil
+end
+
+local function is_go_target(input)
+  local path = input.path
+  if type(path) == "string" and has_go_ext(path) then
+    return true
+  end
+  local pat = input.pattern
+  if type(pat) ~= "string" then
+    return false
+  end
+  return has_go_ext(pat) or pattern_has_go_literal(pat)
 end
 
 for _, name in ipairs({ "grep", "glob" }) do
@@ -310,17 +341,6 @@ for _, name in ipairs({ "grep", "glob" }) do
     warned[key] = true
     out.text = '[codemap-guard] "' .. name .. '" on a Go file (' .. target .. "). "
       .. SUGGESTIONS[name] .. "\n\n" .. (out.text or "")
-    return prev(out, ctx)
-  end)
-end
-
--- Empty codemap results hint: the index may be stale. Slot names are fine to
--- set before the MCP server registers.
-for _, name in ipairs({ "codemap__search", "codemap__search_text", "codemap__methods_of" }) do
-  maki.api.set_slot("tool." .. name .. ".output", function(prev, out, ctx)
-    if not out.is_error and (out.text or ""):match("^%s*$") then
-      out.text = '[codemap-guard] "' .. name .. '" returned no results. The index may be stale — run the codemap__index tool, then retry.\n\n' .. (out.text or "")
-    end
     return prev(out, ctx)
   end)
 end

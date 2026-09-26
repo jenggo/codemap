@@ -102,28 +102,49 @@ func GitHead(repoDir string) (string, error) {
 	return strings.TrimSpace(out), nil
 }
 
+// runGitNUL runs git with a NUL-delimited -z output and returns the records.
+// -z suppresses git's C-style path quoting, so names holding tabs, quotes or
+// backslashes arrive verbatim instead of wrapped in quotes with escapes.
+func runGitNUL(repoDir string, args ...string) ([]string, error) {
+	out, err := runGit(repoDir, args...)
+	if err != nil {
+		return nil, err
+	}
+	return splitNUL(out), nil
+}
+
+// splitNUL splits git -z output into records, dropping the empty record that
+// separates entries.
+func splitNUL(out string) []string {
+	records := make([]string, 0, strings.Count(out, "\x00"))
+	for rec := range strings.SplitSeq(out, "\x00") {
+		if rec == "" {
+			continue
+		}
+		records = append(records, rec)
+	}
+	return records
+}
+
 func GitChangedFiles(repoDir, ref string) ([]string, error) {
 	if err := IsGitRepo(repoDir); err != nil {
 		return nil, err
 	}
-	out, err := runGit(repoDir, "diff", ref, "--name-only", "--", "*.go")
+	records, err := runGitNUL(repoDir, "diff", ref, "--name-only", "-z", "--", "*.go")
 	if err != nil {
 		return nil, err
 	}
-	return parseChangedFiles(out, repoDir), nil
+	return filterGoPaths(records), nil
 }
 
-func parseChangedFiles(out, _ string) []string {
-	var files []string
-	for line := range strings.SplitSeq(out, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
+// filterGoPaths keeps only .go paths. Records arrive unquoted from -z, so no
+// trimming is applied: a leading space can be part of a real filename.
+func filterGoPaths(records []string) []string {
+	files := records[:0]
+	for _, rec := range records {
+		if strings.HasSuffix(rec, ".go") {
+			files = append(files, rec)
 		}
-		if !strings.HasSuffix(line, ".go") {
-			continue
-		}
-		files = append(files, line)
 	}
 	return files
 }
@@ -133,27 +154,44 @@ type FileStatus struct {
 	Status string
 }
 
+// GitFileStatuses returns each changed .go file with its diff status. -z is
+// required rather than cosmetic: without it a rename is emitted as one
+// "R100\told\tnew" line that no tab split can separate, and paths holding
+// tabs, quotes or backslashes arrive quoted and escaped.
+//
+// With -z the records alternate status, path, status, path..., and a rename
+// contributes status, old path, new path.
 func GitFileStatuses(repoDir, ref string) ([]FileStatus, error) {
 	if err := IsGitRepo(repoDir); err != nil {
 		return nil, err
 	}
-	out, err := runGit(repoDir, "diff", ref, "--name-status", "--", "*.go")
+	records, err := runGitNUL(repoDir, "diff", ref, "--name-status", "-z", "--", "*.go")
 	if err != nil {
 		return nil, err
 	}
 	var statuses []FileStatus
-	for line := range strings.SplitSeq(out, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
+	for i := 0; i+1 < len(records); i += 2 {
+		status := records[i]
+		path := records[i+1]
+		if isRenameStatus(status) {
+			if i+2 >= len(records) {
+				break
+			}
+			path = records[i+2]
+			i++
+		}
+		if !strings.HasSuffix(path, ".go") {
 			continue
 		}
-		parts := strings.SplitN(line, "\t", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		statuses = append(statuses, FileStatus{Status: parts[0], Path: parts[1]})
+		statuses = append(statuses, FileStatus{Status: status, Path: path})
 	}
 	return statuses, nil
+}
+
+// isRenameStatus reports a git name-status code carrying two paths (R/C plus a
+// similarity score, e.g. R100).
+func isRenameStatus(status string) bool {
+	return len(status) > 0 && (status[0] == 'R' || status[0] == 'C')
 }
 
 func GitHunks(repoDir, ref, file string) ([]Hunk, error) {
@@ -255,19 +293,11 @@ func GitDeletedFiles(repoDir, ref string) ([]string, error) {
 	if err := IsGitRepo(repoDir); err != nil {
 		return nil, err
 	}
-	out, err := runGit(repoDir, "diff", ref, "--name-only", "--diff-filter=D", "--", "*.go")
+	records, err := runGitNUL(repoDir, "diff", ref, "--name-only", "--diff-filter=D", "-z", "--", "*.go")
 	if err != nil {
 		return nil, err
 	}
-	var files []string
-	for line := range strings.SplitSeq(out, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		files = append(files, line)
-	}
-	return files, nil
+	return filterGoPaths(records), nil
 }
 
 func ResolveRepoDir(repoDir string) (string, error) {
@@ -321,12 +351,12 @@ func GitFileChurn(repoDir, ref string) (map[string]int, error) {
 	if err := IsGitRepo(repoDir); err != nil {
 		return nil, err
 	}
-	args := []string{"log", "--format=format:", "--name-only"}
+	args := []string{"log", "--format=format:", "--name-only", "-z"}
 	if ref != "" {
 		args = append(args, ref)
 	}
 	args = append(args, "--", "*.go")
-	out, err := runGit(repoDir, args...)
+	records, err := runGitNUL(repoDir, args...)
 	if err != nil {
 		if isNoCommitsErr(err) {
 			return nil, ErrNoCommits
@@ -334,15 +364,13 @@ func GitFileChurn(repoDir, ref string) (map[string]int, error) {
 		return nil, err
 	}
 	churn := make(map[string]int)
-	for line := range strings.SplitSeq(out, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
+	// -z separates commits with a double NUL, which splitNUL collapses into the
+	// same empty record it drops, so counting names needs no commit framing.
+	for _, name := range records {
+		if !strings.HasSuffix(name, ".go") {
 			continue
 		}
-		if !strings.HasSuffix(line, ".go") {
-			continue
-		}
-		churn[line]++
+		churn[name]++
 	}
 	return churn, nil
 }

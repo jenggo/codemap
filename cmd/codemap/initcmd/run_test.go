@@ -78,9 +78,8 @@ func TestInjectMaki_WritesGuardAndMCP(t *testing.T) {
 		"set_slot(\"tool.\" .. name .. \".input\"",
 		"set_slot(\"tool.\" .. name .. \".output\"",
 		"codemap__search",
-		"codemap__search_text",
-		"codemap__methods_of",
-		"codemap__index",
+		"codemap__callers_of",
+		"codemap__package",
 	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("codemap-guard.lua missing %q", want)
