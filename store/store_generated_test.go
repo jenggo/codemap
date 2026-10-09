@@ -17,10 +17,15 @@ func markIndexed(t *testing.T, s *Store, at time.Time) {
 	if err := s.SetIndexedAt(at); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.db.ExecContext(context.Background(),
-		`INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`,
-		generatedProvenanceKey, generatedProvenanceVersion); err != nil {
-		t.Fatal(err)
+	for key, value := range map[string]string{
+		generatedProvenanceKey: generatedProvenanceVersion,
+		analyzerVersionKey:     analyzerVersion,
+	} {
+		if _, err := s.db.ExecContext(context.Background(),
+			`INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`,
+			key, value); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

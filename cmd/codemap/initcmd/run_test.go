@@ -75,25 +75,36 @@ func TestInjectMaki_WritesGuardAndMCP(t *testing.T) {
 	content := string(lua)
 	for _, want := range []string{
 		"codemap-guard",
-		"set_slot(\"tool.index.input\"",
-		"set_slot(\"tool.index.output\"",
+		// One loop registers an output layer per tool, so the tool names live
+		// in the NUDGE table rather than in a literal set_slot call each.
+		`maki.api.set_slot("tool." .. tool .. ".output"`,
+		"read = NUDGE_READ",
+		"grep = NUDGE_GREP",
+		"glob = NUDGE_GLOB",
+		"index = NUDGE_INDEX",
+		// Only Go projects are nudged; the gate is the module markers.
+		`GO_MARKERS = { "go.mod", "go.work" }`,
 		"codemap__search",
 		"codemap__callers_of",
 		"codemap__blast_radius",
 		"codemap__interface_impls",
+		"codemap__symbols_in_file",
+		"codemap__search_text",
+		"codemap__pattern",
+		"codemap__package",
 	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("codemap-guard.lua missing %q", want)
 		}
 	}
-	// The guard must not re-introduce grep/glob warnings.
-	for _, unwanted := range []string{
-		`set_slot("tool.grep`,
-		`set_slot("tool.glob`,
-	} {
-		if strings.Contains(content, unwanted) {
-			t.Errorf("codemap-guard.lua should not hook %q", unwanted)
-		}
+	// The guard must never block a call: it only appends, and only on a Go
+	// target. A blocking layer would answer `value, { ask = reason }` to force
+	// approval; this one always falls through to `prev`.
+	if !strings.Contains(content, "return prev(out, ctx)") {
+		t.Error("codemap-guard.lua must always continue the chain with prev")
+	}
+	if strings.Contains(content, "{ ask") {
+		t.Error("codemap-guard.lua must not ask for approval")
 	}
 
 	init, err := os.ReadFile(filepath.Join(tmpHome, ".config", "maki", "init.lua"))

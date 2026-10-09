@@ -269,25 +269,60 @@ export default function (cmd: ModApi): void {
 `
 
 const codemapGuardLua = `-- Codemap Guard — maki plugin
--- Version: 3.0
--- Installed by ` + "`codemap inject`" + ` (alias: ` + "`codemap init`" + `).
--- Soft-mode guard that rides along with the host index tool: when a skeleton is
--- produced for a Go file, it points at the codemap tool that answers what a
--- skeleton structurally cannot (relationships, interface implementations,
--- blast radius). Calls are NOT blocked and grep/glob are left alone.
+-- Version: 4.0
+-- Installed by ` + "`" + `codemap inject` + "`" + ` (alias: ` + "`" + `codemap init` + "`" + `).
+-- Soft-mode guard that rides along with the host read/grep/glob/index tools: on
+-- a Go project it points at the codemap tool that answers what a raw file read
+-- or a text search structurally cannot. Calls are NOT blocked and the agent can
+-- ignore the nudge and keep the result it already has.
 --
 -- The escalation ladder is question-typed rather than tool-typed:
 --   shape of one file         -> index (skeleton), then read
+--   one symbol / a file's API -> codemap__symbols_in_file / codemap__show
 --   who calls / what breaks   -> codemap__callers_of / codemap__blast_radius
 --   symbol or package lookup  -> codemap__search / codemap__package
+--   file contents / AST shape -> codemap__search_text / codemap__pattern
+--
+-- Only Go projects are nudged: a nudge is emitted when the tool's own target
+-- (the read file, the grep path/include, the glob path, or the cwd) sits under
+-- a directory holding go.mod or go.work. Elsewhere the guard stays silent.
+--
+-- Why append to the tool text instead of session.notify: a notify is delivered
+-- asynchronously and does not reach the model inside the turn that produced the
+-- result, so it cannot steer the next call. Appending rides the result the
+-- model is about to read.
 
 local warned = {}
 
--- Appended only after a successful, non-empty skeleton of a Go file.
-local NUDGE = "codemap-guard: this skeleton lists declarations, not relationships. "
+-- Appended only after a successful, non-empty result on a Go target.
+local NUDGE_INDEX = "codemap-guard: this skeleton lists declarations, not relationships. "
   .. "For who calls a symbol use codemap__callers_of, for what an edit affects "
   .. "codemap__blast_radius, for interface implementers codemap__interface_impls, "
   .. "and for symbols by name codemap__search."
+
+local NUDGE_READ = "codemap-guard: reading a Go file line by line is slower than asking codemap for "
+  .. "its structure. For one file's symbols use codemap__symbols_in_file, for one symbol's "
+  .. "signature/docs/source use codemap__show, and for a symbol plus its callers and callees "
+  .. "use codemap__get_context_bundle."
+
+local NUDGE_GREP = "codemap-guard: grepping a Go module for a symbol or an import misses what the "
+  .. "index already knows. For symbols by name use codemap__search, for file contents with "
+  .. "line numbers use codemap__search_text, for import relationships use codemap__imports_of, "
+  .. "and for structural shapes (e.g. every ` + "`" + `defer X.Close()` + "`" + `) use codemap__pattern."
+
+local NUDGE_GLOB = "codemap-guard: globbing for Go files is slower than asking codemap. "
+  .. "codemap__package with no path lists every package and its symbols, and with a path "
+  .. "gives that package's full API."
+
+local NUDGE = {
+  index = NUDGE_INDEX,
+  read = NUDGE_READ,
+  grep = NUDGE_GREP,
+  glob = NUDGE_GLOB,
+}
+
+-- The markers that make a directory the root of a Go codebase.
+local GO_MARKERS = { "go.mod", "go.work" }
 
 -- True when v ends in a .go path. The extension must sit at a real boundary:
 -- "a.gox" and "a.go.bak" are not Go files, while "dir.golang/m.go" is.
@@ -307,38 +342,93 @@ local function has_go_ext(v)
   end
 end
 
-local pending = {} -- path stashed at the input stage
-
-maki.api.set_slot("tool.index.input", function(prev, input, ctx)
-  local path = input and input.path
-  -- A directory index is a listing, not a skeleton, so it is left alone.
-  if type(path) == "string" and has_go_ext(path) then
-    pending[path] = true
+local function first_string(...)
+  for _, v in ipairs({ ... }) do
+    if type(v) == "string" and v ~= "" then
+      return v
+    end
   end
-  return prev(input, ctx)
-end)
+  return nil
+end
 
-maki.api.set_slot("tool.index.output", function(prev, out, ctx)
-  local path = next(pending)
-  pending = {}
-  if not path or out.is_error then
-    return prev(out, ctx)
+-- Whether the call is about Go, using the tool's own target:
+--   read/index -- the file must be a .go file inside a Go module;
+--   grep/glob  -- the search root (its path, else the cwd) must be a Go module.
+-- maki.fs.root walks upward, so a file in a nested module is recognised even
+-- when the cwd is above it, and a non-Go read in a Go repo stays silent.
+local function on_go_target(tool, input)
+  input = type(input) == "table" and input or {}
+  local path = first_string(input.path, input.file_path, input.file)
+  if path then
+    path = maki.fs.abspath(path)
   end
-  -- An empty skeleton means the file declares nothing or the parser failed;
-  -- either way there is no structure to explain, so stay quiet.
+
+  if tool == "read" or tool == "index" then
+    if not (type(path) == "string" and has_go_ext(path)) then
+      return false
+    end
+    return maki.fs.root(path, GO_MARKERS) ~= nil
+  end
+
+  local root = path or maki.uv.cwd()
+  if not root then
+    return false
+  end
+  return maki.fs.root(root, GO_MARKERS) ~= nil
+end
+
+-- session_id is a field on the slot ctx, not a method. Older hosts may omit it;
+-- the fallback key keeps the once-per-session dedupe working.
+local function session_of(ctx)
+  if type(ctx) == "table" and ctx.session_id ~= nil then
+    return tostring(ctx.session_id)
+  end
+  return "?"
+end
+
+-- True the first time (session, tool) is seen, so a session is nudged at most
+-- once per tool rather than once per file: the point is to teach the ladder,
+-- not to nag on every call.
+local function first_time(session, tool)
+  local key = session .. "|" .. tool
+  if warned[key] then
+    return false
+  end
+  warned[key] = true
+  return true
+end
+
+-- An empty result means nothing to explain; an error means the agent has a
+-- problem to fix first. Both stay untouched. "No files found" (grep/glob) is
+-- also empty in spirit.
+local function worth_nudging(out)
+  if type(out) ~= "table" or out.is_error then
+    return false
+  end
   local text = out.text or ""
-  if text == "" or text:match("^%s*%(no entries") then
-    return prev(out, ctx)
-  end
-  if warned[path] then
-    return prev(out, ctx)
-  end
-  warned[path] = true
-  out.text = text .. "\n\n" .. NUDGE
-  return prev(out, ctx)
-end)
-`
+  return text ~= ""
+    and not text:match("^%s*%(no entries")
+    and text ~= "No files found"
+    and text ~= "No matches found"
+end
 
+for tool, nudge in pairs(NUDGE) do
+  maki.api.set_slot("tool." .. tool .. ".output", function(prev, out, ctx)
+    if not worth_nudging(out) then
+      return prev(out, ctx)
+    end
+    local input = type(ctx) == "table" and ctx.input or nil
+    if not on_go_target(tool, input) then
+      return prev(out, ctx)
+    end
+    if not first_time(session_of(ctx), tool) then
+      return prev(out, ctx)
+    end
+    out.text = out.text .. "\n\n" .. nudge
+    return prev(out, ctx)
+  end)
+end
+`
 const makiPluginToml = `# Grants required by codemap-guard: it wraps the index tool slot, and tools
 # that declare no permission capability require the plugin to hold every
 # permission grant.

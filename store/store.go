@@ -547,6 +547,25 @@ func setGeneratedProvenanceTx(ctx context.Context, tx *sql.Tx) error {
 	return err
 }
 
+// analyzerVersionKey records which analyzer implementation produced an index.
+// Symbols and edges are only correct for the analyzer that wrote them, so a
+// change of analyzerVersion invalidates an index even when no .go file changed.
+const analyzerVersionKey = "analyzer_version"
+
+// analyzerVersion must be bumped whenever parse, resolve, or extract change the
+// symbols or edges they produce. Staleness checks rebuild an index recorded with
+// a different value.
+const analyzerVersion = "1"
+
+// setAnalyzerVersionTx records the analyzer version inside an index write
+// transaction, so an index is only considered current for the analyzer that
+// wrote it.
+func setAnalyzerVersionTx(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`,
+		analyzerVersionKey, analyzerVersion)
+	return err
+}
+
 // migrateFileContentFTS recreates file_content_fts with the trigram tokenizer.
 // An FTS5 table's tokenizer is fixed at creation time, so enabling substring
 // matches inside camelCase identifiers (the porter/unicode61 tokenizer stores
@@ -898,13 +917,17 @@ func (s *Store) writeTx(ctx context.Context, tx *sql.Tx, result *resolve.Result,
 
 // completeIndexWrite runs the bookkeeping shared by every successful index
 // write: the overflow response cache is keyed to the previous index generation,
-// and the generated-code provenance version records that this index populated
-// the provenance columns (so staleness checks stop rebuilding for it).
+// the generated-code provenance version records that this index populated the
+// provenance columns, and the analyzer version records which analyzer produced
+// the symbols and edges.
 func completeIndexWrite(ctx context.Context, tx *sql.Tx) error {
 	if err := deleteResponseChunksTx(ctx, tx); err != nil {
 		return err
 	}
-	return setGeneratedProvenanceTx(ctx, tx)
+	if err := setGeneratedProvenanceTx(ctx, tx); err != nil {
+		return err
+	}
+	return setAnalyzerVersionTx(ctx, tx)
 }
 
 // registerRepos upserts every member into the repos table (workspace mode) and
@@ -2756,6 +2779,9 @@ func (s *Store) IsRepoStale(modulePath string) (bool, error) {
 	if _, ok := readMetaDB(s.db, generatedProvenanceKey); !ok {
 		return true, nil
 	}
+	if v, ok := readMetaDB(s.db, analyzerVersionKey); !ok || v != analyzerVersion {
+		return true, nil
+	}
 	var dir string
 	if err := s.db.QueryRowContext(context.Background(), `SELECT dir FROM repos WHERE module_path = ?`, modulePath).Scan(&dir); err != nil {
 		return false, err
@@ -3297,6 +3323,12 @@ func StaleReason(dbPath, repoPath string) (bool, string, error) {
 	// is rebuilt once and generated symbols become distinguishable.
 	if _, ok := readMetaDB(db, generatedProvenanceKey); !ok {
 		return true, "index predates generated-code provenance", nil
+	}
+
+	// An index produced by an older analyzer may hold symbols or edges the
+	// current one would not emit, so results would not match the source.
+	if v, ok := readMetaDB(db, analyzerVersionKey); !ok || v != analyzerVersion {
+		return true, "index was built by a different analyzer version", nil
 	}
 
 	// Uncommitted edits do not change HEAD, so mtime-based checks can miss them
