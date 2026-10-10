@@ -11,10 +11,9 @@ import (
 )
 
 const (
-	// MaxChunk is the maximum size of one section, in bytes. A section above
-	// this size only occurs as a single oversized fallback section for a
-	// payload that cannot be split further (no structural boundary and no
-	// line breaks).
+	// MaxChunk is the historical default section cap. Splitting is now driven
+	// by the caller's response limit (see RenderedSections); this value remains
+	// the floor a limit is clamped to so sections never degenerate.
 	MaxChunk = 8 * 1024
 
 	// MinChunk is the minimum desirable section size, in bytes. Adjacent
@@ -36,26 +35,37 @@ type Section struct {
 // for their own top-level sections, so the same rule serves both.
 var toonKeyRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.]*(\[\d+\])?:`)
 
-// RenderedSections splits s into sections. Structural boundaries are used
-// when they yield sections no larger than MaxChunk: JSON top-level object
-// keys for JSON payloads, TOON keys and blank-line-separated blocks for
-// TOON/text payloads. Otherwise s falls back to fixed ~MaxChunk byte chunks
-// split at line boundaries. Sections smaller than MinChunk are merged into
-// the following neighbor while the result stays within MaxChunk.
-func RenderedSections(s string) []Section {
+// RenderedSections splits s into sections no larger than limit bytes.
+// Structural boundaries are used when they yield sections within limit: JSON
+// top-level object keys for JSON payloads, TOON keys and blank-line-separated
+// blocks for TOON/text payloads. Otherwise s falls back to fixed chunks split
+// at line boundaries. Sections smaller than MinChunk are merged into the
+// following neighbor while the result stays within limit.
+func RenderedSections(s string, limit int) []Section {
 	if s == "" {
 		return nil
 	}
-	sections := splitStructural(s)
-	if sections == nil || exceedsMax(sections) {
-		sections = splitFixed(s)
+	// Leave room for the per-section header the read-back tool prepends
+	// ("section N: title — M bytes\n\n"), so a section plus its header still
+	// fits the gate it came from and reading it back never re-overflows.
+	limit -= readBackHeaderRoom
+	if limit < MinChunk {
+		limit = MinChunk
 	}
-	return mergeSmall(sections)
+	sections := splitStructural(s)
+	if sections == nil || exceedsMax(sections, limit) {
+		sections = splitFixed(s, limit)
+	}
+	return mergeSmall(sections, limit)
 }
 
-func exceedsMax(sections []Section) bool {
+// readBackHeaderRoom is a conservative allowance for the header rendered ahead
+// of a section read back by index.
+const readBackHeaderRoom = 128
+
+func exceedsMax(sections []Section, limit int) bool {
 	for _, sec := range sections {
-		if len(sec.Content) > MaxChunk {
+		if len(sec.Content) > limit {
 			return true
 		}
 	}
@@ -136,11 +146,10 @@ func truncateBytes(s string, limit int) string {
 	return cut
 }
 
-// splitFixed chunks s at line boundaries into pieces of at most MaxChunk
-// bytes. A payload with no line breaks — or a single line longer than
-// MaxChunk — yields one oversized section; it is the only case where a
-// returned section may exceed MaxChunk.
-func splitFixed(s string) []Section {
+// splitFixed chunks s at line boundaries into pieces of at most limit bytes.
+// A line longer than limit — the only case where a returned section may exceed
+// limit — is cut across sections so the result stays readable.
+func splitFixed(s string, limit int) []Section {
 	lines := strings.SplitAfter(s, "\n")
 	var sections []Section
 	var cur strings.Builder
@@ -155,7 +164,19 @@ func splitFixed(s string) []Section {
 		cur.Reset()
 	}
 	for _, line := range lines {
-		if cur.Len() > 0 && cur.Len()+len(line) > MaxChunk {
+		for len(line) > limit {
+			flush()
+			cut := line[:limit]
+			if i := strings.LastIndexByte(cut, '\n'); i > 0 {
+				cut = cut[:i+1]
+			}
+			sections = append(sections, Section{
+				Title:   "part-" + strconv.Itoa(len(sections)),
+				Content: cut,
+			})
+			line = line[len(cut):]
+		}
+		if cur.Len() > 0 && cur.Len()+len(line) > limit {
 			flush()
 		}
 		cur.WriteString(line)
@@ -167,14 +188,14 @@ func splitFixed(s string) []Section {
 // mergeSmall folds sections smaller than MinChunk into the following
 // neighbor while the combined size stays within MaxChunk, so the manifest
 // does not degenerate into dozens of one-line sections.
-func mergeSmall(sections []Section) []Section {
+func mergeSmall(sections []Section, limit int) []Section {
 	for {
 		merged := false
 		out := sections[:0]
 		for i := 0; i < len(sections); i++ {
 			cur := sections[i]
 			if len(cur.Content) < MinChunk && i+1 < len(sections) &&
-				len(cur.Content)+len(sections[i+1].Content) <= MaxChunk {
+				len(cur.Content)+len(sections[i+1].Content) <= limit {
 				sections[i+1] = Section{
 					Title:   sections[i+1].Title,
 					Content: cur.Content + sections[i+1].Content,

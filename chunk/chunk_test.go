@@ -6,6 +6,10 @@ import (
 	"testing"
 )
 
+// testLimit stands in for the response gate an MCP tool passes down, so these
+// tests exercise the same bound production uses.
+const testLimit = MaxChunk
+
 func concat(sections []Section) string {
 	var b strings.Builder
 	for _, sec := range sections {
@@ -53,7 +57,7 @@ summary:
 `
 
 func TestRenderedSectionsTOONOverview(t *testing.T) {
-	sections := RenderedSections(overviewTOON)
+	sections := RenderedSections(overviewTOON, testLimit)
 	if len(sections) != 2 {
 		t.Fatalf("expected 2 sections (packages, summary), got %d: %+v", len(sections), sections)
 	}
@@ -85,7 +89,7 @@ func TestRenderedSectionsJSONObject(t *testing.T) {
   }
 }
 `
-	sections := RenderedSections(payload)
+	sections := RenderedSections(payload, testLimit)
 	if len(sections) != 2 {
 		t.Fatalf("expected 2 sections (packages, summary), got %d: %+v", len(sections), sections)
 	}
@@ -99,7 +103,7 @@ func TestRenderedSectionsJSONObject(t *testing.T) {
 
 func TestRenderedSectionsSingleBlock(t *testing.T) {
 	payload := "Bundle: a.Parser (est. 42 tokens)\n\nbody of the bundle\n"
-	sections := RenderedSections(payload)
+	sections := RenderedSections(payload, testLimit)
 	if len(sections) != 1 {
 		t.Fatalf("expected 1 section, got %d", len(sections))
 	}
@@ -110,12 +114,17 @@ func TestRenderedSectionsSingleBlock(t *testing.T) {
 
 func TestRenderedSectionsNoNewlines(t *testing.T) {
 	payload := strings.Repeat("x", MaxChunk+100)
-	sections := RenderedSections(payload)
-	if len(sections) != 1 {
-		t.Fatalf("expected 1 oversized fallback section for an unbreakable payload, got %d", len(sections))
+	sections := RenderedSections(payload, MaxChunk)
+	if len(sections) < 2 {
+		t.Fatalf("expected an unbreakable payload to be cut across sections, got %d", len(sections))
 	}
-	if len(sections[0].Content) != len(payload) {
-		t.Errorf("section length = %d, want %d", len(sections[0].Content), len(payload))
+	for i, sec := range sections {
+		if len(sec.Content) > MaxChunk {
+			t.Errorf("section %d is %d bytes, exceeds limit %d", i, len(sec.Content), MaxChunk)
+		}
+	}
+	if got := concat(sections); got != payload {
+		t.Errorf("concatenation is not lossless")
 	}
 }
 
@@ -128,7 +137,7 @@ func TestRenderedSectionsFixedFallbackLossless(t *testing.T) {
 	if len(payload) <= MaxChunk {
 		t.Fatalf("test payload must exceed MaxChunk, is %d", len(payload))
 	}
-	sections := RenderedSections(payload)
+	sections := RenderedSections(payload, testLimit)
 	if len(sections) < 2 {
 		t.Fatalf("expected multiple fixed chunks, got %d", len(sections))
 	}
@@ -150,7 +159,7 @@ func TestRenderedSectionsStructuralSplitWinsWhenWithinMax(t *testing.T) {
 	}
 	b.WriteString("summary:\n  packages: 3\n  symbols: 240\n")
 	payload := b.String()
-	sections := RenderedSections(payload)
+	sections := RenderedSections(payload, testLimit)
 	if len(sections) != 2 {
 		t.Fatalf("expected structural split into 2 sections, got %d", len(sections))
 	}
@@ -165,7 +174,7 @@ func TestRenderedSectionsStructuralSplitWinsWhenWithinMax(t *testing.T) {
 }
 
 func TestRenderedSectionsEmptyInput(t *testing.T) {
-	if got := RenderedSections(""); got != nil {
+	if got := RenderedSections("", testLimit); got != nil {
 		t.Errorf("RenderedSections(\"\") = %+v, want nil", got)
 	}
 }
@@ -177,7 +186,7 @@ func TestRenderedSectionsMergesSmallSections(t *testing.T) {
 		b.WriteString("packages[1]:\n  - data line to give the section some bulk for the merge check\n")
 	}
 	payload := b.String()
-	sections := RenderedSections(payload)
+	sections := RenderedSections(payload, testLimit)
 	for i, sec := range sections {
 		if len(sec.Content) < MinChunk && i < len(sections)-1 {
 			t.Errorf("section %d (%d bytes) below MinChunk %d but not merged", i, len(sec.Content), MinChunk)

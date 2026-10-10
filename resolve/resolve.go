@@ -321,6 +321,7 @@ func processPackage(conf *types.Config, ctx *parseContext, pkgInfo parse.Package
 func resolveCallSites(files map[string]*ast.File, fset *token.FileSet, info *types.Info, pkgPath string, result *Result) {
 	for _, astFile := range files {
 		var currentFunc string
+		var fdBoundary token.Pos
 
 		ast.Inspect(astFile, func(n ast.Node) bool {
 			switch node := n.(type) {
@@ -330,9 +331,10 @@ func resolveCallSites(files map[string]*ast.File, fset *token.FileSet, info *typ
 				} else {
 					currentFunc = pkgPath + "." + node.Name.Name
 				}
+				fdBoundary = node.End()
 
 			case *ast.GenDecl:
-				if name := genDeclCurrentName(node, pkgPath); name != "" {
+				if name := genDeclCurrentName(node, pkgPath, node.Pos() < fdBoundary); name != "" {
 					currentFunc = name
 				}
 
@@ -415,6 +417,15 @@ func addReferenceEdge(from, to string, pos token.Position, result *Result) {
 	})
 }
 
+// selectorQualifier returns the ident on the left of a selector expression,
+// unwrapping the parentheses gofmt leaves in cases like (T{}).M. A qualifier
+// that is itself a selector (pkg.T.M) is ignored: its own X is visited
+// separately by the walk.
+func selectorQualifier(node *ast.SelectorExpr) *ast.Ident {
+	ident, _ := ast.Unparen(node.X).(*ast.Ident)
+	return ident
+}
+
 func resolveSelectorRef(node *ast.SelectorExpr, currentDecl string, fset *token.FileSet, info *types.Info, result *Result) {
 	if currentDecl == "" {
 		return
@@ -425,7 +436,13 @@ func resolveSelectorRef(node *ast.SelectorExpr, currentDecl string, fset *token.
 	// avoid double-emit. Callee selections (svc.Get()) are skipped by the
 	// calleeNodes filter in resolveReferences and produce calls edges via
 	// resolveCallExpr.
+	//
+	// Returning early still leaves the qualifier (sel.X) unvisited: the
+	// selectors here are like `re.MatchString`, where X is the referenced
+	// object and Sel is only a method on it. resolveIdentRef sees Sel, not X,
+	// so without this the package-level var behind X is never linked.
 	if _, ok := info.Selections[node]; ok {
+		resolveIdentRef(selectorQualifier(node), currentDecl, fset, info, result)
 		return
 	}
 	obj, ok := info.Uses[node.Sel]
@@ -442,7 +459,7 @@ func resolveSelectorRef(node *ast.SelectorExpr, currentDecl string, fset *token.
 }
 
 func resolveIdentRef(node *ast.Ident, currentDecl string, fset *token.FileSet, info *types.Info, result *Result) {
-	if currentDecl == "" {
+	if node == nil || currentDecl == "" {
 		return
 	}
 	obj, ok := info.Uses[node]
@@ -461,6 +478,7 @@ func resolveIdentRef(node *ast.Ident, currentDecl string, fset *token.FileSet, i
 func resolveReferences(files map[string]*ast.File, fset *token.FileSet, info *types.Info, pkgPath string, result *Result) {
 	for _, astFile := range files {
 		var currentDecl string
+		var fdBoundary token.Pos
 
 		// First pass: collect all nodes that are part of a call-expression's
 		// callee (the function being called and all its descendants). These
@@ -479,8 +497,9 @@ func resolveReferences(files map[string]*ast.File, fset *token.FileSet, info *ty
 			switch node := n.(type) {
 			case *ast.FuncDecl:
 				currentDecl = funcDeclName(node, pkgPath)
+				fdBoundary = node.End()
 			case *ast.GenDecl:
-				if name := genDeclCurrentName(node, pkgPath); name != "" {
+				if name := genDeclCurrentName(node, pkgPath, node.Pos() < fdBoundary); name != "" {
 					currentDecl = name
 				}
 			case *ast.SelectorExpr:
@@ -497,16 +516,32 @@ func resolveReferences(files map[string]*ast.File, fset *token.FileSet, info *ty
 	}
 }
 
-// markCallees marks a call-expression's function node and all its
-// descendant idents/selector-exprs as callee nodes so that
-// resolveReferences skips them.
+// markCallees records the nodes of a call's function expression that
+// resolveReferences must skip, since the callee already yields a calls edge
+// via resolveCallExpr. Only the method name and the exact nested call nodes
+// are recorded. The qualifier of a method selector (re in `re.MatchString()`)
+// is deliberately NOT recorded: it is a genuine reference to a package-level
+// value, distinct from the method being called, and marking it would leave
+// that value with no incoming edge at all.
 func markCallees(fun ast.Node, calleeNodes map[ast.Node]bool) {
-	ast.Inspect(fun, func(n ast.Node) bool {
-		if n != nil {
-			calleeNodes[n] = true
+	switch f := fun.(type) {
+	case *ast.SelectorExpr:
+		if _, isCall := f.X.(*ast.CallExpr); isCall {
+			markCallees(f.X, calleeNodes)
 		}
-		return true
-	})
+		calleeNodes[f] = true
+		calleeNodes[f.Sel] = true
+	case *ast.Ident:
+		calleeNodes[f] = true
+	case *ast.IndexExpr:
+		// A generic instantiation f[T]: f still needs its calls edge, and T
+		// is type-only, so descending into f covers it.
+		markCallees(f.X, calleeNodes)
+	case *ast.IndexListExpr:
+		markCallees(f.X, calleeNodes)
+	case *ast.ParenExpr:
+		markCallees(f.X, calleeNodes)
+	}
 }
 
 func funcDeclName(fd *ast.FuncDecl, pkgPath string) string {
@@ -518,7 +553,15 @@ func funcDeclName(fd *ast.FuncDecl, pkgPath string) string {
 
 // genDeclCurrentName returns the current declaration name from a GenDecl spec.
 // For ValueSpec it returns the last name; for TypeSpec it returns the type name.
-func genDeclCurrentName(node *ast.GenDecl, pkgPath string) string {
+// Only package-level declarations count: a GenDecl inside a function body
+// declares locals, whose names must never become an edge source. inFunc reports
+// whether the walk has descended into a function body.
+func genDeclCurrentName(node *ast.GenDecl, pkgPath string, inFunc bool) string {
+	// inFunc is derived by the caller from a position comparison, not passed
+	// down a stack, because ast.Inspect has no enter/leave callback.
+	if inFunc {
+		return ""
+	}
 	for _, spec := range node.Specs {
 		switch s := spec.(type) {
 		case *ast.ValueSpec:
@@ -890,12 +933,14 @@ func resolveCgoRefs(files map[string]*ast.File, fset *token.FileSet, pkgPath str
 
 func walkCgoFile(astFile *ast.File, fset *token.FileSet, pkgPath string, cgoNames map[string]bool, result *Result) {
 	var currentDecl string
+	var fdBoundary token.Pos
 	ast.Inspect(astFile, func(n ast.Node) bool {
 		switch node := n.(type) {
 		case *ast.FuncDecl:
 			currentDecl = funcDeclName(node, pkgPath)
+			fdBoundary = node.End()
 		case *ast.GenDecl:
-			if name := genDeclCurrentName(node, pkgPath); name != "" {
+			if name := genDeclCurrentName(node, pkgPath, node.Pos() < fdBoundary); name != "" {
 				currentDecl = name
 			}
 		case *ast.SelectorExpr:

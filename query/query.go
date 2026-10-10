@@ -311,6 +311,9 @@ func expandLevel(edges []store.Edge, allowTypes []string, outgoing bool, visited
 func CallersOf(s *store.Store, qualifiedName string, opts ...Option) ([]EdgeDetail, error) {
 	options := &Options{}
 	opt.Apply(options, opts)
+	if err := requireSymbol(s, qualifiedName); err != nil {
+		return nil, err
+	}
 	allowTypes := options.EdgeTypes
 	if len(allowTypes) == 0 {
 		allowTypes = allEdgeTypes
@@ -325,6 +328,9 @@ func CallersOf(s *store.Store, qualifiedName string, opts ...Option) ([]EdgeDeta
 func CalleesOf(s *store.Store, qualifiedName string, opts ...Option) ([]EdgeDetail, error) {
 	options := &Options{}
 	opt.Apply(options, opts)
+	if err := requireSymbol(s, qualifiedName); err != nil {
+		return nil, err
+	}
 	allowTypes := options.EdgeTypes
 	if len(allowTypes) == 0 {
 		allowTypes = allEdgeTypes
@@ -334,6 +340,20 @@ func CalleesOf(s *store.Store, qualifiedName string, opts ...Option) ([]EdgeDeta
 		return nil, err
 	}
 	return filterEdges(edges, options.Repo), nil
+}
+
+// requireSymbol rejects an unknown start node. Without it a typo (or a
+// receiver that does not exist, e.g. Store.f for a free function f) traverses
+// from a node that has no edges and returns an empty list, which reads as
+// "no callers" instead of "no such symbol".
+func requireSymbol(s *store.Store, qualifiedName string) error {
+	if _, err := s.SymbolByName(qualifiedName); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return symbolMissError(s, qualifiedName)
+		}
+		return err
+	}
+	return nil
 }
 
 func Show(s *store.Store, qualifiedName string, opts ...Option) (*ShowResult, error) {
@@ -1260,6 +1280,59 @@ type UnusedSymbol struct {
 	PosLine       int
 }
 
+// reachableSymbols returns every qualified name reachable from the live root
+// set by following outgoing calls/references/satisfies/embeds edges.
+//
+// This is what separates "nobody calls it" from "only dead code calls it":
+// a symbol referenced solely by an unreachable function is itself unreachable.
+// The roots are the declarations that keep a program running regardless of
+// whether anything calls them: the Go runtime's own entry points (main, init),
+// test entry points, and every exported symbol, since a consumer outside the
+// indexed set may call it.
+func reachableSymbols(s *store.Store, allSyms []store.Symbol) (map[string]bool, error) {
+	pkgMain, err := mainPackages(s)
+	if err != nil {
+		return nil, err
+	}
+	roots, err := rootSymbols(s, allSyms, pkgMain)
+	if err != nil {
+		return nil, err
+	}
+	return s.ReachableFrom(roots, liveEdgeTypes)
+}
+
+// rootSymbols collects the names that are live without being called: the
+// runtime's main/init, exported symbols (their caller may be outside the
+// index), and test entry points.
+//
+// Test roots come from a fresh AllSymbols(true) scan rather than the caller's
+// slice, because callers commonly pass includeTests=false for the report while
+// test functions still appear in the edge graph. Leaving them out as roots
+// would make every test-only helper look unreachable.
+func rootSymbols(s *store.Store, allSyms []store.Symbol, pkgMain map[string]bool) ([]string, error) {
+	roots := make([]string, 0, len(allSyms))
+	for _, sym := range allSyms {
+		if sym.Exported || liveByDesign(sym, pkgMain) {
+			roots = append(roots, sym.QualifiedName)
+		}
+	}
+
+	all, err := s.AllSymbols(true)
+	if err != nil {
+		return nil, err
+	}
+	for _, sym := range all {
+		if sym.IsTest && sym.Receiver == "" && isTestEntryName(sym.Name) {
+			roots = append(roots, sym.QualifiedName)
+		}
+	}
+	return roots, nil
+}
+
+// liveEdgeTypes are the edge types that carry liveness: anything an outgoing
+// reference, call, embedding, or interface satisfaction points at is reachable.
+var liveEdgeTypes = []string{edgeTypeCalls, edgeTypeReferences, edgeTypeSatisfies, edgeTypeEmbeds}
+
 func UnusedSymbols(s *store.Store, opts ...Option) ([]UnusedSymbol, error) {
 	options := &Options{}
 	opt.Apply(options, opts)
@@ -1269,16 +1342,14 @@ func UnusedSymbols(s *store.Store, opts ...Option) ([]UnusedSymbol, error) {
 		return nil, err
 	}
 
-	edgesFrom, err := s.AllEdges()
+	reachable, err := reachableSymbols(s, allSyms)
 	if err != nil {
 		return nil, err
 	}
 
-	called := make(map[string]bool)
-	for _, e := range edgesFrom {
-		if e.EdgeType == edgeTypeCalls || e.EdgeType == edgeTypeReferences || e.EdgeType == edgeTypeSatisfies || e.EdgeType == edgeTypeEmbeds {
-			called[e.ToRef] = true
-		}
+	pkgMain, err := mainPackages(s)
+	if err != nil {
+		return nil, err
 	}
 
 	unused := make([]UnusedSymbol, 0)
@@ -1286,7 +1357,10 @@ func UnusedSymbols(s *store.Store, opts ...Option) ([]UnusedSymbol, error) {
 		if sym.Exported || sym.IsGenerated {
 			continue
 		}
-		if !called[sym.QualifiedName] {
+		if liveByDesign(sym, pkgMain) {
+			continue
+		}
+		if !reachable[sym.QualifiedName] {
 			unused = append(unused, UnusedSymbol{
 				QualifiedName: sym.QualifiedName,
 				Kind:          sym.Kind,
@@ -2356,7 +2430,6 @@ func EntryPoints(s *store.Store, heuristics []string, includeTests bool) ([]Entr
 		pkgMain[p.Path] = p.Name == kindMain && !p.IsTest
 		pkgIsTest[p.Path] = p.IsTest
 	}
-
 	allSyms, err := s.AllSymbols(includeTests)
 	if err != nil {
 		return nil, err
@@ -2386,6 +2459,44 @@ func EntryPoints(s *store.Store, heuristics []string, includeTests bool) ([]Entr
 		return out[i].QualifiedName < out[j].QualifiedName
 	})
 	return out, nil
+}
+
+// liveByDesign reports whether a symbol must never be reported as dead even
+// with no incoming edge. These are the declarations the Go runtime invokes
+// itself (main, init) and the blank identifier, which names nothing
+// addressable. UnusedSymbols and EntryPoints share this so the two cannot
+// disagree about what "nothing calls it" means.
+//
+// pkgMain is keyed by package path and is true only for packages whose clause
+// is `main`, so a library func main() stays reportable.
+func liveByDesign(sym store.Symbol, pkgMain map[string]bool) bool {
+	if sym.Name == "_" {
+		return true
+	}
+	if sym.Receiver != "" || sym.Kind != kindFunction {
+		return false
+	}
+	if sym.Name == "init" {
+		return true
+	}
+	return sym.Name == kindMain && pkgMain[sym.PackagePath]
+}
+
+// mainPackages returns the set of package paths whose package clause is
+// `main`. It is the authoritative answer to "does a func main() here actually
+// start a program", which a path suffix check cannot give.
+func mainPackages(s *store.Store) (map[string]bool, error) {
+	pkgs, err := s.ListPackages()
+	if err != nil {
+		return nil, err
+	}
+	pkgMain := make(map[string]bool, len(pkgs))
+	for _, p := range pkgs {
+		if p.Name == kindMain {
+			pkgMain[p.Path] = true
+		}
+	}
+	return pkgMain, nil
 }
 
 func isTestEntryName(name string) bool {

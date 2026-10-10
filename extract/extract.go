@@ -133,7 +133,14 @@ func (e *fileExtractor) extract() {
 			curCount = &count
 			pending = append(pending, pendingComplexity{idx: idx, count: &count})
 		case *ast.GenDecl:
-			e.extractGenDecl(node)
+			// A GenDecl inside a function body declares locals (or a local
+			// type), which are not package-level symbols and are never the
+			// target of a reference edge, so emitting them only produces
+			// false "unused" hits. inFunctionBody requires the exact pos/end
+			// containment a package-scope decl after the body fails.
+			if !inFunctionBody(node, curFd) {
+				e.extractGenDecl(node)
+			}
 		case *ast.IfStmt, *ast.ForStmt, *ast.RangeStmt, *ast.CaseClause:
 			if inFunctionBody(node, curFd) && curCount != nil {
 				*curCount++
@@ -380,6 +387,14 @@ func wireName(f *ast.Field, goName string) string {
 
 func (e *fileExtractor) extractValueSpec(vs *ast.ValueSpec, kind string, doc *ast.CommentGroup) {
 	for i, name := range vs.Names {
+		// The blank identifier declares nothing addressable, so a `var _ = f()`
+		// must not create a symbol. Emitting one folds every such declaration
+		// into a single package._ name that UnusedSymbols then treats as live,
+		// masking the genuinely dead symbols it was meant to report.
+		if name.Name == "_" {
+			continue
+		}
+
 		pos := e.fset.Position(name.Pos())
 		qualifiedName := e.pkgPath + "." + name.Name
 

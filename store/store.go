@@ -1252,6 +1252,14 @@ DO UPDATE SET
 		SELECT value FROM json_each(excluded.sites)
 	))`
 
+	// 26k+ edges must not recompile this upsert (with its JSON subqueries) on
+	// every row, so prepare it once for the whole transaction.
+	stmt, err := tx.PrepareContext(ctx, edgeUpsert)
+	if err != nil {
+		return fmt.Errorf("preparing edge upsert: %w", err)
+	}
+	defer func() { _ = stmt.Close() }()
+
 	for _, edge := range edges {
 		_, repoID := attrib.pkgFor(edge.Edge.FromRef)
 
@@ -1261,7 +1269,7 @@ DO UPDATE SET
 			return fmt.Errorf("marshaling sites for %s -> %s: %w", edge.Edge.FromRef, edge.Edge.ToRef, err)
 		}
 
-		_, err = tx.ExecContext(ctx, edgeUpsert,
+		_, err = stmt.ExecContext(ctx,
 			edge.Edge.FromRef,
 			edge.Edge.ToRef,
 			edge.Edge.EdgeType,
@@ -1839,6 +1847,53 @@ func (s *Store) EdgesByType(edgeType string) ([]Edge, error) {
 // other multi-ref queries, kept well under SQLite's default variable limit
 // (999) so a bounded collection of refs never overflows the binding capacity.
 const edgesInBatchSize = 500
+
+// ReachableFrom returns every reference reachable from roots by following
+// outgoing edges of the given types, computing the transitive closure inside
+// SQLite with a recursive CTE.
+//
+// This is the whole-graph fixpoint that a per-level BFS approximates with one
+// query per frontier; letting SQLite walk it keeps the work in the engine and
+// uses idx_edges_from (from_ref) for each join step.
+func (s *Store) ReachableFrom(roots, edgeTypes []string) (map[string]bool, error) {
+	reachable := make(map[string]bool)
+	if len(roots) == 0 || len(edgeTypes) == 0 {
+		return reachable, nil
+	}
+
+	rootsJSON, err := jsonMarshal(roots)
+	if err != nil {
+		return nil, err
+	}
+	typeJSON, err := jsonMarshal(edgeTypes)
+	if err != nil {
+		return nil, err
+	}
+
+	query := `WITH RECURSIVE reach(qn) AS (
+		SELECT value FROM json_each(?)
+		UNION
+		SELECT e.to_ref FROM edges e
+			JOIN reach r ON e.from_ref = r.qn
+		WHERE e.edge_type IN (SELECT value FROM json_each(?))
+	)
+	SELECT DISTINCT qn FROM reach`
+
+	rows, err := s.db.QueryContext(context.Background(), query, rootsJSON, typeJSON)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var qn string
+		if err := rows.Scan(&qn); err != nil {
+			return nil, err
+		}
+		reachable[qn] = true
+	}
+	return reachable, rows.Err()
+}
 
 // EdgesForNodes returns every edge whose from_ref (outgoing=true) or to_ref
 // (outgoing=false) is one of refs, optionally restricted to the given edge

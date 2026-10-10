@@ -52,7 +52,7 @@ func (s *Server) gateResponse(tool, rendered string) string {
 	if err != nil {
 		return gateStoreError(len(rendered), limit, err)
 	}
-	sections := chunk.RenderedSections(rendered)
+	sections := chunk.RenderedSections(rendered, limit)
 	if len(sections) == 0 {
 		return gateStoreError(len(rendered), limit, errors.New("chunking produced no sections"))
 	}
@@ -165,7 +165,6 @@ func readResponseSectionByIndex(st *store.Store, id string, idx int) (string, an
 	b.WriteString(sec.Content)
 	return b.String(), nil, false
 }
-
 func searchResponseSections(st *store.Store, id, query string, limit int) (string, any, bool) {
 	hits, err := st.SearchResponseSections(id, query, limit)
 	if err != nil {
