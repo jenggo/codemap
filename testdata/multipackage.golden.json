@@ -111,6 +111,7 @@
       "Path": "codemap/testdata/multipackage/pkgA",
       "Name": "pkgA",
       "Dir": "testdata/multipackage/pkgA",
+      "Doc": "",
       "SymCount": 4,
       "IsTest": false,
       "IsGenerated": false
@@ -119,6 +120,7 @@
       "Path": "codemap/testdata/multipackage/pkgB",
       "Name": "pkgB",
       "Dir": "testdata/multipackage/pkgB",
+      "Doc": "",
       "SymCount": 4,
       "IsTest": false,
       "IsGenerated": false

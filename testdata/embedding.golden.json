@@ -104,6 +104,7 @@
       "Path": "codemap/testdata/embedding",
       "Name": "embedding",
       "Dir": "testdata/embedding",
+      "Doc": "",
       "SymCount": 8,
       "IsTest": false,
       "IsGenerated": false

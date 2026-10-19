@@ -215,12 +215,12 @@ func associatedStruct(analysis *Analysis, repo, constQN string) (StructInfo, boo
 	if len(structs) == 0 {
 		return StructInfo{}, false
 	}
-	dot := strings.LastIndex(constQN, ".")
-	if dot < 0 {
+	before, after, ok := strings.CutLast(constQN, ".")
+	if !ok {
 		return StructInfo{}, false
 	}
-	pkg := constQN[:dot]
-	base := constQN[dot+1:]
+	pkg := before
+	base := after
 
 	if s, ok := structs[pkg+"."+strings.TrimPrefix(base, "MsgType")]; ok {
 		return s, true

@@ -104,6 +104,7 @@
       "Path": "codemap/testdata/interfaces",
       "Name": "interfaces",
       "Dir": "testdata/interfaces",
+      "Doc": "",
       "SymCount": 8,
       "IsTest": false,
       "IsGenerated": false

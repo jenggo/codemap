@@ -117,6 +117,7 @@ CREATE TABLE IF NOT EXISTS packages (
     path         TEXT    NOT NULL UNIQUE,
     name         TEXT    NOT NULL,
     dir          TEXT    NOT NULL,
+    doc          TEXT    NOT NULL DEFAULT '',
     is_test      BOOLEAN NOT NULL DEFAULT FALSE,
     is_generated BOOLEAN NOT NULL DEFAULT FALSE,
     repo_id      INTEGER REFERENCES repos(id)
@@ -398,16 +399,8 @@ func ensureSchema(db *sql.DB) error {
 		return err
 	}
 
-	if !tableExists(db, "repos") {
-		if _, err := db.ExecContext(ctx, `CREATE TABLE repos (
-			id          INTEGER PRIMARY KEY,
-			module_path TEXT    NOT NULL UNIQUE,
-			dir         TEXT    NOT NULL,
-			missing     BOOLEAN NOT NULL DEFAULT FALSE,
-			indexed_at  TEXT
-		)`); err != nil {
-			return err
-		}
+	if err := ensureReposTable(ctx, db); err != nil {
+		return err
 	}
 
 	if err := ensureRepoIDColumns(ctx, db); err != nil {
@@ -416,6 +409,11 @@ func ensureSchema(db *sql.DB) error {
 
 	// Generated-code provenance (additive boolean columns).
 	if err := ensureGeneratedColumns(ctx, db); err != nil {
+		return err
+	}
+
+	// Package doc comments for the summary command (additive).
+	if err := ensurePackageDocColumn(ctx, db); err != nil {
 		return err
 	}
 
@@ -483,6 +481,22 @@ func migrateFromVersion(ctx context.Context, db *sql.DB, version int) error {
 	return migrateFileContentFTS(ctx, db)
 }
 
+// ensureReposTable creates the workspace repo registry on databases predating
+// workspace support.
+func ensureReposTable(ctx context.Context, db *sql.DB) error {
+	if tableExists(db, "repos") {
+		return nil
+	}
+	_, err := db.ExecContext(ctx, `CREATE TABLE repos (
+		id          INTEGER PRIMARY KEY,
+		module_path TEXT    NOT NULL UNIQUE,
+		dir         TEXT    NOT NULL,
+		missing     BOOLEAN NOT NULL DEFAULT FALSE,
+		indexed_at  TEXT
+	)`)
+	return err
+}
+
 // ensureRepoIDColumns adds the repo_id foreign-key column to single-repo tables
 // when missing (additive migration from the pre-workspace schema).
 func ensureRepoIDColumns(ctx context.Context, db *sql.DB) error {
@@ -527,6 +541,21 @@ func ensureGeneratedColumns(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
+// ensurePackageDocColumn adds the package doc-comment column when missing
+// (additive migration). Existing rows default to an empty doc until the next
+// index write populates them.
+func ensurePackageDocColumn(ctx context.Context, db *sql.DB) error {
+	hasCol, err := columnExists(db, "packages", "doc")
+	if err != nil {
+		return fmt.Errorf("ensure schema: inspect packages.doc: %w", err)
+	}
+	if hasCol {
+		return nil
+	}
+	_, err = db.ExecContext(ctx, `ALTER TABLE packages ADD COLUMN doc TEXT NOT NULL DEFAULT ''`)
+	return err
+}
+
 // generatedColumn is the shared provenance column name on packages and symbols.
 const generatedColumn = "is_generated"
 
@@ -555,7 +584,7 @@ const analyzerVersionKey = "analyzer_version"
 // analyzerVersion must be bumped whenever parse, resolve, or extract change the
 // symbols or edges they produce. Staleness checks rebuild an index recorded with
 // a different value.
-const analyzerVersion = "1"
+const analyzerVersion = "2"
 
 // setAnalyzerVersionTx records the analyzer version inside an index write
 // transaction, so an index is only considered current for the analyzer that
@@ -1118,8 +1147,9 @@ func writePackages(ctx context.Context, tx *sql.Tx, packages []parse.PackageInfo
 	for _, pkg := range packages {
 		repoID := repoByModule[pkg.ModulePath]
 		var id int64
-		_, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO packages (path, name, dir, is_test, is_generated, repo_id) VALUES (?, ?, ?, ?, ?, ?)`,
-			pkg.ImportPath, pkg.Name, pkg.Dir, pkg.IsTest, pkg.IsGenerated, nullableRepo(repoID))
+		_, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO packages (path, name, dir, doc, is_test, is_generated, repo_id) VALUES (?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(path) DO UPDATE SET doc = excluded.doc`,
+			pkg.ImportPath, pkg.Name, pkg.Dir, pkg.Doc, pkg.IsTest, pkg.IsGenerated, nullableRepo(repoID))
 		if err != nil {
 			return nil, err
 		}
@@ -1458,6 +1488,7 @@ type Package struct {
 	Path        string
 	Name        string
 	Dir         string
+	Doc         string
 	Repo        string `json:"repo,omitempty"`
 	SymCount    int
 	IsTest      bool
@@ -1762,7 +1793,7 @@ func scanSymbols(rows *sql.Rows) ([]Symbol, error) {
 
 func (s *Store) ListPackages() ([]Package, error) {
 	rows, err := s.db.QueryContext(context.Background(), `
-		SELECT p.path, p.name, p.dir, p.is_test, p.is_generated, COUNT(s.id), r.module_path
+		SELECT p.path, p.name, p.dir, p.doc, p.is_test, p.is_generated, COUNT(s.id), r.module_path
 		FROM packages p
 		LEFT JOIN symbols s ON s.package_id = p.id
 		LEFT JOIN repos r ON r.id = p.repo_id
@@ -1778,7 +1809,7 @@ func (s *Store) ListPackages() ([]Package, error) {
 	for rows.Next() {
 		var p Package
 		var repo sql.NullString
-		if err := rows.Scan(&p.Path, &p.Name, &p.Dir, &p.IsTest, &p.IsGenerated, &p.SymCount, &repo); err != nil {
+		if err := rows.Scan(&p.Path, &p.Name, &p.Dir, &p.Doc, &p.IsTest, &p.IsGenerated, &p.SymCount, &repo); err != nil {
 			return nil, err
 		}
 		p.Repo = repo.String

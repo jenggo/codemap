@@ -49,6 +49,7 @@
       "Path": "codemap/testdata/simple",
       "Name": "simple",
       "Dir": "testdata/simple",
+      "Doc": "",
       "SymCount": 4,
       "IsTest": false,
       "IsGenerated": false

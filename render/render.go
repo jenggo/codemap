@@ -23,7 +23,11 @@ const (
 	FormatCompact
 )
 
-const keyPackages = "packages"
+const (
+	keyPackages = "packages"
+	keySymbols  = "symbols"
+	keyEdges    = "edges"
+)
 
 type Options struct {
 	Format   Format
@@ -617,8 +621,8 @@ func renderOverviewTOON(result *query.OverviewResult) string {
 	data := map[string]any{
 		"summary": map[string]any{
 			keyPackages: result.TotalPackages,
-			"symbols":   result.TotalSymbols,
-			"edges":     result.TotalEdges,
+			keySymbols:  result.TotalSymbols,
+			keyEdges:    result.TotalEdges,
 		},
 		keyPackages: result.Packages,
 	}

@@ -26,8 +26,11 @@ type PackageInfo struct {
 	// single-repo mode; set by workspace indexing to the nearest enclosing
 	// go.mod's module path.
 	ModulePath string
-	Files      []string
-	IsTest     bool
+	// Doc is the package clause comment ("// Package x ...") of the first
+	// non-test file, trimmed to its first sentence.
+	Doc    string
+	Files  []string
+	IsTest bool
 	// IsGenerated is set when every file defining the package is generated
 	// code. Per-file provenance lives in Result.GeneratedFiles.
 	IsGenerated bool
@@ -59,6 +62,7 @@ func Run(pattern string) (*Result, error) {
 	}
 	if result, err := goList(absPattern); err == nil {
 		finalizeGenerated(result)
+		finalizeDocs(result)
 		return result, nil
 	}
 	result, err := runDirWalk(absPattern)
@@ -67,6 +71,7 @@ func Run(pattern string) (*Result, error) {
 	}
 	result.Fallback = true
 	finalizeGenerated(result)
+	finalizeDocs(result)
 	return result, nil
 }
 
@@ -123,6 +128,49 @@ func finalizeGenerated(result *Result) {
 			}
 		}
 	}
+}
+
+// finalizeDocs records each package's doc comment from the first non-test file
+// that carries one. Test packages inherit their target package's doc because
+// the package clause is identical.
+func finalizeDocs(result *Result) {
+	docByPath := make(map[string]string)
+	for i := range result.Packages {
+		pkg := &result.Packages[i]
+		if pkg.IsTest {
+			continue
+		}
+		for _, f := range pkg.Files {
+			astFile := result.Files[f]
+			if astFile == nil || astFile.Doc == nil {
+				continue
+			}
+			docByPath[pkg.ImportPath] = firstSentence(astFile.Doc.Text())
+			break
+		}
+	}
+	for i := range result.Packages {
+		pkg := &result.Packages[i]
+		if pkg.IsTest {
+			pkg.Doc = docByPath[strings.TrimSuffix(pkg.ImportPath, "_test")]
+			continue
+		}
+		pkg.Doc = docByPath[pkg.ImportPath]
+	}
+}
+
+// firstSentence trims s to its first sentence so a long package doc does not
+// dominate a summary line. A period only ends a sentence when followed by
+// whitespace or end of text, so "go.mod" and "e.g." survive intact.
+func firstSentence(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if s == "" {
+		return ""
+	}
+	if i := strings.Index(s, ". "); i >= 0 {
+		return s[:i+1]
+	}
+	return s
 }
 
 // File parses one file's source into an *ast.File with comments, without
@@ -196,6 +244,7 @@ func RunWorkspace(roots []WorkspaceRoot) (*Result, error) {
 	}
 
 	finalizeGenerated(result)
+	finalizeDocs(result)
 
 	return result, nil
 }
@@ -407,6 +456,9 @@ func goListInto(result *Result, abs, modulePath string, seen map[string]bool) er
 }
 
 func addGoListPkgInto(result *Result, p goListPkg, modulePath string, seen map[string]bool) {
+	if skipListedPackage(p.Dir) {
+		return
+	}
 	files := make([]string, 0, len(p.GoFiles)+len(p.CgoFiles)+len(p.TestGoFiles))
 	files = append(files, p.GoFiles...)
 	files = append(files, p.CgoFiles...)
@@ -495,6 +547,9 @@ func goList(abs string) (*Result, error) {
 }
 
 func addGoListPkg(result *Result, p goListPkg) {
+	if skipListedPackage(p.Dir) {
+		return
+	}
 	files := make([]string, 0, len(p.GoFiles)+len(p.CgoFiles)+len(p.TestGoFiles))
 	files = append(files, p.GoFiles...)
 	files = append(files, p.CgoFiles...)
@@ -529,6 +584,18 @@ func addGoListPkg(result *Result, p goListPkg) {
 }
 
 const dirVendor = "vendor"
+
+// skipListedPackage reports whether go list returned a package from a directory
+// the indexer excludes. `go list ./...` descends into vendor and node_modules
+// when they sit inside the module tree, unlike the directory walk.
+func skipListedPackage(dir string) bool {
+	for part := range strings.SplitSeq(filepath.ToSlash(dir), "/") {
+		if part == dirVendor || part == "node_modules" {
+			return true
+		}
+	}
+	return false
+}
 
 func runDirWalk(pattern string) (*Result, error) {
 	result := &Result{

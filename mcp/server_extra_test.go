@@ -38,6 +38,7 @@ func TestToolsListIncludesNewTools(t *testing.T) {
 	}
 	required := []string{
 		"show",
+		"summary",
 		"changed_symbols",
 		"dependency_flow",
 		"entry_points",
@@ -71,7 +72,7 @@ func TestToolsListIncludesNewTools(t *testing.T) {
 			t.Errorf("absorbed tool %q must not appear in tools/list", gone)
 		}
 	}
-	if len(tools) != 33 {
+	if len(tools) != 34 {
 		t.Errorf("expected 33 tools in tools/list, got %d", len(tools))
 	}
 }

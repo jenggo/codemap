@@ -10,7 +10,10 @@ It can be used both as a **CLI tool** and as an **MCP server** for AI-powered co
 # Index the current Go repository
 codemap index
 
-# Get a bird's-eye overview
+# Get a tl;dr of the repo (module, packages, entry points, deps)
+codemap summary
+
+# List every package's exported symbols
 codemap overview
 
 # Search for a symbol
@@ -29,6 +32,7 @@ codemap mcp
 
 | Command | What it does |
 |---|---|
+| `summary` | Repository tl;dr: module, package map with doc comments, entry points, third-party and stdlib deps, hub packages. Call this first in an unfamiliar repo |
 | `search <pattern>` | Find symbols by name. Matching spans every indexed field (qualified name, name, kind, receiver, signature, doc) and ranking puts name matches first |
 | `show <qualified_name>` | Full details: signature, docs, file location, incoming/outgoing edges |
 | `package <path>` | All symbols in a package with signatures and docs |
@@ -51,10 +55,11 @@ codemap mcp
 
 ### Code Analysis
 
-`hotspots`, `importance`, and `changed-symbols` are available on the CLI; the traversal and analysis tools below them are exposed only through the **MCP server**.
+`summary`, `hotspots`, `importance`, and `changed-symbols` are available on the CLI; the traversal and analysis tools below them are exposed only through the **MCP server**.
 
 | Command / Tool | Where | Description |
 |---|---|---|
+| `summary` | CLI + MCP | Repository tl;dr (~1.5 KB): module, size, packages with doc comments, entry points, third-party + stdlib deps, hubs. Complements `overview`, which enumerates every symbol |
 | `hotspots` / `get_hotspots` | CLI + MCP | Rank symbols by `complexity × churn` for refactoring risk (MCP adds `mode: "pagerank"` for call-graph centrality) |
 | `importance` | CLI | Rank symbols by PageRank call-graph centrality |
 | `changed-symbols [--ref R]` / `changed_symbols` | CLI + MCP | Working-tree changed symbols vs a git ref, classified by change type, with renamed files reported as `from -> to` |
@@ -109,7 +114,7 @@ The MCP server always renders TOON.
 
 Unlike the CLI, the MCP server keeps itself fresh: it indexes the repo automatically on the first tool call and re-indexes when Go files change. `reindex` forces a full rebuild (the CLI spells this `index`).
 
-Tools: `reindex`, `health`, `overview`, `schema`, `stats`, `show`, `search`, `package`, `methods_of`, `symbols_in_file`, `callers_of`, `callees_of`, `imports_of`, `all_edges`, `find_path`, `cycles`, `dependency_flow`, `blast_radius`, `type_usage`, `interface_impls`, `entry_points`, `unused`, `search_text`, `pattern`, `get_context_bundle`, `diagnostics`, `changed_symbols`, `get_hotspots`, `contracts`, `contract_drift`, `runtime_contracts`, `suppress_contract`, `read_response_section`.
+Tools: `reindex`, `health`, `summary`, `overview`, `schema`, `stats`, `show`, `search`, `package`, `methods_of`, `symbols_in_file`, `callers_of`, `callees_of`, `imports_of`, `all_edges`, `find_path`, `cycles`, `dependency_flow`, `blast_radius`, `type_usage`, `interface_impls`, `entry_points`, `unused`, `search_text`, `pattern`, `get_context_bundle`, `diagnostics`, `changed_symbols`, `get_hotspots`, `contracts`, `contract_drift`, `runtime_contracts`, `suppress_contract`, `read_response_section`.
 
 Responses over 16 KiB are stored and replaced by a searchable section manifest, so a large result never floods the context window; `read_response_section` pulls back only the sections you need. Override the threshold with `CODEMAP_RESPONSE_LIMIT`.
 
@@ -121,7 +126,7 @@ Responses over 16 KiB are stored and replaced by a searchable section manifest, 
 - **Plugin** — installs a soft-mode guard to `~/.config/opencode/plugins/codemap-guard.ts` that warns agents when they use grep/glob/read on `.go` files instead of codemap MCP tools
 - **Crush** — injects the MCP entry into `~/.config/crush/crush.json`
 - **Command Code** — installs a soft-mode guard mod to `~/.commandcode/mods/codemap-guard.ts` (skipped when `~/.commandcode` is absent)
-- **Maki** — registers `[mcp.codemap]` in `mcp.toml`, installs a Lua guard plugin (`codemap-guard.lua`) loaded from `init.lua`, and writes permission grants to `plugin.toml`, into `~/.maki` (or `~/.config/maki`); skipped when neither config dir exists. This guard rides along with maki's own `index` tool: after a successful non-empty skeleton of a `.go` file it appends a pointer to the codemap tools that answer what a skeleton cannot (callers, blast radius, interface implementations, symbol search).
+- **Maki** — registers `[mcp.codemap]` in `mcp.toml`, installs a Lua guard plugin (`codemap_guard.lua`) loaded from `init.lua`, and injects a `codemap summary` of the current Go module into the system prompt (`after_instructions`), and writes permission grants to `plugin.toml`, into `~/.maki` (or `~/.config/maki`); skipped when neither config dir exists. This guard rides along with maki's own `index` tool: after a successful non-empty skeleton of a `.go` file it appends a pointer to the codemap tools that answer what a skeleton cannot (callers, blast radius, interface implementations, symbol search).
 - **AGENTS.md** — creates project-level guidance for AI agents (skipped if already exists)
 
 Re-run `codemap init` after upgrading codemap to refresh the installed plugins, navigation doc, and guards; the command reports `updated` or `unchanged` per artifact, and each guard carries a `Version:` marker.
@@ -136,7 +141,7 @@ codemap <command> [args] [flags]
 
 ### Commands
 
-`inject`/`init`, `update-agents`, `index [path]`, `changed-symbols [--ref R]`, `overview`, `show <name>`, `callers-of <name>`, `callees-of <name>`, `search <pattern>`, `importers-of <pkg>`, `imports-of <pkg>`, `edges-by-type <type>`, `all-edges`, `list-packages`, `package <path>`, `methods-of <type>`, `search-text <pattern> [file-pattern]`, `pattern <pattern>`, `hotspots`, `importance`, `diagnostics [file]`, `contracts`, `contract-drift`, `runtime-contracts`, `workspace <subcommand>`, `serve`/`mcp`.
+`inject`/`init`, `update-agents`, `index [path]`, `changed-symbols [--ref R]`, `summary`, `overview`, `show <name>`, `callers-of <name>`, `callees-of <name>`, `search <pattern>`, `importers-of <pkg>`, `imports-of <pkg>`, `edges-by-type <type>`, `all-edges`, `list-packages`, `package <path>`, `methods-of <type>`, `search-text <pattern> [file-pattern]`, `pattern <pattern>`, `hotspots`, `importance`, `diagnostics [file]`, `contracts`, `contract-drift`, `runtime-contracts`, `workspace <subcommand>`, `serve`/`mcp`.
 
 ### Workspace Subcommands
 

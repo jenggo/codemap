@@ -1209,8 +1209,8 @@ func symbolMissError(s *store.Store, qualifiedName string) error {
 		short = short[i+1:]
 	}
 	pkgPrefix := ""
-	if i := strings.LastIndex(qualifiedName, "."); i >= 0 {
-		pkgPrefix = qualifiedName[:i]
+	if before, _, ok := strings.CutLast(qualifiedName, "."); ok {
+		pkgPrefix = before
 	}
 
 	candidates := symbolCandidates(s, short, pkgPrefix)
@@ -2228,8 +2228,8 @@ func resolveProjectTarget(toRef string, projectSet map[string]bool) string {
 			return p
 		}
 	}
-	if idx := strings.LastIndex(toRef, "/"); idx >= 0 {
-		bare := toRef[idx+1:]
+	if _, after, ok := strings.CutLast(toRef, "/"); ok {
+		bare := after
 		if projectSet[bare] {
 			return bare
 		}
@@ -2513,11 +2513,11 @@ func containsHTTPHandler(sig string) bool {
 }
 
 func extractPkgPath(qn string) string {
-	idx := strings.LastIndex(qn, ".")
-	if idx < 0 {
+	before, _, ok := strings.CutLast(qn, ".")
+	if !ok {
 		return ""
 	}
-	return qn[:idx]
+	return before
 }
 
 type ChangedSymbol struct {

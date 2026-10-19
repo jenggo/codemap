@@ -604,6 +604,7 @@ func (s *Server) toolHandlers() map[string]toolHandler {
 func queryHandlers() map[string]toolHandler {
 	return map[string]toolHandler{
 		"overview":          handleOverview,
+		"summary":           handleSummary,
 		toolShow:            handleShow,
 		toolCallersOf:       handleCallersOf,
 		toolCalleesOf:       handleCalleesOf,
@@ -672,6 +673,14 @@ func handleOverview(st *store.Store, opts []query.Option, renderOpts []render.Op
 		return fmt.Sprintf("Error: %v", err), nil, true
 	}
 	return render.RenderOverview(result, renderOpts...), result, false
+}
+
+func handleSummary(st *store.Store, opts []query.Option, renderOpts []render.Option, _ map[string]any) (string, any, bool) {
+	result, err := query.Summary(st, opts...)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err), nil, true
+	}
+	return render.RenderSummary(result, renderOpts...), result, false
 }
 
 func handleShow(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
@@ -1998,10 +2007,16 @@ func indexTools() []map[string]any {
 			"Per-repo index freshness: indexed/stale/missing state and indexed_at. Call when results look stale or an expected symbol is missing.",
 			map[string]any{}),
 		toolDef("overview",
-			"Architecture summary of all indexed Go packages: paths, exported symbols with signatures, import counts.",
+			"Symbol inventory: every indexed Go package with its exported symbols and signatures. Use when you need the full API surface; use summary for a compact orientation instead.",
 			map[string]any{
 				keyIncludeTests: boolProp("Include test packages and symbols"),
 				"full_docs":     boolProp("Show full documentation instead of first sentence"),
+			}),
+		toolDef("summary",
+			"Repository tl;dr: module, size, packages with their doc comments, entry points, external dependencies, and hub packages. Call this first in an unfamiliar repo.",
+			map[string]any{
+				keyIncludeTests: boolProp("Include test packages"),
+				keyRepo:         repoProp(),
 			}),
 		toolDef(toolShow,
 			"Symbol details: file:line, signature, docs, deduplicated call relationships with call sites. source: true returns raw declaration text instead.",

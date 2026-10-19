@@ -53,6 +53,7 @@ type parsedFlags struct {
 	regex             bool
 	workspace         bool
 	discover          bool
+	formatSet         bool
 }
 
 func parseArgs(args []string, defaultDBPath string) (parsedFlags, []string) {
@@ -81,10 +82,16 @@ func handleFlag(arg string, args []string, i int, flags *parsedFlags) (bool, int
 		flags.fullDocs = true
 	case "--json":
 		flags.format = render.FormatJSON
+		flags.formatSet = true
 	case "--toon":
 		flags.format = render.FormatTOON
+		flags.formatSet = true
 	case "--compact":
 		flags.format = render.FormatCompact
+		flags.formatSet = true
+	case "--text":
+		flags.format = render.FormatText
+		flags.formatSet = true
 	case "--db":
 		if i+1 < len(args) {
 			flags.dbPath = args[i+1]
@@ -279,6 +286,8 @@ func dispatchQueryCommand(cmd string, args []string, dbPath string, flags parsed
 	switch cmd {
 	case "overview":
 		cmdOverview(dbPath, queryOpts, renderOpts)
+	case "summary":
+		cmdSummary(dbPath, queryOpts, summaryRenderOpts(flags, renderOpts))
 	case "show":
 		return withRequiredArg(args, "show", func(arg string) { cmdShow(arg, dbPath, queryOpts, renderOpts) })
 	case "callers-of":
@@ -308,11 +317,7 @@ func dispatchQueryCommand(cmd string, args []string, dbPath string, flags parsed
 	case "importance":
 		cmdImportance(dbPath, queryOpts, renderOpts)
 	case "diagnostics":
-		file := ""
-		if len(args) > 0 {
-			file = args[0]
-		}
-		cmdDiagnostics(file, dbPath, queryOpts, renderOpts)
+		cmdDiagnostics(optionalArg(args), dbPath, queryOpts, renderOpts)
 	default:
 		return dispatchDataCommand(cmd, dbPath, flags)
 	}
@@ -356,6 +361,27 @@ func dispatchDataCommand(cmd, dbPath string, flags parsedFlags) error {
 		return fmt.Errorf("unknown command: %s", cmd)
 	}
 	return nil
+}
+
+// summaryRenderOpts renders the CLI summary as prose unless the caller asked for
+// a specific format. The MCP tool keeps TOON, which is what agents read.
+func summaryRenderOpts(flags parsedFlags, renderOpts []render.Option) []render.Option {
+	if flags.formatSet {
+		return renderOpts
+	}
+	opts := []render.Option{render.WithFormat(render.FormatText)}
+	if flags.fullDocs {
+		opts = append(opts, render.WithFullDocs())
+	}
+	return opts
+}
+
+// optionalArg returns args[0] or "" when no argument was supplied.
+func optionalArg(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	return args[0]
 }
 
 func withRequiredArg(args []string, name string, fn func(string)) error {
@@ -696,6 +722,23 @@ func cmdOverview(dbPath string, qOpts []query.Option, rOpts []render.Option) {
 	fmt.Print(render.RenderOverview(result, rOpts...))
 }
 
+func cmdSummary(dbPath string, qOpts []query.Option, rOpts []render.Option) {
+	s, err := store.Open(dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	defer func() { _ = s.Close() }()
+
+	result, err := query.Summary(s, qOpts...)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+
+	fmt.Print(render.RenderSummary(result, rOpts...))
+}
+
 func cmdShow(qn, dbPath string, qOpts []query.Option, rOpts []render.Option) {
 	s, err := store.Open(dbPath)
 	if err != nil {
@@ -997,7 +1040,8 @@ func printUsage() {
 	fmt.Println("Commands:")
 	fmt.Println("  inject (or init)          Install MCP + guard plugins for crush, opencode, commandcode, maki")
 	fmt.Println("  index [path]              Index a Go repository")
-	fmt.Println("  overview                  Show package overview")
+	fmt.Println("  overview                  Show every package's exported symbols")
+	fmt.Println("  summary                   Show a tl;dr of the repository")
 	fmt.Println("  show <qualified_name>     Show symbol details")
 	fmt.Println("  callers-of <name>         Find callers of a symbol")
 	fmt.Println("  callees-of <name>         Find callees of a symbol")
@@ -1029,7 +1073,8 @@ func printUsageFlags() {
 	fmt.Println("  --include-tests           Include test packages and symbols")
 	fmt.Println("  --include-unexported      Include unexported symbols (for package)")
 	fmt.Println("  --full-docs               Show full documentation")
-	fmt.Println("  --toon                    Output as TOON (default)")
+	fmt.Println("  --toon                    Output as TOON (default; summary defaults to text)")
+	fmt.Println("  --text                    Output as plain text")
 	fmt.Println("  --json                    Output as JSON")
 	fmt.Println("  --compact                 Compact output")
 	fmt.Println("  --db <path>               Database path (default: .codemap/codemap.db)")

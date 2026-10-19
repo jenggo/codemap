@@ -304,3 +304,83 @@ func TestFilePropagatesParseError(t *testing.T) {
 		t.Fatal("expected a parse error for malformed source")
 	}
 }
+
+// TestPackageDocFromClause verifies that the package clause comment is captured
+// as the package Doc, trimmed to one sentence.
+func TestPackageDocFromClause(t *testing.T) {
+	dir := writeGoFiles(t, "docpkg", map[string]string{
+		"doc.go":  "// Package docpkg does a thing. It has a second sentence.\npackage docpkg\n\nfunc A() {}\n",
+		"more.go": "package docpkg\n\nfunc B() {}\n",
+	})
+
+	pr, err := Run(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := pkgByPath(t, pr, "docpkg").Doc
+	if got != "Package docpkg does a thing." {
+		t.Errorf("package doc = %q, want first sentence only", got)
+	}
+}
+
+// TestPackageDocInheritedByTestPackage verifies that an external test package
+// carries the target package's doc.
+func TestPackageDocInheritedByTestPackage(t *testing.T) {
+	dir := writeGoFiles(t, "doctest", map[string]string{
+		"doc.go":          "// Package doctest is documented.\npackage doctest\n\nfunc A() {}\n",
+		"doctest_test.go": "package doctest_test\n",
+	})
+
+	pr, err := Run(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := pkgByPath(t, pr, "doctest_test").Doc; got != "Package doctest is documented." {
+		t.Errorf("test package doc = %q, want inherited doc", got)
+	}
+}
+
+// TestPackageDocAbsent verifies that a package without a clause comment gets an
+// empty Doc rather than inheriting a neighbouring file's comment.
+func TestPackageDocAbsent(t *testing.T) {
+	dir := writeGoFiles(t, "nodoc", map[string]string{
+		"a.go": "package nodoc\n\n// A is documented.\nfunc A() {}\n",
+	})
+
+	pr, err := Run(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := pkgByPath(t, pr, "nodoc").Doc; got != "" {
+		t.Errorf("package doc = %q, want empty", got)
+	}
+}
+
+// TestGoListSkipsVendorAndNodeModules verifies that packages `go list ./...`
+// reports from inside vendor/ or node_modules/ are not indexed.
+func TestGoListSkipsVendorAndNodeModules(t *testing.T) {
+	dir := writeGoFiles(t, "skipdirs", map[string]string{
+		"go.mod": "module skipdirs\n\ngo 1.21\n",
+		"a.go":   "package skipdirs\n\nfunc A() {}\n",
+	})
+	for _, sub := range []string{"vendor/legacy", "node_modules/pkg/golang"} {
+		subDir := filepath.Join(dir, sub)
+		if err := os.MkdirAll(subDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		src := "package legacy\n\nfunc Legacy() {}\n"
+		if err := os.WriteFile(filepath.Join(subDir, "x.go"), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	pr, err := Run(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range pr.Packages {
+		if strings.Contains(p.ImportPath, "vendor") || strings.Contains(p.ImportPath, "node_modules") {
+			t.Errorf("package %q must be skipped", p.ImportPath)
+		}
+	}
+}

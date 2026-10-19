@@ -68,9 +68,9 @@ func TestInjectMaki_WritesGuardAndMCP(t *testing.T) {
 		t.Fatalf("injectMaki failed: %v", err)
 	}
 
-	lua, err := os.ReadFile(filepath.Join(tmpHome, ".config", "maki", "lua", "codemap-guard.lua"))
+	lua, err := os.ReadFile(filepath.Join(tmpHome, ".config", "maki", "lua", "codemap_guard.lua"))
 	if err != nil {
-		t.Fatalf("codemap-guard.lua not written: %v", err)
+		t.Fatalf("codemap_guard.lua not written: %v", err)
 	}
 	content := string(lua)
 	for _, want := range []string{
@@ -94,25 +94,25 @@ func TestInjectMaki_WritesGuardAndMCP(t *testing.T) {
 		"codemap__package",
 	} {
 		if !strings.Contains(content, want) {
-			t.Errorf("codemap-guard.lua missing %q", want)
+			t.Errorf("codemap_guard.lua missing %q", want)
 		}
 	}
 	// The guard must never block a call: it only appends, and only on a Go
 	// target. A blocking layer would answer `value, { ask = reason }` to force
 	// approval; this one always falls through to `prev`.
 	if !strings.Contains(content, "return prev(out, ctx)") {
-		t.Error("codemap-guard.lua must always continue the chain with prev")
+		t.Error("codemap_guard.lua must always continue the chain with prev")
 	}
 	if strings.Contains(content, "{ ask") {
-		t.Error("codemap-guard.lua must not ask for approval")
+		t.Error("codemap_guard.lua must not ask for approval")
 	}
 
 	init, err := os.ReadFile(filepath.Join(tmpHome, ".config", "maki", "init.lua"))
 	if err != nil {
 		t.Fatalf("init.lua not written: %v", err)
 	}
-	if !strings.Contains(string(init), `require("codemap-guard")`) {
-		t.Error("init.lua missing require(\"codemap-guard\")")
+	if !strings.Contains(string(init), makiRequire) {
+		t.Errorf("init.lua missing %s", makiRequire)
 	}
 
 	perms, err := os.ReadFile(filepath.Join(tmpHome, ".config", "maki", "plugin.toml"))
@@ -171,7 +171,7 @@ func TestInjectMaki_PrefersDotMaki(t *testing.T) {
 		t.Fatalf("injectMaki failed: %v", err)
 	}
 
-	if _, err := os.Stat(filepath.Join(tmpHome, ".maki", "lua", "codemap-guard.lua")); err != nil {
+	if _, err := os.Stat(filepath.Join(tmpHome, ".maki", "lua", "codemap_guard.lua")); err != nil {
 		t.Errorf("guard not written to ~/.maki: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(tmpHome, ".config", "maki", "lua")); !os.IsNotExist(err) {
@@ -191,7 +191,7 @@ func TestInjectMaki_Idempotent(t *testing.T) {
 		t.Fatalf("first injectMaki failed: %v", err)
 	}
 
-	luaPath := filepath.Join(tmpHome, ".config", "maki", "lua", "codemap-guard.lua")
+	luaPath := filepath.Join(tmpHome, ".config", "maki", "lua", "codemap_guard.lua")
 	mcpPath := filepath.Join(tmpHome, ".config", "maki", "mcp.toml")
 	initPath := filepath.Join(tmpHome, ".config", "maki", "init.lua")
 
@@ -208,7 +208,7 @@ func TestInjectMaki_Idempotent(t *testing.T) {
 	init2, _ := os.ReadFile(initPath)
 
 	if string(lua1) != string(lua2) {
-		t.Error("codemap-guard.lua changed on second run")
+		t.Error("codemap_guard.lua changed on second run")
 	}
 	if string(mcp1) != string(mcp2) {
 		t.Error("mcp.toml changed on second run")
@@ -255,8 +255,8 @@ func TestInjectMaki_RespectsExistingPluginTomlAndInitLua(t *testing.T) {
 	if !strings.HasPrefix(string(init), existingInit) {
 		t.Error("existing init.lua content must be preserved")
 	}
-	if strings.Count(string(init), `require("codemap-guard")`) != 1 {
-		t.Error("init.lua should gain require(\"codemap-guard\") exactly once")
+	if strings.Count(string(init), makiRequire) != 1 {
+		t.Errorf("init.lua should gain %s exactly once", makiRequire)
 	}
 }
 
@@ -401,5 +401,59 @@ func TestInjectOpencode_Idempotent(t *testing.T) {
 	pluginPath := filepath.Join(tmpHome, ".config", "opencode", "plugins", "codemap-guard.ts")
 	if _, err := os.Stat(pluginPath); err != nil {
 		t.Fatal("codemap-guard.ts missing after second run")
+	}
+}
+
+// TestMakiRequireMatchesInstalledFileName guards the rename: init.lua must
+// require the underscore module name, because the file on disk is
+// codemap_guard.lua and Lua module names mirror the path.
+func TestMakiRequireMatchesInstalledFileName(t *testing.T) {
+	if legacyMakiRequire == makiRequire {
+		t.Fatal("legacy and current require strings must differ")
+	}
+	if !strings.Contains(codemapGuardLua, "register_prompt_hint") {
+		t.Error("guard plugin must inject the codebase summary prompt hint")
+	}
+	if !strings.Contains(codemapGuardLua, "GO_MARKERS") {
+		t.Error("guard plugin must gate the summary on a Go module root")
+	}
+}
+
+// TestInjectMakiGuardRenamesLegacyFile verifies that an install carrying the
+// old codemap-guard.lua is migrated: the file is renamed, the stale require is
+// rewritten, and the legacy file is gone so it cannot shadow the new one.
+func TestInjectMakiGuardRenamesLegacyFile(t *testing.T) {
+	dir := t.TempDir()
+	luaDir := filepath.Join(dir, "lua")
+	if err := os.MkdirAll(luaDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(luaDir, "codemap-guard.lua"), []byte("-- old\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "init.lua"), []byte("require(\"codemap-guard\")\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := injectMakiGuard(dir); err != nil {
+		t.Fatalf("injectMakiGuard: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(luaDir, "codemap-guard.lua")); !os.IsNotExist(err) {
+		t.Error("legacy codemap-guard.lua must be removed")
+	}
+	if _, err := os.Stat(filepath.Join(luaDir, "codemap_guard.lua")); err != nil {
+		t.Errorf("codemap_guard.lua must exist: %v", err)
+	}
+
+	init, err := os.ReadFile(filepath.Join(dir, "init.lua"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(init), legacyMakiRequire) {
+		t.Errorf("init.lua still requires the legacy module: %s", init)
+	}
+	if !strings.Contains(string(init), makiRequire) {
+		t.Errorf("init.lua must require codemap_guard: %s", init)
 	}
 }

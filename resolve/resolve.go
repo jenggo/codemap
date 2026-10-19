@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -96,6 +97,7 @@ func Run(parseResult *parse.Result) *Result {
 	}
 
 	imp := newImporter(parseResult)
+	imp.exports = loadExportIndex(parseResult)
 	imp.warn = func(pkgPath string, err error) {
 		// Attribute the concrete dependency error to the package being checked
 		// instead of collapsing it into a generic "could not type-check".
@@ -793,6 +795,10 @@ type importer struct {
 	// pre-diagnostic behavior.
 	warn func(pkgPath string, err error)
 
+	// exports maps an import path to its compiled export-data file, resolved in
+	// one `go list -export -deps` call before type-checking starts.
+	exports map[string]string
+
 	mu sync.Mutex
 }
 
@@ -871,7 +877,7 @@ func (i *importer) Import(path string) (*types.Package, error) {
 func (i *importer) importExternal(path string) (*types.Package, error) {
 	i.mu.Lock()
 	if i.gc == nil {
-		i.gc = goimporter.ForCompiler(i.fset, "gc", exportLookup)
+		i.gc = goimporter.ForCompiler(i.fset, "gc", i.exportLookup)
 	}
 	i.mu.Unlock()
 
@@ -886,10 +892,19 @@ func (i *importer) importExternal(path string) (*types.Package, error) {
 	return pkg, nil
 }
 
-// exportLookup shells out to `go list -export` to get the compiled export
-// data path for an external import (it builds on demand), so module-cache
-// packages resolve even though they have no installed .a file.
-func exportLookup(path string) (io.ReadCloser, error) {
+// exportLookup opens the compiled export data for an external import. The path
+// is normally resolved up front by loadExportIndex; test-only dependencies are
+// absent from `go list -deps ./...`, so those fall back to a single-path lookup.
+func (i *importer) exportLookup(path string) (io.ReadCloser, error) {
+	if exportFile := i.exports[path]; exportFile != "" {
+		return os.Open(exportFile)
+	}
+	return exportLookupOne(path)
+}
+
+// exportLookupOne resolves one import's export data with its own `go list`
+// call. Only reached for imports the batched lookup could not see.
+func exportLookupOne(path string) (io.ReadCloser, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "go", "list", "-export", "-f", "{{.Export}}", path).Output()
@@ -901,6 +916,56 @@ func exportLookup(path string) (io.ReadCloser, error) {
 		return nil, fmt.Errorf("no export data for %s", path)
 	}
 	return os.Open(exportFile)
+}
+
+// loadExportIndex resolves every dependency's compiled export data with a single
+// `go list -export -deps` call. Resolving per import instead spawns one `go`
+// process per dependency, which dominates index time on repos with many
+// third-party imports.
+func loadExportIndex(pr *parse.Result) map[string]string {
+	dir := moduleRoot(pr)
+	if dir == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "go", "list", "-export", "-deps", "-e",
+		"-f", "{{.ImportPath}} {{.Export}}", "./...").Output()
+	if err != nil {
+		return nil
+	}
+	exports := make(map[string]string)
+	for line := range strings.SplitSeq(string(out), "\n") {
+		path, exportFile, ok := strings.Cut(line, " ")
+		if !ok || exportFile == "" {
+			continue
+		}
+		exports[path] = exportFile
+	}
+	return exports
+}
+
+// moduleRoot returns the nearest directory holding a go.mod above the first
+// parsed package, so `go list ./...` covers the whole module rather than one
+// package's dependency subtree.
+func moduleRoot(pr *parse.Result) string {
+	for _, p := range pr.Packages {
+		if p.Dir == "" {
+			continue
+		}
+		dir := p.Dir
+		for {
+			if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+				return dir
+			}
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
+	}
+	return ""
 }
 
 // resolveCgoRefs detects cgo files (those importing "C"), emits a per-file

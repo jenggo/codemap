@@ -17,7 +17,8 @@ const ToolsAndTipsBlock = `## Available Tools
 | Tool | Returns / Does | When to use |
 |---|---|---|
 | ` + "`reindex`" + ` | Force a full re-index | Indexing is automatic otherwise |
-| ` + "`overview`" + ` | Each package's exports + signatures | Understanding project structure |
+| ` + "`summary`" + ` | Module, package map with docs, entry points, deps, hubs (~1.5 KB) | First call in an unfamiliar repo |
+| ` + "`overview`" + ` | Each package's exports + signatures (full inventory) | Enumerating the API surface |
 | ` + "`search`" + ` | Qualified names, file:line, signatures, docs; mode: substring/prefix/method | Finding symbols by name |
 | ` + "`show`" + ` | Signature, docs, file:line, incoming+outgoing edges; source: true returns raw source | Understanding a single symbol |
 | ` + "`callers_of`" + ` | Caller names, file:line, edge types | Tracing who calls a function |
@@ -63,6 +64,7 @@ const ToolsAndTipsBlock = `## Available Tools
 - ` + "`pattern`" + ` takes Go source with ` + "`$UPPERCASE`" + ` metavariables (ast-grep style); matching is syntactic and repeated metavariables must bind identical nodes; ` + "`file_pattern`" + ` and ` + "`repo`" + ` narrow the scan
 - ` + "`search`" + ` down-ranks generated and test symbols (never hides them); ` + "`generated: \"exclude\"|\"only\"`" + ` filters them
 - Indexing is automatic and fast (~50ms). Re-indexes when Go files change.
+- In a Go module the guard injects a ` + "`codemap summary`" + ` of the project into the system prompt, so the package map is already available before the first tool call.
 `
 
 const agentsContent = `# AGENTS.md
@@ -79,7 +81,7 @@ This project uses ` + "`codemap`" + ` MCP tools for Go codebase analysis. These 
 | Find what a function depends on | ` + "`callees_of`" + ` | reading imports |
 | Get a package's full API | ` + "`package`" + ` | listing .go files |
 | Find all methods on a type | ` + "`methods_of`" + ` | grep for receiver patterns |
-| See project architecture | ` + "`overview`" + ` | guessing from directory structure |
+| Get oriented in a new repo | ` + "`summary`" + ` | reading the directory tree |
 | Find where a package is imported | ` + "`imports_of`" + ` with ` + "`direction: \"in\"`" + ` | grep for import path |
 | Find what a package depends on | ` + "`imports_of`" + ` | reading import blocks |
 | List all packages | ` + "`package`" + ` without path | ls and guess |
@@ -114,7 +116,7 @@ Indexing is **automatic** — the first tool call triggers indexing if needed (~
 | What does this function call? | ` + "`callees_of`" + ` | reading code |
 | Get a package's full API | ` + "`package`" + ` | listing .go files |
 | All methods on a type | ` + "`methods_of`" + ` | grep for receiver |
-| Project architecture overview | ` + "`overview`" + ` | guessing from dirs |
+| Get oriented in a new repo | ` + "`summary`" + ` | guessing from dirs |
 | Where is this package imported? | ` + "`imports_of`" + ` with ` + "`direction: \"in\"`" + ` | grep for import path |
 | What does this package depend on? | ` + "`imports_of`" + ` | reading import blocks |
 | Search file contents | ` + "`search_text`" + ` | grep |
@@ -269,7 +271,7 @@ export default function (cmd: ModApi): void {
 `
 
 const codemapGuardLua = `-- Codemap Guard — maki plugin
--- Version: 4.0
+-- Version: 5.0
 -- Installed by ` + "`" + `codemap inject` + "`" + ` (alias: ` + "`" + `codemap init` + "`" + `).
 -- Soft-mode guard that rides along with the host read/grep/glob/index tools: on
 -- a Go project it points at the codemap tool that answers what a raw file read
@@ -292,7 +294,128 @@ const codemapGuardLua = `-- Codemap Guard — maki plugin
 -- result, so it cannot steer the next call. Appending rides the result the
 -- model is about to read.
 
+-- The markers that make a directory the root of a Go codebase.
+local GO_MARKERS = { "go.mod", "go.work" }
+
 local warned = {}
+
+-- One codemap summary per project per session, injected into the system prompt
+-- so the agent starts oriented instead of discovering the layout by reading
+-- files. codemap summary on an unindexed repo prints an error and exits 0,
+-- so the output is validated rather than the exit code.
+local SUMMARY_TIMEOUT_MS = 15000
+local summary_cache = {}
+local summary_inflight = {}
+
+-- The binary codemap inject registered in mcp.toml, or codemap on PATH.
+local function codemap_bin()
+  local cfg = maki.fs.read(maki.env.config_dir() .. "/mcp.toml")
+  if cfg then
+    local cmd = cfg:match('%[mcp%.codemap%][^%[]-"command"%s*=%s*%[%s*"([^"]+)"')
+    if cmd and cmd ~= "" then
+      return cmd
+    end
+  end
+  return "codemap"
+end
+
+local function summary_key(root)
+  return tostring(maki.session.current()) .. "|" .. root
+end
+
+-- Text format opens with "<module> | N packages, ..."; TOON opens with a
+-- "packages[" block. Anything else (an error line) is not a summary.
+local function valid_summary(out)
+  if type(out) ~= "string" or out == "" then
+    return false
+  end
+  return out:match("^packages%[") ~= nil
+    or out:match("^%S+ %| %d+ packages") ~= nil
+end
+
+-- Runs codemap summary once per (session, project root) and caches the text.
+-- A failure is cached too: retrying every turn would spawn a process per turn.
+-- The MCP server owns the index, so a missing database is not created here.
+local function summary_for(root)
+  local key = summary_key(root)
+  if summary_cache[key] ~= nil then
+    return summary_cache[key]
+  end
+  if summary_inflight[key] then
+    return nil
+  end
+
+  local db = root .. "/.codemap/codemap.db"
+  local meta, meta_err = maki.fs.metadata(db)
+  if not meta or meta_err then
+    summary_cache[key] = false
+    return nil
+  end
+
+  summary_inflight[key] = true
+
+  local id, err = maki.fn.jobstart({ codemap_bin(), "summary", "--db", db }, {
+    cwd = root,
+    scope = { session = maki.session.current() },
+  })
+  if not id then
+    maki.log.warn("codemap_guard: could not start codemap summary: " .. tostring(err))
+    summary_inflight[key] = nil
+    summary_cache[key] = false
+    return nil
+  end
+
+  local result, wait_err = maki.fn.jobwait(id, SUMMARY_TIMEOUT_MS)
+  summary_inflight[key] = nil
+  if not result then
+    maki.log.warn("codemap_guard: codemap summary did not finish: " .. tostring(wait_err))
+    summary_cache[key] = false
+    return nil
+  end
+  if not valid_summary(result.stdout) then
+    summary_cache[key] = false
+    return nil
+  end
+  summary_cache[key] = result.stdout
+  return result.stdout
+end
+
+-- The Go module the session is working in, or nil for a non-Go project.
+local function go_root()
+  local cwd = maki.uv.cwd()
+  if not cwd then
+    return nil
+  end
+  return maki.fs.root(cwd, GO_MARKERS)
+end
+
+maki.api.register_prompt_hint({
+  slot = "after_instructions",
+  prompt = "system",
+  content = function()
+    local root = go_root()
+    if not root then
+      return ""
+    end
+    local summary = summary_for(root)
+    if not summary then
+      return "\n\n<!-- codemap:summary -->\n"
+        .. "## Codebase summary (codemap)\n\n"
+        .. "This is a Go module with no codemap index yet. Call codemap__summary "
+        .. "before exploring: it indexes the repo and returns the package map, "
+        .. "entry points, and dependencies in about a second.\n"
+        .. "<!-- /codemap:summary -->"
+    end
+    return "\n\n<!-- codemap:summary -->\n"
+      .. "## Codebase summary (codemap)\n\n"
+      .. "This is a Go module. Start from this map instead of re-deriving it: "
+      .. "the full symbol inventory is codemap__overview, and relationships "
+      .. "come from codemap__callers_of, codemap__callees_of, and "
+      .. "codemap__blast_radius.\n\n"
+      .. summary
+      .. "\n<!-- /codemap:summary -->"
+  end,
+})
 
 -- Appended only after a successful, non-empty result on a Go target.
 local NUDGE_INDEX = "codemap-guard: this skeleton lists declarations, not relationships. "
@@ -320,9 +443,6 @@ local NUDGE = {
   grep = NUDGE_GREP,
   glob = NUDGE_GLOB,
 }
-
--- The markers that make a directory the root of a Go codebase.
-local GO_MARKERS = { "go.mod", "go.work" }
 
 -- True when v ends in a .go path. The extension must sit at a real boundary:
 -- "a.gox" and "a.go.bak" are not Go files, while "dir.golang/m.go" is.
@@ -656,42 +776,77 @@ func injectMakiMCP(dir, selfPath string) error {
 	return nil
 }
 
+const (
+	makiRequire       = `require("codemap_guard")`
+	legacyMakiRequire = `require("codemap-guard")`
+)
+
 func injectMakiGuard(dir string) error {
 	luaDir := filepath.Join(dir, "lua")
 	if err := os.MkdirAll(luaDir, 0755); err != nil {
 		return fmt.Errorf("creating maki lua directory: %w", err)
 	}
 
-	luaPath := filepath.Join(luaDir, "codemap-guard.lua")
+	// Older installs wrote codemap-guard.lua; drop it so init.lua's require
+	// cannot resolve to a stale copy alongside the renamed file.
+	legacyPath := filepath.Join(luaDir, "codemap-guard.lua")
+	if _, statErr := os.Stat(legacyPath); statErr == nil {
+		if err := os.Remove(legacyPath); err != nil {
+			return fmt.Errorf("removing legacy codemap-guard.lua: %w", err)
+		}
+		fmt.Printf("maki: removed %s (renamed to codemap_guard.lua)\n", legacyPath)
+	}
+
+	luaPath := filepath.Join(luaDir, "codemap_guard.lua")
 	changed, err := writeIfChanged(luaPath, codemapGuardLua)
 	if err != nil {
-		return fmt.Errorf("writing codemap-guard.lua: %w", err)
+		return fmt.Errorf("writing codemap_guard.lua: %w", err)
 	}
 	fmt.Printf("maki: %s %s\n", changeVerb(changed), luaPath)
 
+	if err := injectMakiInitRequire(dir); err != nil {
+		return err
+	}
+	return injectMakiPermissions(dir)
+}
+
+// injectMakiInitRequire makes init.lua load the guard module, rewriting the
+// legacy hyphenated require that cannot resolve to codemap_guard.lua.
+func injectMakiInitRequire(dir string) error {
 	initPath := filepath.Join(dir, "init.lua")
 	data, err := os.ReadFile(initPath)
 	switch {
 	case os.IsNotExist(err):
-		if err := os.WriteFile(initPath, []byte("require(\"codemap-guard\")\n"), 0644); err != nil {
+		if err := os.WriteFile(initPath, []byte(makiRequire+"\n"), 0644); err != nil {
 			return fmt.Errorf("writing init.lua: %w", err)
 		}
 		fmt.Printf("maki: created %s\n", initPath)
 	case err != nil:
 		return fmt.Errorf("reading init.lua: %w", err)
-	case !strings.Contains(string(data), "codemap-guard"):
+	case strings.Contains(string(data), legacyMakiRequire):
+		// Earlier versions required "codemap-guard", which cannot resolve
+		// because the file on disk is codemap_guard.lua.
+		content := strings.ReplaceAll(string(data), legacyMakiRequire, makiRequire)
+		if err := os.WriteFile(initPath, []byte(content), 0644); err != nil {
+			return fmt.Errorf("rewriting init.lua: %w", err)
+		}
+		fmt.Printf("maki: updated %s\n", initPath)
+	case !strings.Contains(string(data), makiRequire):
 		content := string(data)
 		if !strings.HasSuffix(content, "\n") {
 			content += "\n"
 		}
-		if err := os.WriteFile(initPath, []byte(content+"require(\"codemap-guard\")\n"), 0644); err != nil {
+		if err := os.WriteFile(initPath, []byte(content+makiRequire+"\n"), 0644); err != nil {
 			return fmt.Errorf("writing init.lua: %w", err)
 		}
 		fmt.Printf("maki: updated %s\n", initPath)
 	default:
-		fmt.Println("maki: init.lua already loads codemap-guard, skipping")
+		fmt.Println("maki: init.lua already loads codemap_guard, skipping")
 	}
+	return nil
+}
 
+func injectMakiPermissions(dir string) error {
 	permsPath := filepath.Join(dir, "plugin.toml")
 	if _, err := os.Stat(permsPath); err == nil {
 		fmt.Println("maki: plugin.toml already exists, skipping")

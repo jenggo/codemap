@@ -1,9 +1,11 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"codemap/query"
+	"codemap/render"
 	"codemap/store"
 )
 
@@ -76,5 +78,27 @@ func TestParseArgsDropsBooleanFlagsFromPositionals(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestSummaryDefaultsToText verifies the CLI summary renders prose unless the
+// caller asked for a format, while MCP keeps TOON.
+func TestSummaryDefaultsToText(t *testing.T) {
+	flags, _ := parseArgs([]string{"summary"}, "unused.db")
+	if flags.formatSet {
+		t.Fatal("summary must not mark the format as explicitly set")
+	}
+	opts := summaryRenderOpts(flags, nil)
+	if len(opts) != 1 {
+		t.Fatalf("expected one render option, got %d", len(opts))
+	}
+	text := render.RenderSummary(&query.SummaryResult{Module: "m", TotalSymbols: 1}, opts...)
+	if !strings.Contains(text, "m | 0 packages") {
+		t.Errorf("summary without an explicit format must render text, got %q", text)
+	}
+
+	jsonFlags, _ := parseArgs([]string{"summary", "--json"}, "unused.db")
+	if !jsonFlags.formatSet {
+		t.Fatal("--json must mark the format as explicitly set")
 	}
 }
