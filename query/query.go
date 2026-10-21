@@ -1176,7 +1176,7 @@ func InterfaceImplementations(s *store.Store, interfaceName string, opts ...Opti
 
 	results := make([]InterfaceImpl, 0)
 	for _, implType := range implTypes {
-		methods, err := s.MethodsByReceiver(extractShortName(implType), false)
+		methods, err := s.MethodsByQualifiedReceiver(implType, false)
 		if err != nil {
 			continue
 		}

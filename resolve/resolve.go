@@ -54,6 +54,7 @@ type parseContext struct {
 	pkgFiles  map[string][]*ast.File // package import path -> AST files
 	pathByAST map[*ast.File]string   // AST pointer -> file path
 	generated map[string]bool        // file path -> generated code
+	pkgPaths  map[string]bool        // package import path -> indexed
 }
 
 func newParseContext(pr *parse.Result) *parseContext {
@@ -64,11 +65,13 @@ func newParseContext(pr *parse.Result) *parseContext {
 		pkgFiles:  make(map[string][]*ast.File),
 		pathByAST: make(map[*ast.File]string, len(pr.Files)),
 		generated: pr.GeneratedFiles,
+		pkgPaths:  make(map[string]bool, len(pr.Packages)),
 	}
 	for path, af := range pr.Files {
 		ctx.pathByAST[af] = path
 	}
 	for _, pkg := range pr.Packages {
+		ctx.pkgPaths[pkg.ImportPath] = true
 		for _, f := range pkg.Files {
 			if _, ok := pr.Files[f]; !ok {
 				continue
@@ -98,27 +101,28 @@ func Run(parseResult *parse.Result) *Result {
 
 	imp := newImporter(parseResult)
 	imp.exports = loadExportIndex(parseResult)
-	imp.warn = func(pkgPath string, err error) {
-		// Attribute the concrete dependency error to the package being checked
-		// instead of collapsing it into a generic "could not type-check".
+	imp.onError = func(pkgPath string, err error) {
+		// Attribute the concrete type error to the package being checked, so the
+		// warning stream is identical no matter which pass reached the package.
 		warn(fmt.Sprintf("%s: %v", pkgPath, err))
+		// Unpositioned errors and indexer-side importer failures (there is no
+		// compile problem blamed on the file) stay in Warnings only.
+		if d := typedDiagnostic(err); d.File != "" && !isImporterNoise(d.Message) {
+			result.Diagnostics = append(result.Diagnostics, d)
+		}
 	}
-
-	conf := &types.Config{Importer: imp}
 
 	ctx := newParseContext(parseResult)
 	collectParseDiagnostics(parseResult, result)
 
 	var typePackages []*types.Package
 	for _, pkgInfo := range parseResult.Packages {
-		conf.Error = packageDiagCollector(warn, result)
-		typePkg := processPackage(conf, ctx, pkgInfo, result, warn)
-		if typePkg != nil {
+		if typePkg := processPackage(imp, ctx, pkgInfo, result); typePkg != nil {
 			typePackages = append(typePackages, typePkg)
 		}
 	}
 
-	resolveCrossPackageSatisfaction(typePackages, result)
+	resolveCrossPackageSatisfaction(typePackages, ctx.pkgPaths, result)
 
 	sort.Slice(result.Symbols, func(i, j int) bool {
 		return result.Symbols[i].Symbol.QualifiedName < result.Symbols[j].Symbol.QualifiedName
@@ -153,20 +157,6 @@ func parseParseError(file, msg string) (Diagnostic, bool) {
 	return Diagnostic{File: file, Line: line, Col: col, Message: strings.TrimPrefix(msg, fmt.Sprintf("%d:%d:", line, col))}, true
 }
 
-// packageDiagCollector returns an Error handler for types.Config that records
-// positioned type errors as diagnostics (and warns, preserving the
-// pre-existing warnings behavior).
-func packageDiagCollector(warn func(string), result *Result) func(error) {
-	return func(err error) {
-		warn(err.Error())
-		// Unpositioned errors and indexer-side importer failures (there is no
-		// compile problem blamed on the file) stay in Warnings only.
-		if d := typedDiagnostic(err); d.File != "" && !isImporterNoise(d.Message) {
-			result.Diagnostics = append(result.Diagnostics, d)
-		}
-	}
-}
-
 // isImporterNoise reports whether a type error is an "indexer could not load
 // external module" message rather than a problem in the indexed source.
 func isImporterNoise(msg string) bool {
@@ -184,20 +174,43 @@ func typedDiagnostic(err error) Diagnostic {
 	return Diagnostic{File: pos.Filename, Line: pos.Line, Col: pos.Column, Message: terr.Msg}
 }
 
-func getExportedNamedTypes(pkg *types.Package) map[string]*types.Named {
+// namedTypes keys each package-level type by the name the index will store it
+// under. Unexported types are included: they are real implementers and dropping
+// them hid whole implementations from interface_impls.
+//
+// Aliases resolve to the type they alias. When that type is defined in another
+// indexed package, the alias collapses onto the definition site so one
+// implementer never yields two satisfies edges. When the target is outside the
+// index (e.g. an alias of net/http.Handler), the alias itself is the only
+// indexed symbol, so it keeps its own name instead of pointing at nothing.
+func namedTypes(pkg *types.Package, indexed map[string]bool) map[string]*types.Named {
 	result := make(map[string]*types.Named)
 	for _, name := range pkg.Scope().Names() {
 		obj := pkg.Scope().Lookup(name)
-		if !obj.Exported() {
+		if _, ok := obj.(*types.TypeName); !ok {
 			continue
 		}
 		named := underlyingNamed(obj.Type())
-		if named == nil {
+		if named == nil || named.Obj() == nil {
 			continue
 		}
-		result[name] = named
+		key := pkg.Path() + "." + name
+		if defPkg := named.Obj().Pkg(); defPkg == nil || defPkg == pkg || indexed[defPkg.Path()] {
+			key = canonicalName(named)
+		}
+		result[key] = named
 	}
 	return result
+}
+
+// canonicalName is the definition-site identity of a named type. Aliases
+// resolve to the original, so every alias of one type shares this key.
+func canonicalName(named *types.Named) string {
+	obj := named.Obj()
+	if obj.Pkg() == nil {
+		return obj.Name()
+	}
+	return obj.Pkg().Path() + "." + obj.Name()
 }
 
 func isInterfaceNamed(named *types.Named) bool {
@@ -213,7 +226,7 @@ func underlyingNamed(t types.Type) *types.Named {
 	return named
 }
 
-func resolveCrossPackageSatisfaction(typePackages []*types.Package, result *Result) {
+func resolveCrossPackageSatisfaction(typePackages []*types.Package, indexed map[string]bool, result *Result) {
 	type pkgTypes struct {
 		pkg    *types.Package
 		types  map[string]*types.Named
@@ -222,7 +235,7 @@ func resolveCrossPackageSatisfaction(typePackages []*types.Package, result *Resu
 
 	pkgs := make([]pkgTypes, 0, len(typePackages))
 	for _, pkg := range typePackages {
-		constructors, ifaces := classifyTypes(pkg)
+		constructors, ifaces := classifyTypes(pkg, indexed)
 		pkgs = append(pkgs, pkgTypes{pkg: pkg, types: constructors, ifaces: ifaces})
 	}
 
@@ -231,33 +244,36 @@ func resolveCrossPackageSatisfaction(typePackages []*types.Package, result *Resu
 			if pt.pkg == other.pkg {
 				continue
 			}
-			findCrossPackageSatisfies(pt.pkg.Path(), pt.types, other.pkg.Path(), other.ifaces, result)
+			findCrossPackageSatisfies(pt.types, other.ifaces, result)
 		}
 	}
 }
 
-func classifyTypes(pkg *types.Package) (constructors, ifaces map[string]*types.Named) {
-	namedTypes := getExportedNamedTypes(pkg)
+func classifyTypes(pkg *types.Package, indexed map[string]bool) (constructors, ifaces map[string]*types.Named) {
 	constructors = make(map[string]*types.Named)
 	ifaces = make(map[string]*types.Named)
-	for name, named := range namedTypes {
+	for key, named := range namedTypes(pkg, indexed) {
 		if isInterfaceNamed(named) {
-			ifaces[name] = named
+			ifaces[key] = named
 		} else {
-			constructors[name] = named
+			constructors[key] = named
 		}
 	}
 	return constructors, ifaces
 }
 
-func findCrossPackageSatisfies(fromPkg string, ctors map[string]*types.Named, toPkg string, ifaces map[string]*types.Named, result *Result) {
+// findCrossPackageSatisfies emits one edge per (implementer, interface) pair.
+// Both maps are keyed by the symbol name the edge should reference, so aliases
+// of the same type are visited once and the edge is reported under the
+// definition site.
+func findCrossPackageSatisfies(ctors, ifaces map[string]*types.Named, result *Result) {
 	for ctorName, ctorType := range ctors {
 		for ifaceName, ifaceType := range ifaces {
 			if satisfiesInterface(ctorType, ifaceType) {
 				result.Edges = append(result.Edges, ResolvedEdge{
 					Edge: extract.Edge{
-						FromRef:  fromPkg + "." + ctorName,
-						ToRef:    toPkg + "." + ifaceName,
+						FromRef:  ctorName,
+						ToRef:    ifaceName,
 						EdgeType: "satisfies",
 						Pos:      extract.Position{File: "", Line: 0},
 					},
@@ -267,27 +283,137 @@ func findCrossPackageSatisfies(fromPkg string, ctors map[string]*types.Named, to
 	}
 }
 
+// satisfiesInterface reports whether ctorType implements ifaceType.
+//
+// It refuses to answer when either side depends on a type that failed to
+// resolve. go/types treats such types as vacuously satisfying everything: an
+// implementer that embeds an unresolvable type gets an empty method set, and an
+// interface that embeds one reports Empty(). Both make Implements return true
+// for any candidate, which is how an unimportable gin.ResponseWriter turned a
+// compression writer into an "implementation" of an unrelated API-key service.
 func satisfiesInterface(ctorType, ifaceType *types.Named) bool {
+	if hasUnresolvedType(ctorType) || hasUnresolvedType(ifaceType) {
+		return false
+	}
 	iface := ifaceType.Underlying().(*types.Interface)
 	return types.Implements(ctorType, iface) ||
 		types.Implements(types.NewPointer(ctorType), iface)
 }
 
-func processPackage(conf *types.Config, ctx *parseContext, pkgInfo parse.PackageInfo, result *Result, warn func(string)) *types.Package {
+// hasUnresolvedType reports whether t's structure contains a type the importer
+// could not load.
+func hasUnresolvedType(t types.Type) bool {
+	return hasUnresolvedTypeSeen(t, make(map[types.Type]bool))
+}
+
+// hasUnresolvedTypeSeen guards recursion and mutually recursive named types.
+func hasUnresolvedTypeSeen(t types.Type, visited map[types.Type]bool) bool {
+	if t == nil || visited[t] {
+		return false
+	}
+	visited[t] = true
+
+	switch u := t.(type) {
+	case *types.Basic:
+		return u.Kind() == types.Invalid
+	case *types.Named:
+		return hasUnresolvedTypeSeen(u.Underlying(), visited)
+	case *types.Alias:
+		return hasUnresolvedTypeSeen(types.Unalias(u), visited)
+	case *types.Pointer:
+		return hasUnresolvedTypeSeen(u.Elem(), visited)
+	case *types.Slice:
+		return hasUnresolvedTypeSeen(u.Elem(), visited)
+	case *types.Array:
+		return hasUnresolvedTypeSeen(u.Elem(), visited)
+	case *types.Chan:
+		return hasUnresolvedTypeSeen(u.Elem(), visited)
+	case *types.Map:
+		return hasUnresolvedTypeSeen(u.Key(), visited) || hasUnresolvedTypeSeen(u.Elem(), visited)
+	default:
+		return compositeHasUnresolved(t, visited)
+	}
+}
+
+func compositeHasUnresolved(t types.Type, visited map[types.Type]bool) bool {
+	switch u := t.(type) {
+	case *types.Struct:
+		return embeddedFieldUnresolved(u, visited)
+	case *types.Interface:
+		return interfaceUnresolved(u, visited)
+	case *types.Signature:
+		return signatureUnresolved(u, visited)
+	case *types.Tuple:
+		return anyVarUnresolved(u, visited)
+	}
+	return false
+}
+
+// embeddedFieldUnresolved checks only embedded fields: they alone contribute to
+// the method set, so only they can make Implements lie. A named field of an
+// unresolved type is harmless.
+func embeddedFieldUnresolved(st *types.Struct, visited map[types.Type]bool) bool {
+	for f := range st.Fields() {
+		if f.Embedded() && hasUnresolvedTypeSeen(f.Type(), visited) {
+			return true
+		}
+	}
+	return false
+}
+
+func interfaceUnresolved(iface *types.Interface, visited map[types.Type]bool) bool {
+	for m := range iface.Methods() {
+		if hasUnresolvedTypeSeen(m.Type(), visited) {
+			return true
+		}
+	}
+	for e := range iface.EmbeddedTypes() {
+		if hasUnresolvedTypeSeen(e, visited) {
+			return true
+		}
+	}
+	return false
+}
+
+func signatureUnresolved(sig *types.Signature, visited map[types.Type]bool) bool {
+	if anyVarUnresolved(sig.Params(), visited) || anyVarUnresolved(sig.Results(), visited) {
+		return true
+	}
+	recv := sig.Recv()
+	return recv != nil && hasUnresolvedTypeSeen(recv.Type(), visited)
+}
+
+func anyVarUnresolved(tup *types.Tuple, visited map[types.Type]bool) bool {
+	if tup == nil {
+		return false
+	}
+	for v := range tup.Variables() {
+		if hasUnresolvedTypeSeen(v.Type(), visited) {
+			return true
+		}
+	}
+	return false
+}
+
+func processPackage(imp *importer, ctx *parseContext, pkgInfo parse.PackageInfo, result *Result) *types.Package {
 	files := ctx.pkgFiles[pkgInfo.ImportPath]
 	if len(files) == 0 {
 		return nil
 	}
 
-	info := &types.Info{
-		Uses:       make(map[*ast.Ident]types.Object),
-		Selections: make(map[*ast.SelectorExpr]*types.Selection),
-		Defs:       make(map[*ast.Ident]types.Object),
-	}
-
-	typePkg, err := conf.Check(pkgInfo.ImportPath, ctx.fset, files, info)
+	typePkg, info, err := imp.packageFor(pkgInfo.ImportPath)
 	if err != nil {
-		warn(err.Error())
+		// The package could not be checked (import cycle, or a nil result).
+		// Keep going: symbols and syntactic edges are still worth indexing.
+		if imp.onError != nil {
+			imp.onError(pkgInfo.ImportPath, err)
+		}
+	}
+	if info == nil {
+		// No type information is available, so type-based edges are skipped but
+		// extraction still runs. This also covers a second pass over the same
+		// package, whose Info the first pass already consumed.
+		info = newTypeInfo()
 	}
 
 	fileMap := make(map[string]*ast.File, len(files))
@@ -311,8 +437,15 @@ func processPackage(conf *types.Config, ctx *parseContext, pkgInfo parse.Package
 
 	resolveCallSites(fileMap, ctx.fset, info, pkgInfo.ImportPath, result)
 	resolveReferences(fileMap, ctx.fset, info, pkgInfo.ImportPath, result)
+
+	// The type information is only needed for this package's own edge
+	// resolution; dropping it keeps peak memory bounded by packages in flight.
+	imp.mu.Lock()
+	delete(imp.info, pkgInfo.ImportPath)
+	imp.mu.Unlock()
+
 	if typePkg != nil {
-		resolveInterfaceSatisfaction(typePkg, pkgInfo.ImportPath, result)
+		resolveInterfaceSatisfaction(typePkg, ctx.pkgPaths, result)
 		resolveStructEmbedding(typePkg, pkgInfo.ImportPath, result)
 	}
 	resolveCgoRefs(fileMap, ctx.fset, pkgInfo.ImportPath, result)
@@ -647,67 +780,12 @@ func funcQualifiedName(fn *types.Func, pkgPath string) string {
 	return pkgPath + "." + named.Obj().Name() + "." + fn.Name()
 }
 
-func resolveInterfaceSatisfaction(pkg *types.Package, pkgPath string, result *Result) {
-	scope := pkg.Scope()
-	for _, name := range scope.Names() {
-		named, ok := exportedNonInterfaceNamed(scope, name)
-		if !ok {
-			continue
-		}
-		findInPackageInterfaces(scope, pkgPath, name, named, result)
-	}
-}
-
-func exportedNonInterfaceNamed(scope *types.Scope, name string) (*types.Named, bool) {
-	obj := scope.Lookup(name)
-	if !obj.Exported() {
-		return nil, false
-	}
-	named := underlyingNamed(obj.Type())
-	if named == nil {
-		return nil, false
-	}
-	if isInterfaceNamed(named) {
-		return nil, false
-	}
-	return named, true
-}
-
-func exportedInterfaceNamed(scope *types.Scope, name string) (*types.Named, bool) {
-	obj := scope.Lookup(name)
-	if !obj.Exported() {
-		return nil, false
-	}
-	named := underlyingNamed(obj.Type())
-	if named == nil {
-		return nil, false
-	}
-	if !isInterfaceNamed(named) {
-		return nil, false
-	}
-	return named, true
-}
-
-func findInPackageInterfaces(scope *types.Scope, pkgPath, name string, named *types.Named, result *Result) {
-	for _, otherName := range scope.Names() {
-		if otherName == name {
-			continue
-		}
-		otherNamed, ok := exportedInterfaceNamed(scope, otherName)
-		if !ok {
-			continue
-		}
-		if satisfiesInterface(named, otherNamed) {
-			result.Edges = append(result.Edges, ResolvedEdge{
-				Edge: extract.Edge{
-					FromRef:  pkgPath + "." + name,
-					ToRef:    pkgPath + "." + otherName,
-					EdgeType: "satisfies",
-					Pos:      extract.Position{File: "", Line: 0},
-				},
-			})
-		}
-	}
+// resolveInterfaceSatisfaction records same-package implementation edges. Both
+// sides are keyed by the stored symbol name, so an alias never produces a
+// second edge for the same (implementer, interface) pair.
+func resolveInterfaceSatisfaction(pkg *types.Package, indexed map[string]bool, result *Result) {
+	constructors, ifaces := classifyTypes(pkg, indexed)
+	findCrossPackageSatisfies(constructors, ifaces, result)
 }
 
 func resolveStructEmbedding(pkg *types.Package, pkgPath string, result *Result) {
@@ -787,13 +865,15 @@ type importer struct {
 	pkgFiles map[string][]*ast.File
 	fset     *token.FileSet
 	memo     map[string]*types.Package
+	info     map[string]*types.Info
 
 	inProgress map[string]bool
 
-	// warn records concrete type-check errors for a project dependency, keyed
-	// by the import path being checked. Nil means "drop" (no-op), matching the
-	// pre-diagnostic behavior.
-	warn func(pkgPath string, err error)
+	// onError records concrete type-check errors for the package being checked.
+	// Every check goes through it, whether triggered by an import or by the
+	// top-level pass, so diagnostics and warnings do not depend on which path
+	// reached the package first.
+	onError func(pkgPath string, err error)
 
 	// exports maps an import path to its compiled export-data file, resolved in
 	// one `go list -export -deps` call before type-checking starts.
@@ -807,6 +887,7 @@ func newImporter(pr *parse.Result) *importer {
 		pkgFiles:   make(map[string][]*ast.File),
 		fset:       pr.Fset,
 		memo:       make(map[string]*types.Package),
+		info:       make(map[string]*types.Info),
 		inProgress: make(map[string]bool),
 	}
 	for _, pi := range pr.Packages {
@@ -824,18 +905,38 @@ func newImporter(pr *parse.Result) *importer {
 }
 
 func (i *importer) Import(path string) (*types.Package, error) {
+	pkg, _, err := i.packageFor(path)
+	return pkg, err
+}
+
+// newTypeInfo returns an empty types.Info. Callers that pass it to Check get it
+// populated; callers that fall back to it read empty maps and simply produce no
+// type-based edges.
+func newTypeInfo() *types.Info {
+	return &types.Info{
+		Uses:       make(map[*ast.Ident]types.Object),
+		Selections: make(map[*ast.SelectorExpr]*types.Selection),
+		Defs:       make(map[*ast.Ident]types.Object),
+	}
+}
+
+// packageFor returns the single checked instance of a package and the type
+// information gathered while checking it. Every consumer shares that instance,
+// so types.Identical sees the same object identity across package boundaries.
+func (i *importer) packageFor(path string) (*types.Package, *types.Info, error) {
 	if path == "unsafe" {
-		return types.Unsafe, nil
+		return types.Unsafe, nil, nil
 	}
 
 	i.mu.Lock()
 	if pkg, ok := i.memo[path]; ok {
+		info := i.info[path]
 		i.mu.Unlock()
-		return pkg, nil
+		return pkg, info, nil
 	}
 	if i.inProgress[path] {
 		i.mu.Unlock()
-		return nil, fmt.Errorf("import cycle: %s", path)
+		return nil, nil, fmt.Errorf("import cycle: %s", path)
 	}
 	files, isProject := i.pkgFiles[path]
 	if isProject {
@@ -844,30 +945,33 @@ func (i *importer) Import(path string) (*types.Package, error) {
 	i.mu.Unlock()
 
 	if !isProject {
-		return i.importExternal(path)
+		pkg, err := i.importExternal(path)
+		return pkg, nil, err
 	}
 
+	info := newTypeInfo()
 	conf := &types.Config{
 		Importer: i,
 		Error: func(err error) {
-			if i.warn != nil {
-				i.warn(path, err)
+			if i.onError != nil {
+				i.onError(path, err)
 			}
 		},
 	}
-	pkg, _ := conf.Check(path, i.fset, files, nil)
+	pkg, _ := conf.Check(path, i.fset, files, info)
 
 	i.mu.Lock()
 	delete(i.inProgress, path)
 	if pkg != nil {
 		i.memo[path] = pkg
+		i.info[path] = info
 	}
 	i.mu.Unlock()
 
 	if pkg == nil {
-		return nil, fmt.Errorf("could not type-check package %s", path)
+		return nil, nil, fmt.Errorf("could not type-check package %s", path)
 	}
-	return pkg, nil
+	return pkg, info, nil
 }
 
 // importExternal loads compiled export data for external (module/stdlib)

@@ -2652,6 +2652,33 @@ func (s *Store) MethodsByReceiver(typeName string, includeTests bool) ([]Symbol,
 	return scanSymbols(rows)
 }
 
+func (s *Store) MethodsByQualifiedReceiver(qualifiedType string, includeTests bool) ([]Symbol, error) {
+	query := `SELECT ` + symbolColumns + `
+		` +
+		symbolFrom + `
+		WHERE s.kind = 'method'
+		  AND substr(s.qualified_name, 1, length(?) + 1) = ? || '.'
+	`
+	args := []any{qualifiedType, qualifiedType}
+	if !includeTests {
+		query += andIsTestFalse
+	}
+	query += orderByQualifiedName
+
+	rows, err := s.db.QueryContext(context.Background(), query, args...)
+	if err != nil {
+		return nil, err
+	}
+	syms, err := scanSymbols(rows)
+	if err != nil {
+		return nil, err
+	}
+	if syms == nil {
+		syms = []Symbol{}
+	}
+	return syms, nil
+}
+
 func (s *Store) MethodsByName(methodName string, includeTests bool) ([]Symbol, error) {
 	query := `SELECT ` + symbolColumns + `
 		` +
