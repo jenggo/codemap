@@ -584,7 +584,7 @@ const analyzerVersionKey = "analyzer_version"
 // analyzerVersion must be bumped whenever parse, resolve, or extract change the
 // symbols or edges they produce. Staleness checks rebuild an index recorded with
 // a different value.
-const analyzerVersion = "2"
+const analyzerVersion = "3"
 
 // setAnalyzerVersionTx records the analyzer version inside an index write
 // transaction, so an index is only considered current for the analyzer that
@@ -1294,7 +1294,7 @@ DO UPDATE SET
 		_, repoID := attrib.pkgFor(edge.Edge.FromRef)
 
 		pos := edge.Edge.Pos
-		sitesJSON, err := jsonMarshal([]Site{{File: pos.File, Line: pos.Line}})
+		sitesJSON, err := jsonMarshal([]Site{{File: pos.File, Line: pos.Line, Column: pos.Column}})
 		if err != nil {
 			return fmt.Errorf("marshaling sites for %s -> %s: %w", edge.Edge.FromRef, edge.Edge.ToRef, err)
 		}
@@ -1607,11 +1607,13 @@ func (s *Store) Diagnostics(file string) ([]Diagnostic, error) {
 	return out, rows.Err()
 }
 
-// Site is one occurrence location of an edge: the repo-relative file path and
-// line at which the edge was observed during indexing.
+// Site is one occurrence location of an edge: the repo-relative file path,
+// line, and 1-based column at which the edge was observed during indexing.
+// Column is what makes two occurrences on one line distinguishable.
 type Site struct {
-	File string `json:"file"`
-	Line int    `json:"line"`
+	File   string `json:"file"`
+	Line   int    `json:"line"`
+	Column int    `json:"column,omitempty"`
 }
 
 type Edge struct {

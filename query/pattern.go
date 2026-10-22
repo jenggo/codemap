@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
-	"slices"
 	"sort"
 	"strings"
 
@@ -152,51 +151,4 @@ func sourceSlice(content string, start, end int) string {
 		return ""
 	}
 	return content[start:end]
-}
-
-// enclosingSymbol returns the innermost declaration on the ancestor stack that
-// maps to an indexed symbol.
-func enclosingSymbol(fset *token.FileSet, stack []ast.Node, byLine map[int][]store.Symbol) (store.Symbol, bool) {
-	for _, n := range slices.Backward(stack) {
-		name, line, ok := declaredName(fset, n)
-		if !ok {
-			continue
-		}
-		if sym, found := symbolAt(byLine[line], name); found {
-			return sym, true
-		}
-	}
-	return store.Symbol{}, false
-}
-
-func symbolAt(syms []store.Symbol, name string) (store.Symbol, bool) {
-	for _, sym := range syms {
-		if sym.Name == name {
-			return sym, true
-		}
-	}
-	return store.Symbol{}, false
-}
-
-// declaredName returns the declared name and start line of a declaration node,
-// matching the position the index records for its symbol.
-func declaredName(fset *token.FileSet, n ast.Node) (string, int, bool) {
-	switch d := n.(type) {
-	case *ast.FuncDecl:
-		if d.Name == nil {
-			return "", 0, false
-		}
-		return d.Name.Name, fset.Position(d.Pos()).Line, true
-	case *ast.TypeSpec:
-		if d.Name == nil {
-			return "", 0, false
-		}
-		return d.Name.Name, fset.Position(d.Pos()).Line, true
-	case *ast.ValueSpec:
-		if len(d.Names) == 0 {
-			return "", 0, false
-		}
-		return d.Names[0].Name, fset.Position(d.Pos()).Line, true
-	}
-	return "", 0, false
 }

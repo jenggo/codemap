@@ -501,18 +501,39 @@ func resolveCallExpr(node *ast.CallExpr, currentFunc string, fset *token.FileSet
 	}
 
 	if callee != "" {
-		pos := fset.Position(node.Pos())
+		pos := fset.Position(calleePos(node.Fun))
 		result.Edges = append(result.Edges, ResolvedEdge{
 			Edge: extract.Edge{
 				FromRef:  currentFunc,
 				ToRef:    callee,
 				EdgeType: "calls",
 				Pos: extract.Position{
-					File: pos.Filename,
-					Line: pos.Line,
+					File:   pos.Filename,
+					Line:   pos.Line,
+					Column: pos.Column,
 				},
 			},
 		})
+	}
+}
+
+// calleePos returns the identifier that names the callee, so a recorded site
+// points at the token a rename must rewrite rather than at the start of the
+// whole call expression (which for pkg.Fn() is pkg).
+func calleePos(fun ast.Expr) token.Pos {
+	switch f := fun.(type) {
+	case *ast.Ident:
+		return f.Pos()
+	case *ast.SelectorExpr:
+		return f.Sel.Pos()
+	case *ast.IndexExpr:
+		return calleePos(f.X)
+	case *ast.IndexListExpr:
+		return calleePos(f.X)
+	case *ast.ParenExpr:
+		return calleePos(f.X)
+	default:
+		return fun.Pos()
 	}
 }
 
@@ -547,7 +568,7 @@ func addReferenceEdge(from, to string, pos token.Position, result *Result) {
 			FromRef:  from,
 			ToRef:    to,
 			EdgeType: "references",
-			Pos:      extract.Position{File: pos.Filename, Line: pos.Line},
+			Pos:      extract.Position{File: pos.Filename, Line: pos.Line, Column: pos.Column},
 		},
 	})
 }
@@ -589,7 +610,7 @@ func resolveSelectorRef(node *ast.SelectorExpr, currentDecl string, fset *token.
 	}
 	toRef := objectQualifiedName(obj)
 	if toRef != "" && toRef != currentDecl {
-		addReferenceEdge(currentDecl, toRef, fset.Position(node.Pos()), result)
+		addReferenceEdge(currentDecl, toRef, fset.Position(node.Sel.Pos()), result)
 	}
 }
 

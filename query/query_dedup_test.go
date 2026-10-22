@@ -149,11 +149,11 @@ func TestBlastRadiusDeduplicated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if br.DirectCallers != 2 {
-		t.Errorf("expected 2 direct callers (Helper + Other), got %d", br.DirectCallers)
+	if br.DirectCallers != 3 {
+		t.Errorf("expected 3 direct callers (Helper, Other, SameLine), got %d", br.DirectCallers)
 	}
-	if br.TransitiveCallers < 2 {
-		t.Errorf("expected transitive callers >= 2, got %d", br.TransitiveCallers)
+	if br.TransitiveCallers < 3 {
+		t.Errorf("expected transitive callers >= 3, got %d", br.TransitiveCallers)
 	}
 }
 
@@ -179,6 +179,39 @@ func TestShowReturnsSites(t *testing.T) {
 	}
 	if len(helperEdge.Sites) != 4 {
 		t.Errorf("expected 4 sites on show edge, got %d", len(helperEdge.Sites))
+	}
+}
+
+// TestSameLineOccurrencesAreDistinctSites asserts the index records one site
+// per occurrence, not one per line: SameLine calls Target twice on one line, so
+// its edge must carry two sites that differ only by column.
+func TestSameLineOccurrencesAreDistinctSites(t *testing.T) {
+	s := setupMultiSiteStore(t)
+
+	callers, err := query.CallersOf(s, "multisite.Target")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var sameLine *query.EdgeDetail
+	for i := range callers {
+		if callers[i].FromRef == "multisite.SameLine" && callers[i].EdgeType == "calls" {
+			sameLine = &callers[i]
+		}
+	}
+	if sameLine == nil {
+		t.Fatalf("expected a calls edge from SameLine, got %+v", callers)
+	}
+
+	if sameLine.SiteCount != 2 {
+		t.Fatalf("SameLine calls Target twice on one line: expected SiteCount 2, got %d (%+v)",
+			sameLine.SiteCount, sameLine.Sites)
+	}
+	if sameLine.Sites[0].Line != sameLine.Sites[1].Line {
+		t.Errorf("expected both sites on one line, got %+v", sameLine.Sites)
+	}
+	if sameLine.Sites[0].Column == sameLine.Sites[1].Column {
+		t.Errorf("expected distinct columns, got %+v", sameLine.Sites)
 	}
 }
 

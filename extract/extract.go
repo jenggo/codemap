@@ -9,8 +9,9 @@ import (
 )
 
 type Position struct {
-	File string
-	Line int
+	File   string
+	Line   int
+	Column int
 }
 
 // StructField records one struct field's Go name, effective wire name (from
@@ -31,8 +32,8 @@ type Symbol struct {
 	Receiver      string
 	Signature     string
 	Doc           string
-	Pos           Position
 	Fields        []StructField
+	Pos           Position
 	Complexity    int
 	Exported      bool
 	IsTest        bool

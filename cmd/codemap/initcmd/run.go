@@ -49,6 +49,10 @@ const ToolsAndTipsBlock = `## Available Tools
 | ` + "`suppress_contract`" + ` | Suppress a confirmed false-positive contract pair | Cleaning false positives |
 | ` + "`health`" + ` | Per-repo index freshness (indexed/stale/missing) | Diagnosing stale results |
 | ` + "`schema`" + ` | Schema of all result types | Understanding response shapes |
+| ` + "`replace_symbol_body`" + ` | Replaces a symbol's declaration span (doc comment too with ` + "`include_doc`" + `) | Editing a declaration without counting lines; needs ` + "`serve --allow-write`" + ` |
+| ` + "`insert_before_symbol`" + ` | Inserts Go source before a symbol's declaration (before its doc comment) | Adding a declaration next to its siblings |
+| ` + "`insert_after_symbol`" + ` | Inserts Go source after a symbol's declaration | Adding a declaration next to its siblings |
+| ` + "`safe_delete_symbol`" + ` | Deletes a symbol only when the index records no incoming references | Removing dead code with the referrers checked for you |
 
 ## Tips
 
@@ -63,6 +67,7 @@ const ToolsAndTipsBlock = `## Available Tools
 - ` + "`imports_of`" + ` defaults to direction ` + "`out`" + ` (imports); use ` + "`direction: \"in\"`" + ` for importers and ` + "`transitive: true`" + ` for the full dependency tree
 - ` + "`pattern`" + ` takes Go source with ` + "`$UPPERCASE`" + ` metavariables (ast-grep style); matching is syntactic and repeated metavariables must bind identical nodes; ` + "`file_pattern`" + ` and ` + "`repo`" + ` narrow the scan
 - ` + "`search`" + ` down-ranks generated and test symbols (never hides them); ` + "`generated: \"exclude\"|\"only\"`" + ` filters them
+- The four write tools refuse unless the server was started with ` + "`serve --allow-write`" + `; a read-only server never touches a source file
 - Indexing is automatic and fast (~50ms). Re-indexes when Go files change.
 - In a Go module the guard injects a ` + "`codemap summary`" + ` of the project into the system prompt, so the package map is already available before the first tool call.
 `

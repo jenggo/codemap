@@ -1,6 +1,7 @@
 package query
 
 import (
+	"go/ast"
 	"os"
 	"path/filepath"
 	"strings"
@@ -96,10 +97,11 @@ func TestSymbolSpan(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			start, end, docOff, grouped, members, err := symbolSpan(file, tc.posLine, tc.receiver, tc.qn, tc.kind)
+			span, err := symbolSpan(file, tc.posLine, tc.receiver, tc.qn, tc.kind)
 			if err != nil {
 				t.Fatalf("symbolSpan: %v", err)
 			}
+			start, end, docOff := span.startOff, span.endOff, span.docStartOff
 			if start < 0 || end <= start || end > len(data) {
 				t.Fatalf("offsets out of range: start=%d end=%d len=%d", start, end, len(data))
 			}
@@ -107,11 +109,11 @@ func TestSymbolSpan(t *testing.T) {
 			if !strings.Contains(body, tc.wantSubstr) {
 				t.Errorf("body does not contain %q\nbody: %s", tc.wantSubstr, body)
 			}
-			if grouped != tc.wantGrouped {
-				t.Errorf("partOfGroup: got %v want %v", grouped, tc.wantGrouped)
+			if span.partOfGroup != tc.wantGrouped {
+				t.Errorf("partOfGroup: got %v want %v", span.partOfGroup, tc.wantGrouped)
 			}
-			if grouped && members != tc.wantMembers {
-				t.Errorf("groupMembers: got %d want %d", members, tc.wantMembers)
+			if span.partOfGroup && span.groupMembers != tc.wantMembers {
+				t.Errorf("groupMembers: got %d want %d", span.groupMembers, tc.wantMembers)
 			}
 			if tc.wantDocOffset && docOff < 0 {
 				t.Errorf("expected doc offset, got %d", docOff)
@@ -123,7 +125,7 @@ func TestSymbolSpan(t *testing.T) {
 func TestSymbolSpanNotFound(t *testing.T) {
 	abs, _ := filepath.Abs("../testdata/generics")
 	file := filepath.Join(abs, "generics.go")
-	_, _, _, _, _, err := symbolSpan(file, 1, "", "NonExistent", "function")
+	_, err := symbolSpan(file, 1, "", "NonExistent", "function")
 	if err == nil {
 		t.Fatal("expected error for non-existent symbol")
 	}
@@ -194,7 +196,7 @@ func TestSymbolSpanStaleLineFallback(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			start, end, _, _, _, err := symbolSpan(file, 9999, tc.receiver, tc.qn, tc.kind)
+			span, err := symbolSpan(file, 9999, tc.receiver, tc.qn, tc.kind)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("expected error for %s (receiver=%s)", tc.qn, tc.receiver)
@@ -204,8 +206,11 @@ func TestSymbolSpanStaleLineFallback(t *testing.T) {
 			if err != nil {
 				t.Fatalf("symbolSpan fallback: %v", err)
 			}
+			if !span.stale {
+				t.Error("expected the name-only fallback to be reported as stale")
+			}
 			data := readFile(t, file)
-			body := string(data[start:end])
+			body := string(data[span.startOff:span.endOff])
 			if !strings.Contains(body, tc.wantSubstr) {
 				t.Errorf("body does not contain %q\nbody: %s", tc.wantSubstr, body)
 			}
@@ -214,7 +219,7 @@ func TestSymbolSpanStaleLineFallback(t *testing.T) {
 }
 
 func TestSymbolSpanFileMissing(t *testing.T) {
-	_, _, _, _, _, err := symbolSpan("/nonexistent/file.go", 1, "", "X", "function")
+	_, err := symbolSpan("/nonexistent/file.go", 1, "", "X", "function")
 	if err == nil {
 		t.Fatal("expected error for missing file")
 	}
@@ -224,13 +229,70 @@ func TestSymbolSpanInterfaceType(t *testing.T) {
 	abs, _ := filepath.Abs("../testdata/interfaces")
 	file := filepath.Join(abs, "interfaces.go")
 	data := readFile(t, file)
-	start, end, _, _, _, err := symbolSpan(file, 4, "", "Reader", "type")
+	span, err := symbolSpan(file, 4, "", "Reader", "type")
 	if err != nil {
 		t.Fatalf("symbolSpan: %v", err)
 	}
-	body := string(data[start:end])
+	body := string(data[span.startOff:span.endOff])
 	if !strings.Contains(body, "type Reader interface") {
 		t.Errorf("body does not contain type Reader interface\nbody: %s", body)
+	}
+}
+
+// TestSymbolSpanReturnsDeclarationNode covers the write path's need for the
+// matched node: funcs, methods, types, and grouped var members must all expose
+// the declaration the offsets describe, along with the doc offset and group
+// membership that decide whether a rewrite is safe.
+func TestSymbolSpanReturnsDeclarationNode(t *testing.T) {
+	abs, err := filepath.Abs("../testdata/generics")
+	if err != nil {
+		t.Fatalf("abs path: %v", err)
+	}
+	file := filepath.Join(abs, "generics.go")
+	data := readFile(t, file)
+
+	tests := []struct {
+		name        string
+		posLine     int
+		receiver    string
+		qn          string
+		kind        string
+		wantFunc    bool
+		wantGrouped bool
+		wantMembers int
+	}{
+		{name: "function", posLine: 38, qn: "PlainFunc", kind: "function", wantFunc: true},
+		{name: "method", posLine: 28, receiver: "Server", qn: "Get", kind: "method", wantFunc: true},
+		{name: "type", posLine: 23, qn: "Server", kind: "type"},
+		{name: "grouped var", posLine: 15, qn: "MaxRetries", kind: "var", wantGrouped: true, wantMembers: 2},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			span, err := symbolSpan(file, tc.posLine, tc.receiver, tc.qn, tc.kind)
+			if err != nil {
+				t.Fatalf("symbolSpan: %v", err)
+			}
+			if span.node == nil {
+				t.Fatal("expected the matched declaration node")
+			}
+			_, isFunc := span.node.(*ast.FuncDecl)
+			if isFunc != tc.wantFunc {
+				t.Errorf("node is FuncDecl = %v, want %v (%T)", isFunc, tc.wantFunc, span.node)
+			}
+			if span.docStartOff < 0 {
+				t.Error("expected a doc comment offset")
+			}
+			if span.partOfGroup != tc.wantGrouped {
+				t.Errorf("partOfGroup = %v, want %v", span.partOfGroup, tc.wantGrouped)
+			}
+			if tc.wantGrouped && span.groupMembers != tc.wantMembers {
+				t.Errorf("groupMembers = %d, want %d", span.groupMembers, tc.wantMembers)
+			}
+			if got := string(data[span.startOff:span.endOff]); !strings.Contains(got, tc.qn) {
+				t.Errorf("span %q does not mention %q", got, tc.qn)
+			}
+		})
 	}
 }
 

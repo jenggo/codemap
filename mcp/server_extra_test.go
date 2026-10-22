@@ -50,6 +50,8 @@ func TestToolsListIncludesNewTools(t *testing.T) {
 		"all_edges",
 		"package",
 		"search",
+		"find_declaration",
+		"rename_symbol",
 	}
 	for _, r := range required {
 		if !names[r] {
@@ -72,8 +74,8 @@ func TestToolsListIncludesNewTools(t *testing.T) {
 			t.Errorf("absorbed tool %q must not appear in tools/list", gone)
 		}
 	}
-	if len(tools) != 34 {
-		t.Errorf("expected 33 tools in tools/list, got %d", len(tools))
+	if len(tools) != 40 {
+		t.Errorf("expected 40 tools in tools/list, got %d", len(tools))
 	}
 }
 

@@ -162,16 +162,17 @@ func RenderShow(result *query.ShowResult, opts ...Option) string {
 
 func renderShowJSON(r *query.ShowResult, fullDocs bool) string {
 	type showJSON struct {
-		QualifiedName string             `json:"qualified_name"`
-		Kind          string             `json:"kind"`
-		Receiver      string             `json:"receiver"`
-		Signature     string             `json:"signature"`
-		Doc           string             `json:"doc"`
-		PosFile       string             `json:"pos_file"`
-		IncomingEdges []query.EdgeDetail `json:"incoming_edges"`
-		OutgoingEdges []query.EdgeDetail `json:"outgoing_edges"`
-		PosLine       int                `json:"pos_line"`
-		Exported      bool               `json:"exported"`
+		QualifiedName string              `json:"qualified_name"`
+		Kind          string              `json:"kind"`
+		Receiver      string              `json:"receiver"`
+		Signature     string              `json:"signature"`
+		Doc           string              `json:"doc"`
+		PosFile       string              `json:"pos_file"`
+		Fields        []store.SymbolField `json:"fields,omitempty"`
+		IncomingEdges []query.EdgeDetail  `json:"incoming_edges"`
+		OutgoingEdges []query.EdgeDetail  `json:"outgoing_edges"`
+		PosLine       int                 `json:"pos_line"`
+		Exported      bool                `json:"exported"`
 	}
 
 	doc := r.Symbol.Doc
@@ -186,6 +187,7 @@ func renderShowJSON(r *query.ShowResult, fullDocs bool) string {
 		Signature:     r.Symbol.Signature,
 		Doc:           doc,
 		PosFile:       r.Symbol.PosFile,
+		Fields:        r.Symbol.Fields,
 		PosLine:       r.Symbol.PosLine,
 		Exported:      r.Symbol.Exported,
 		IncomingEdges: r.IncomingEdges,
@@ -210,6 +212,7 @@ func renderShowText(r *query.ShowResult, fullDocs bool) string {
 		fmt.Fprintf(&b, "  doc: %s\n", doc)
 	}
 	fmt.Fprintf(&b, "  pos: %s:%d\n", r.Symbol.PosFile, r.Symbol.PosLine)
+	writeFieldLines(&b, "  ", r.Symbol.Fields)
 
 	if len(r.IncomingEdges) > 0 {
 		b.WriteString("\n  incoming edges:\n")
@@ -229,7 +232,41 @@ func renderShowText(r *query.ShowResult, fullDocs bool) string {
 }
 
 func renderShowCompact(r *query.ShowResult) string {
-	return fmt.Sprintf("%s %s %s", r.Symbol.Kind, r.Symbol.QualifiedName, r.Symbol.Signature)
+	out := fmt.Sprintf("%s %s %s", r.Symbol.Kind, r.Symbol.QualifiedName, r.Symbol.Signature)
+	if fields := fieldList(r.Symbol.Fields); fields != "" {
+		out += " fields=" + fields
+	}
+	return out
+}
+
+// fieldList renders fields as go_name:go_type pairs for one-line formats,
+// adding the wire name when it differs from the Go name.
+func fieldList(fields []store.SymbolField) string {
+	parts := make([]string, 0, len(fields))
+	for _, f := range fields {
+		part := f.GoName + ":" + f.GoType
+		if f.WireName != f.GoName {
+			part = f.GoName + ":" + f.WireName + ":" + f.GoType
+		}
+		parts = append(parts, part)
+	}
+	return strings.Join(parts, ",")
+}
+
+// writeFieldLines renders one indented line per field, keeping the wire name
+// visible in formats that have room for it.
+func writeFieldLines(b *strings.Builder, indent string, fields []store.SymbolField) {
+	if len(fields) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "%sfields:\n", indent)
+	for _, f := range fields {
+		if f.WireName == f.GoName {
+			fmt.Fprintf(b, "%s  %s %s\n", indent, f.GoName, f.GoType)
+			continue
+		}
+		fmt.Fprintf(b, "%s  %s %s wire=%s\n", indent, f.GoName, f.GoType, f.WireName)
+	}
 }
 
 func RenderCallers(edges []query.EdgeDetail, opts ...Option) string {
@@ -307,6 +344,7 @@ func RenderSearch(results []query.SearchResult, opts ...Option) string {
 			if doc != "" {
 				fmt.Fprintf(&b, "  %s\n", doc)
 			}
+			writeFieldLines(&b, "  ", r.Fields)
 		}
 		return b.String()
 	default:
@@ -450,6 +488,7 @@ func renderPackageText(pkg *query.PackageResult) string {
 		if sym.Doc != "" {
 			fmt.Fprintf(&b, "      doc: %s\n", firstSentence(sym.Doc))
 		}
+		writeFieldLines(&b, "      ", sym.Fields)
 	}
 	return b.String()
 }
@@ -534,9 +573,19 @@ func toonStruct(rv reflect.Value) any {
 		if isRepoKey(name) && isEmptyValue(val) {
 			continue
 		}
+		if omitsEmptySlice(f) && isEmptyValue(val) {
+			continue
+		}
 		obj[name] = val
 	}
 	return obj
+}
+
+// omitsEmptySlice reports whether a field is tagged omitempty, so TOON drops an
+// empty slice the way encoding/json does. Non-slice omitempty keys keep their
+// pre-existing TOON output.
+func omitsEmptySlice(f reflect.StructField) bool {
+	return f.Type.Kind() == reflect.Slice && strings.Contains(f.Tag.Get("json"), ",omitempty")
 }
 
 func toonFieldName(f reflect.StructField) string {
@@ -574,8 +623,13 @@ func isEmptyValue(v any) bool {
 	if v == nil {
 		return true
 	}
-	s, ok := v.(string)
-	return ok && s == ""
+	if s, ok := v.(string); ok {
+		return s == ""
+	}
+	if arr, ok := v.([]any); ok {
+		return len(arr) == 0
+	}
+	return false
 }
 
 func symToJSON(sym query.SymbolDetail, fullDocs bool) symJSON {
@@ -1156,6 +1210,90 @@ func RenderPatternMatches(matches []query.PatternMatch, opts ...Option) string {
 	}
 }
 
+func RenderWriteResult(result *query.WriteResult, opts ...Option) string {
+	options := &Options{}
+	opt.Apply(options, opts)
+
+	switch options.Format {
+	case FormatJSON:
+		return marshalJSON(result)
+	case FormatCompact:
+		return fmt.Sprintf("%s %s %s:%d-%d (%d lines)%s%s",
+			result.Action, result.QualifiedName, result.File, result.StartLine, result.EndLine,
+			result.NewLines, staleTag(result), reindexTag(result))
+	case FormatTOON, FormatText:
+		var b strings.Builder
+		fmt.Fprintf(&b, "%s %s (%s)\n", result.Action, result.QualifiedName, result.Kind)
+		fmt.Fprintf(&b, "file: %s:%d-%d\n", result.File, result.StartLine, result.EndLine)
+		if result.Unchanged {
+			b.WriteString("unchanged: true (no write)\n")
+		} else {
+			fmt.Fprintf(&b, "new_lines: %d\n", result.NewLines)
+		}
+		if result.StaleIndex {
+			b.WriteString("stale_index: true (the indexed line no longer matched; declaration matched by name)\n")
+		}
+		if result.ReindexError != "" {
+			fmt.Fprintf(&b, "reindex_error: %s; run reindex\n", result.ReindexError)
+		}
+		return b.String()
+	default:
+		return marshalJSON(result)
+	}
+}
+
+// RenderRenameResult renders a completed rename: the files it rewrote and how
+// many occurrences each carried, plus any shadowing it overrode.
+func RenderRenameResult(result *query.RenameResult, opts ...Option) string {
+	options := &Options{}
+	opt.Apply(options, opts)
+
+	switch options.Format {
+	case FormatJSON:
+		return marshalJSON(result)
+	case FormatCompact:
+		return fmt.Sprintf("rename %s -> %s (%d sites in %d files)%s",
+			result.QualifiedName, result.NewName, result.SiteCount, len(result.Files), renameReindexTag(result))
+	case FormatTOON, FormatText:
+		var b strings.Builder
+		fmt.Fprintf(&b, "rename %s -> %s\n", result.QualifiedName, result.NewName)
+		fmt.Fprintf(&b, "sites: %d\n", result.SiteCount)
+		for _, f := range result.Files {
+			fmt.Fprintf(&b, "  %s (%d)\n", f.File, f.Sites)
+		}
+		if len(result.OverriddenShadowing) > 0 {
+			fmt.Fprintf(&b, "overridden_shadowing: %s\n", strings.Join(result.OverriddenShadowing, ", "))
+		}
+		if result.ReindexError != "" {
+			fmt.Fprintf(&b, "reindex_error: %s; run reindex\n", result.ReindexError)
+		}
+		return b.String()
+	default:
+		return marshalJSON(result)
+	}
+}
+
+func renameReindexTag(r *query.RenameResult) string {
+	if r.ReindexError != "" {
+		return " [reindex failed]"
+	}
+	return ""
+}
+
+func staleTag(r *query.WriteResult) string {
+	if r.StaleIndex {
+		return " [stale index]"
+	}
+	return ""
+}
+
+func reindexTag(r *query.WriteResult) string {
+	if r.ReindexError != "" {
+		return " [reindex failed: run reindex]"
+	}
+	return ""
+}
+
 // symbolTag annotates a match line with its enclosing symbol. The empty string
 // keeps the line clean for matches that lie outside every indexed symbol.
 func symbolTag(symbol string) string {
@@ -1208,7 +1346,9 @@ func writeBundleSymbol(b *strings.Builder, sym *query.SymbolDetail) {
 	if sym.Doc != "" {
 		fmt.Fprintf(b, "  doc: %s\n", firstSentence(sym.Doc))
 	}
-	fmt.Fprintf(b, "  pos: %s:%d\n\n", sym.PosFile, sym.PosLine)
+	fmt.Fprintf(b, "  pos: %s:%d\n", sym.PosFile, sym.PosLine)
+	writeFieldLines(b, "  ", sym.Fields)
+	b.WriteString("\n")
 }
 
 func writeBundleBody(b *strings.Builder, body string) {

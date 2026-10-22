@@ -5,7 +5,7 @@ go 1.27.0
 require (
 	github.com/alpkeskin/gotoon v0.1.1
 	gopkg.in/yaml.v3 v3.0.1
-	modernc.org/sqlite v1.60.1
+	modernc.org/sqlite v1.61.0
 )
 
 require (

@@ -30,6 +30,7 @@ type Options struct {
 	Depth             int
 	IncludeTests      bool
 	IncludeUnexported bool
+	IncludeFields     bool
 }
 
 // Option mutates query Options. Alias of opt.Option[Options], so existing
@@ -66,6 +67,13 @@ func WithUnexported() Option {
 	}
 }
 
+// WithFields attaches struct fields to package and search results.
+func WithFields() Option {
+	return func(o *Options) {
+		o.IncludeFields = true
+	}
+}
+
 // WithEdgeTypes restricts returned edges to the given types. Kept variadic
 // so call sites can pass both single values and spread slices.
 func WithEdgeTypes(types ...string) Option {
@@ -89,7 +97,8 @@ type SymbolDetail struct {
 	Signature     string
 	Doc           string
 	PosFile       string
-	Repo          string `json:"repo,omitempty"`
+	Repo          string              `json:"repo,omitempty"`
+	Fields        []store.SymbolField `json:"fields,omitempty"`
 	PosLine       int
 	Exported      bool
 	Generated     bool
@@ -136,7 +145,8 @@ type SearchResult struct {
 	Doc           string
 	Receiver      string
 	PosFile       string
-	Repo          string `json:"repo,omitempty"`
+	Repo          string              `json:"repo,omitempty"`
+	Fields        []store.SymbolField `json:"fields,omitempty"`
 	PosLine       int
 	Exported      bool
 	Generated     bool
@@ -389,6 +399,7 @@ func Show(s *store.Store, qualifiedName string, opts ...Option) (*ShowResult, er
 			Signature:     sym.Signature,
 			Doc:           sym.Doc,
 			PosFile:       sym.PosFile,
+			Fields:        sym.Fields,
 			PosLine:       sym.PosLine,
 			Exported:      sym.Exported,
 			Generated:     sym.IsGenerated,
@@ -481,14 +492,14 @@ func buildPackageSummary(s *store.Store, p store.Package, includeTests bool, imp
 		Repo:        p.Repo,
 		ImportCount: importCounts[p.Path],
 
-		ExportedSymbols: symbolDetails(syms, false)}
+		ExportedSymbols: symbolDetails(syms, false, false)}
 
 	return summary, nil
 }
 
 // symbolDetails converts store symbols to query details, keeping only exported
-// symbols unless includeUnexported is set.
-func symbolDetails(syms []store.Symbol, includeUnexported bool) []SymbolDetail {
+// symbols unless includeUnexported is set. Fields are attached only on request.
+func symbolDetails(syms []store.Symbol, includeUnexported, includeFields bool) []SymbolDetail {
 	var symbols []SymbolDetail
 	for _, sym := range syms {
 		if !includeUnexported && !sym.Exported {
@@ -501,6 +512,7 @@ func symbolDetails(syms []store.Symbol, includeUnexported bool) []SymbolDetail {
 			Signature:     sym.Signature,
 			Doc:           sym.Doc,
 			PosFile:       sym.PosFile,
+			Fields:        fieldsIfRequested(sym, includeFields),
 			PosLine:       sym.PosLine,
 			Exported:      sym.Exported,
 			Generated:     sym.IsGenerated,
@@ -508,6 +520,35 @@ func symbolDetails(syms []store.Symbol, includeUnexported bool) []SymbolDetail {
 		})
 	}
 	return symbols
+}
+
+func fieldsIfRequested(sym store.Symbol, include bool) []store.SymbolField {
+	if !include {
+		return nil
+	}
+	return sym.Fields
+}
+
+// searchResultsFromSymbols projects store rows into search results, attaching
+// fields only when the caller asked for them.
+func searchResultsFromSymbols(syms []store.Symbol, includeFields bool) []SearchResult {
+	result := make([]SearchResult, 0, len(syms))
+	for _, sym := range syms {
+		result = append(result, SearchResult{
+			QualifiedName: sym.QualifiedName,
+			Kind:          sym.Kind,
+			Signature:     sym.Signature,
+			Doc:           sym.Doc,
+			Receiver:      sym.Receiver,
+			PosFile:       sym.PosFile,
+			Fields:        fieldsIfRequested(sym, includeFields),
+			PosLine:       sym.PosLine,
+			Exported:      sym.Exported,
+			Generated:     sym.IsGenerated,
+			Repo:          sym.Repo,
+		})
+	}
+	return result
 }
 
 func Search(s *store.Store, pattern string, opts ...Option) ([]SearchResult, error) {
@@ -531,21 +572,7 @@ func Search(s *store.Store, pattern string, opts ...Option) ([]SearchResult, err
 		sortSymbolsForSearch(syms, strings.ToLower(pattern))
 	}
 
-	result := make([]SearchResult, 0, len(syms))
-	for _, sym := range syms {
-		result = append(result, SearchResult{
-			QualifiedName: sym.QualifiedName,
-			Kind:          sym.Kind,
-			Signature:     sym.Signature,
-			Doc:           sym.Doc,
-			Receiver:      sym.Receiver,
-			PosFile:       sym.PosFile,
-			PosLine:       sym.PosLine,
-			Exported:      sym.Exported,
-			Generated:     sym.IsGenerated,
-			Repo:          sym.Repo,
-		})
-	}
+	result := searchResultsFromSymbols(syms, options.IncludeFields)
 
 	return filterSearchResults(result, options.Repo), nil
 }
@@ -712,7 +739,7 @@ func Package(s *store.Store, pkgPath string, opts ...Option) (*PackageResult, er
 		Path:            found.Path,
 		Name:            found.Name,
 		ImportCount:     importCount,
-		ExportedSymbols: symbolDetails(syms, options.IncludeUnexported),
+		ExportedSymbols: symbolDetails(syms, options.IncludeUnexported, options.IncludeFields),
 		Repo:            found.Repo,
 	}, nil
 }
@@ -883,21 +910,7 @@ func SearchByPrefix(s *store.Store, prefix string, opts ...Option) ([]SearchResu
 
 	sortSymbolsForSearch(syms, strings.ToLower(prefix))
 
-	result := make([]SearchResult, 0, len(syms))
-	for _, sym := range syms {
-		result = append(result, SearchResult{
-			QualifiedName: sym.QualifiedName,
-			Kind:          sym.Kind,
-			Signature:     sym.Signature,
-			Doc:           sym.Doc,
-			Receiver:      sym.Receiver,
-			PosFile:       sym.PosFile,
-			PosLine:       sym.PosLine,
-			Exported:      sym.Exported,
-			Generated:     sym.IsGenerated,
-			Repo:          sym.Repo,
-		})
-	}
+	result := searchResultsFromSymbols(syms, options.IncludeFields)
 
 	return filterSearchResults(filterGenerated(result, options.Generated), options.Repo), nil
 }
@@ -981,21 +994,7 @@ func TypeUsage(s *store.Store, typeName string, opts ...Option) ([]SearchResult,
 		return nil, err
 	}
 
-	result := make([]SearchResult, 0, len(syms))
-	for _, sym := range syms {
-		result = append(result, SearchResult{
-			QualifiedName: sym.QualifiedName,
-			Kind:          sym.Kind,
-			Signature:     sym.Signature,
-			Doc:           sym.Doc,
-			Receiver:      sym.Receiver,
-			PosFile:       sym.PosFile,
-			PosLine:       sym.PosLine,
-			Exported:      sym.Exported,
-			Generated:     sym.IsGenerated,
-			Repo:          sym.Repo,
-		})
-	}
+	result := searchResultsFromSymbols(syms, false)
 
 	return filterSearchResults(result, options.Repo), nil
 }
@@ -1133,21 +1132,7 @@ func MethodSearch(s *store.Store, methodName string, opts ...Option) ([]SearchRe
 
 	sortSymbolsForSearch(syms, strings.ToLower(methodName))
 
-	result := make([]SearchResult, 0, len(syms))
-	for _, sym := range syms {
-		result = append(result, SearchResult{
-			QualifiedName: sym.QualifiedName,
-			Kind:          sym.Kind,
-			Signature:     sym.Signature,
-			Doc:           sym.Doc,
-			Receiver:      sym.Receiver,
-			PosFile:       sym.PosFile,
-			PosLine:       sym.PosLine,
-			Exported:      sym.Exported,
-			Generated:     sym.IsGenerated,
-			Repo:          sym.Repo,
-		})
-	}
+	result := searchResultsFromSymbols(syms, options.IncludeFields)
 	return filterSearchResults(filterGenerated(result, options.Generated), options.Repo), nil
 }
 
@@ -1556,21 +1541,7 @@ func SymbolsInFile(s *store.Store, filePath string, opts ...Option) ([]SearchRes
 		return nil, err
 	}
 
-	result := make([]SearchResult, 0, len(syms))
-	for _, sym := range syms {
-		result = append(result, SearchResult{
-			QualifiedName: sym.QualifiedName,
-			Kind:          sym.Kind,
-			Signature:     sym.Signature,
-			Doc:           sym.Doc,
-			Receiver:      sym.Receiver,
-			PosFile:       sym.PosFile,
-			PosLine:       sym.PosLine,
-			Exported:      sym.Exported,
-			Generated:     sym.IsGenerated,
-			Repo:          sym.Repo,
-		})
-	}
+	result := searchResultsFromSymbols(syms, false)
 	return filterSearchResults(result, options.Repo), nil
 }
 
@@ -1725,11 +1696,15 @@ func ListPackages(s *store.Store, opts ...Option) ([]store.Package, error) {
 }
 
 type spanMatch struct {
+	node         ast.Node
 	startOff     int
 	endOff       int
 	docStartOff  int
-	partOfGroup  bool
 	groupMembers int
+	partOfGroup  bool
+	// stale records that the exact-line match failed and the declaration was
+	// re-located by name, so the caller knows the index was behind.
+	stale bool
 }
 
 func matchFuncDecl(d *ast.FuncDecl, fset *token.FileSet, posLine int, receiver, name, kind string) *spanMatch {
@@ -1763,6 +1738,7 @@ func matchFuncDecl(d *ast.FuncDecl, fset *token.FileSet, posLine int, receiver, 
 		docStart = fset.Position(d.Doc.Pos()).Offset
 	}
 	return &spanMatch{
+		node:        d,
 		startOff:    fset.Position(d.Pos()).Offset,
 		endOff:      fset.Position(d.End()).Offset,
 		docStartOff: docStart,
@@ -1803,6 +1779,7 @@ func matchTypeSpec(s *ast.TypeSpec, d *ast.GenDecl, fset *token.FileSet, posLine
 	}
 	startTok, endTok := declRange(fset, d, s, grouped)
 	return &spanMatch{
+		node:         d,
 		startOff:     fset.Position(startTok).Offset,
 		endOff:       fset.Position(endTok).Offset,
 		docStartOff:  typeDocOffset(fset, d, s),
@@ -1831,6 +1808,7 @@ func matchValueSpec(s *ast.ValueSpec, d *ast.GenDecl, fset *token.FileSet, posLi
 		docStart = fset.Position(d.Doc.Pos()).Offset
 	}
 	return &spanMatch{
+		node:         d,
 		startOff:     fset.Position(startTok).Offset,
 		endOff:       fset.Position(endTok).Offset,
 		docStartOff:  docStart,
@@ -1860,21 +1838,34 @@ func matchGenDecl(d *ast.GenDecl, fset *token.FileSet, posLine int, name, kind s
 	return nil
 }
 
-func symbolSpan(filePath string, posLine int, receiver, name, kind string) (startOff, endOff, docStartOff int, partOfGroup bool, groupMembers int, err error) {
-	_, startOff, endOff, docStartOff, partOfGroup, groupMembers, err = symbolSpanData(filePath, posLine, receiver, name, kind)
-	return
+// declSpan is a declaration located in a source file: the file's bytes, the
+// declaration node, and the offsets a caller needs to read or rewrite it.
+type declSpan struct {
+	node         ast.Node
+	data         []byte
+	startOff     int
+	endOff       int
+	docStartOff  int
+	groupMembers int
+	partOfGroup  bool
+	// stale records that the exact-line match failed and the declaration was
+	// re-located by name, so the caller knows the index was behind.
+	stale bool
 }
 
-func symbolSpanData(filePath string, posLine int, receiver, name, kind string) (data []byte, startOff, endOff, docStartOff int, partOfGroup bool, groupMembers int, err error) {
-	data, readErr := os.ReadFile(filePath)
-	if readErr != nil {
-		return nil, 0, 0, 0, false, 0, fmt.Errorf("read source file %s: %w", filePath, readErr)
+// symbolSpan re-parses filePath and returns the declaration matching name and
+// kind, preferring the declaration at posLine and falling back to a name match
+// when the index is stale.
+func symbolSpan(filePath string, posLine int, receiver, name, kind string) (*declSpan, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("read source file %s: %w", filePath, err)
 	}
 
 	fset := token.NewFileSet()
-	f, parseErr := parser.ParseFile(fset, filePath, data, parser.ParseComments)
-	if parseErr != nil {
-		return nil, 0, 0, 0, false, 0, fmt.Errorf("parse source file %s: %w", filePath, parseErr)
+	f, err := parser.ParseFile(fset, filePath, data, parser.ParseComments)
+	if err != nil {
+		return nil, fmt.Errorf("parse source file %s: %w", filePath, err)
 	}
 
 	matchAtLine := func(line int) *spanMatch {
@@ -1893,9 +1884,22 @@ func symbolSpanData(filePath string, posLine int, receiver, name, kind string) (
 		return nil
 	}
 
+	span := func(m *spanMatch) *declSpan {
+		return &declSpan{
+			data:         data,
+			node:         m.node,
+			startOff:     m.startOff,
+			endOff:       m.endOff,
+			docStartOff:  m.docStartOff,
+			partOfGroup:  m.partOfGroup,
+			groupMembers: m.groupMembers,
+			stale:        m.stale,
+		}
+	}
+
 	// Exact-line match first: the fast path when the index is fresh.
 	if m := matchAtLine(posLine); m != nil {
-		return data, m.startOff, m.endOff, m.docStartOff, m.partOfGroup, m.groupMembers, nil
+		return span(m), nil
 	}
 
 	// Name-only fallback: the index may be stale (file edited since indexing),
@@ -1903,20 +1907,21 @@ func symbolSpanData(filePath string, posLine int, receiver, name, kind string) (
 	// file and methods are disambiguated by receiver, so this stays safe.
 	if posLine != 0 {
 		if m := matchAtLine(0); m != nil {
-			return data, m.startOff, m.endOff, m.docStartOff, m.partOfGroup, m.groupMembers, nil
+			m.stale = true
+			return span(m), nil
 		}
 	}
 
-	return nil, 0, 0, 0, false, 0, fmt.Errorf("declaration not found: %s (kind=%s) at line %d in %s", name, kind, posLine, filePath)
+	return nil, fmt.Errorf("declaration not found: %s (kind=%s) at line %d in %s", name, kind, posLine, filePath)
 }
 
 func symbolEndLine(filePath string, posLine int, receiver, name, kind string) (int, error) {
-	data, _, endOff, _, _, _, err := symbolSpanData(filePath, posLine, receiver, name, kind)
+	span, err := symbolSpan(filePath, posLine, receiver, name, kind)
 	if err != nil {
 		return 0, err
 	}
-	lineOffsets := computeLineOffsets(data)
-	return offsetToLine(lineOffsets, endOff), nil
+	lineOffsets := computeLineOffsets(span.data)
+	return offsetToLine(lineOffsets, span.endOff), nil
 }
 
 func genDeclTokForKind(kind string) (token.Token, bool) {
@@ -1967,19 +1972,19 @@ func GetSymbolBody(s *store.Store, qualifiedName string, contextLines int, inclu
 		return nil, err
 	}
 
-	data, startOff, endOff, docStartOff, partOfGroup, groupMembers, err := symbolSpanData(sym.PosFile, sym.PosLine, sym.Receiver, sym.Name, sym.Kind)
+	span, err := symbolSpan(sym.PosFile, sym.PosLine, sym.Receiver, sym.Name, sym.Kind)
 	if err != nil {
 		return nil, err
 	}
 
-	bodyStart := startOff
-	if includeDoc && docStartOff >= 0 {
-		bodyStart = docStartOff
+	bodyStart := span.startOff
+	if includeDoc && span.docStartOff >= 0 {
+		bodyStart = span.docStartOff
 	}
-	body := string(data[bodyStart:endOff])
+	body := string(span.data[bodyStart:span.endOff])
 
-	lineOffsets := computeLineOffsets(data)
-	posEndLine := offsetToLine(lineOffsets, endOff)
+	lineOffsets := computeLineOffsets(span.data)
+	posEndLine := offsetToLine(lineOffsets, span.endOff)
 	posStartLine := offsetToLine(lineOffsets, bodyStart)
 
 	var before, after string
@@ -1987,13 +1992,13 @@ func GetSymbolBody(s *store.Store, qualifiedName string, contextLines int, inclu
 		startLineIdx := max(posStartLine-1-contextLines, 0)
 		endLineIdx := posStartLine - 1
 		if endLineIdx >= 0 && startLineIdx <= endLineIdx {
-			before = sliceLines(data, lineOffsets, startLineIdx, endLineIdx)
+			before = sliceLines(span.data, lineOffsets, startLineIdx, endLineIdx)
 		}
 
 		afterStart := posEndLine
 		afterEnd := posEndLine - 1 + contextLines
 		if afterStart < len(lineOffsets) && afterEnd < len(lineOffsets) {
-			after = sliceLines(data, lineOffsets, afterStart, afterEnd)
+			after = sliceLines(span.data, lineOffsets, afterStart, afterEnd)
 		}
 	}
 
@@ -2004,8 +2009,8 @@ func GetSymbolBody(s *store.Store, qualifiedName string, contextLines int, inclu
 		PosLine:       sym.PosLine,
 		PosEndLine:    posEndLine,
 		Body:          body,
-		PartOfGroup:   partOfGroup,
-		GroupMembers:  groupMembers,
+		PartOfGroup:   span.partOfGroup,
+		GroupMembers:  span.groupMembers,
 		ContextBefore: before,
 		ContextAfter:  after,
 	}, nil
@@ -2666,11 +2671,11 @@ func readChangedBody(filePath, name, kind, receiver string, posLine int, include
 	if !include {
 		return "", nil
 	}
-	data, startOff, endOff, _, _, _, spanErr := symbolSpanData(filePath, posLine, receiver, name, kind)
+	span, spanErr := symbolSpan(filePath, posLine, receiver, name, kind)
 	if spanErr != nil {
 		return "", fmt.Errorf("changed_symbols: body for %s in %s: %w", name, filePath, spanErr)
 	}
-	return string(data[startOff:endOff]), nil
+	return string(span.data[span.startOff:span.endOff]), nil
 }
 
 func incSummary(ct string, result *ChangedSymbolsResult) {

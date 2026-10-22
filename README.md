@@ -116,6 +116,8 @@ Unlike the CLI, the MCP server keeps itself fresh: it indexes the repo automatic
 
 Tools: `reindex`, `health`, `summary`, `overview`, `schema`, `stats`, `show`, `search`, `package`, `methods_of`, `symbols_in_file`, `callers_of`, `callees_of`, `imports_of`, `all_edges`, `find_path`, `cycles`, `dependency_flow`, `blast_radius`, `type_usage`, `interface_impls`, `entry_points`, `unused`, `search_text`, `pattern`, `get_context_bundle`, `diagnostics`, `changed_symbols`, `get_hotspots`, `contracts`, `contract_drift`, `runtime_contracts`, `suppress_contract`, `read_response_section`.
 
+The server is read-only unless started with `serve --allow-write`. With that flag it also exposes four mutating tools — `replace_symbol_body`, `insert_before_symbol`, `insert_after_symbol`, `safe_delete_symbol` — which anchor edits to a symbol's declaration span instead of line numbers, refuse input that would leave the file unparseable, write atomically, and reindex afterwards. Without the flag each returns a refusal naming it.
+
 Responses over 16 KiB are stored and replaced by a searchable section manifest, so a large result never floods the context window; `read_response_section` pulls back only the sections you need. Override the threshold with `CODEMAP_RESPONSE_LIMIT`.
 
 ### Init Command
@@ -175,6 +177,7 @@ codemap <command> [args] [flags]
 | `--min-complexity <n>` / `--min-churn <n>` | Minimum thresholds (for `hotspots`) |
 | `--workspace` | Index as a workspace (with `index`) |
 | `--discover` | Auto-discover sibling Go modules as a workspace (with `index --workspace`) |
+| `--allow-write` | Let the MCP server modify source files (with `serve`; off by default) |
 | `--severity <level>` | Filter contract results by severity: compatible/breaking/unknown (for `contracts` and `contract-drift`) |
 | `--direction <dir>` / `--min-confidence <f>` | Filter contract results by direction (producer/consumer/shared) and minimum confidence (for `contracts`) |
 

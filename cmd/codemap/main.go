@@ -53,6 +53,7 @@ type parsedFlags struct {
 	regex             bool
 	workspace         bool
 	discover          bool
+	allowWrite        bool
 	formatSet         bool
 }
 
@@ -110,6 +111,8 @@ func handleFlag(arg string, args []string, i int, flags *parsedFlags) (bool, int
 		flags.workspace = true
 	case "--discover":
 		flags.discover = true
+	case "--allow-write":
+		flags.allowWrite = true
 	default:
 		return handleValueFlags(arg, args, i, flags)
 	}
@@ -273,7 +276,7 @@ func dispatchCommand(cmd string, args []string, flags parsedFlags, queryOpts []q
 			return err
 		}
 	case "serve", "mcp":
-		cmdServe(flags.dbPath)
+		cmdServe(flags.dbPath, flags.allowWrite)
 	case "workspace":
 		return cmdWorkspace(args, flags.dbPath, flags, renderOpts)
 	default:
@@ -952,8 +955,11 @@ func cmdInit() {
 	}
 }
 
-func cmdServe(dbPath string) {
+func cmdServe(dbPath string, allowWrite bool) {
 	server := mcp.NewLazy(dbPath)
+	if allowWrite {
+		server = server.WithWrite()
+	}
 	if err := server.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "MCP server error: %v\n", err)
 		return
@@ -1093,6 +1099,7 @@ func printUsageFlags() {
 	fmt.Println("  --min-churn <n>           Minimum churn (for hotspots)")
 	fmt.Println("  --workspace               Index as a workspace (with index)")
 	fmt.Println("  --discover                Auto-discover sibling Go modules as a workspace (with index --workspace)")
+	fmt.Println("  --allow-write             Let the MCP server modify source files (with serve; off by default)")
 }
 
 func parseBool(s string) *bool {

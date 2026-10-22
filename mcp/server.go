@@ -51,7 +51,11 @@ type Server struct {
 	failedIndexBackoff time.Duration
 
 	// State mutated during dispatch; guarded by mu.
-	mu             sync.Mutex
+	mu sync.Mutex
+
+	// writeEnabled gates every mutating tool; the server is read-only by default.
+	writeEnabled bool
+
 	hasContractCfg bool
 }
 
@@ -93,6 +97,13 @@ func NewLazy(dbPath string) *Server {
 		failedIndexBackoff: defaultFailedIndexBackoff,
 		usage:              newUsageStats(),
 	}
+}
+
+// WithWrite enables the mutating tools. Off by default: a server that can edit
+// source must be opted into at startup, not by a per-call argument.
+func (s *Server) WithWrite() *Server {
+	s.writeEnabled = true
+	return s
 }
 
 // ttl returns the configured freshness TTL; zero means the default, negative
@@ -507,6 +518,20 @@ func (s *Server) handleToolsCall(id json.RawMessage, msg map[string]json.RawMess
 
 type toolHandler func(*store.Store, []query.Option, []render.Option, map[string]any) (string, any, bool)
 
+// handleSpecialTool serves the tools that bypass the query handler map. The
+// third return reports whether name was one of them.
+func (s *Server) handleSpecialTool(name string, args map[string]any) (string, bool, bool) {
+	switch name {
+	case "reindex":
+		msg, isErr := s.handleIndex(args)
+		return msg, isErr, true
+	case "schema":
+		return handleSchema(), false, true
+	default:
+		return "", false, false
+	}
+}
+
 func (s *Server) handleTool(name string, args map[string]any) (string, bool) {
 	// record closes over this call's tool name so every return path counts
 	// exactly once, on the rendered payload the call produced.
@@ -520,21 +545,15 @@ func (s *Server) handleTool(name string, args map[string]any) (string, bool) {
 	}
 	// reindex is spelled "index" on the CLI; the MCP name avoids colliding with
 	// a host agent's own file-skeleton tool of the same name.
-	if name == "reindex" {
-		msg, isErr := s.handleIndex(args)
-		record(nil, msg, isErr)
-		return msg, isErr
-	}
-	if name == "schema" {
-		out := handleSchema()
-		record(nil, out, false)
-		return out, false
-	}
 	if name == "stats" {
 		// The report must stay byte-identical across repeat calls with
 		// identical usage, so stats does not record itself: a growing
 		// self-row would differ between consecutive calls.
 		return renderUsageStats(s.usage), false
+	}
+	if msg, isErr, handled := s.handleSpecialTool(name, args); handled {
+		record(nil, msg, isErr)
+		return msg, isErr
 	}
 	if name == "changed_symbols" {
 		dir := "."
@@ -544,6 +563,11 @@ func (s *Server) handleTool(name string, args map[string]any) (string, bool) {
 		if _, err := s.allowedTarget(dir); err != nil {
 			return fail("Error: %v", err)
 		}
+	}
+	// The write gate runs before argument validation and before any store or
+	// file read, so a read-only server never touches the target file.
+	if writeTools[name] && !s.writeEnabled {
+		return fail("%s", writeRefusal(name))
 	}
 	if err := validateToolArgs(name, args); err != nil {
 		return fail("Error: %v", err)
@@ -557,6 +581,9 @@ func (s *Server) handleTool(name string, args map[string]any) (string, bool) {
 	opts, renderOpts := s.buildOptions(args)
 
 	handler, ok := s.toolHandlers()[name]
+	if !ok {
+		handler, ok = s.writeHandlers()[name]
+	}
 	if !ok {
 		return fail("Error: unknown tool %s", name)
 	}
@@ -620,6 +647,7 @@ func queryHandlers() map[string]toolHandler {
 		"diagnostics":       handleDiagnostics,
 		toolCycles:          handleCycles,
 		"symbols_in_file":   handleSymbolsInFile,
+		toolFindDeclaration: handleFindDeclaration,
 		toolBlastRadius:     handleBlastRadius,
 		"dependency_flow":   handleDependencyFlow,
 		"entry_points":      handleEntryPoints,
@@ -760,6 +788,9 @@ func handleSearch(st *store.Store, opts []query.Option, renderOpts []render.Opti
 	if v, ok := args[keyGenerated].(string); ok && v != "" {
 		opts = append(opts, query.WithGenerated(store.GeneratedFilter(v)))
 	}
+	if b, ok := args[keyIncludeFields].(bool); ok && b {
+		opts = append(opts, query.WithFields())
+	}
 	var results []query.SearchResult
 	var err error
 	switch mode {
@@ -801,6 +832,9 @@ func handlePackage(st *store.Store, opts []query.Option, renderOpts []render.Opt
 	}
 	if b, ok := args["include_unexported"].(bool); ok && b {
 		opts = append(opts, query.WithUnexported())
+	}
+	if b, ok := args[keyIncludeFields].(bool); ok && b {
+		opts = append(opts, query.WithFields())
 	}
 	result, err := query.Package(st, pkgPath, opts...)
 	if err != nil {
@@ -978,6 +1012,37 @@ func handleSymbolsInFile(st *store.Store, opts []query.Option, renderOpts []rend
 		return fmt.Sprintf("Error: %v", err), nil, true
 	}
 	return render.RenderSearch(results, renderOpts...), results, false
+}
+
+// handleFindDeclaration resolves a position or a name occurrence to the indexed
+// symbol it belongs to. It is read-only, so it stays available with write mode
+// off.
+func handleFindDeclaration(st *store.Store, _ []query.Option, _ []render.Option, args map[string]any) (string, any, bool) {
+	filePath := requiredString(args, keyFilePath)
+	if filePath == "" {
+		return "Error: file_path is required", nil, true
+	}
+	line := 0
+	if v, ok := args[keyLine].(float64); ok {
+		line = int(v)
+	}
+	col := 0
+	if v, ok := args["column"].(float64); ok {
+		col = int(v)
+	}
+	symbol := requiredString(args, keySymbol)
+	if line == 0 && symbol == "" {
+		return "Error: pass either line (position mode) or symbol (occurrence mode)", nil, true
+	}
+	result, err := query.FindDeclaration(st, filePath, line, col, symbol)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err), nil, true
+	}
+	data, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err), nil, true
+	}
+	return string(data), result, false
 }
 
 func handleBlastRadius(st *store.Store, opts []query.Option, renderOpts []render.Option, args map[string]any) (string, any, bool) {
@@ -1366,15 +1431,16 @@ const (
 )
 
 const (
-	toolBlastRadius    = "blast_radius"
-	toolCallersOf      = "callers_of"
-	toolCalleesOf      = "callees_of"
-	toolContextBundle  = "get_context_bundle"
-	toolContracts      = "contracts"
-	toolCycles         = "cycles"
-	toolShow           = "show"
-	toolHotspots       = "get_hotspots"
-	importDirectionOut = "out"
+	toolBlastRadius     = "blast_radius"
+	toolCallersOf       = "callers_of"
+	toolCalleesOf       = "callees_of"
+	toolContextBundle   = "get_context_bundle"
+	toolContracts       = "contracts"
+	toolCycles          = "cycles"
+	toolFindDeclaration = "find_declaration"
+	toolShow            = "show"
+	toolHotspots        = "get_hotspots"
+	importDirectionOut  = "out"
 )
 
 var (
@@ -1610,9 +1676,16 @@ const (
 	keySource        = "source"
 	keyGenerated     = "generated"
 	keyIncludeDoc    = "include_doc"
+	keyIncludeFields = "include_fields"
+	keyFields        = "fields"
 	keyTransitive    = "transitive"
 	keyLayers        = "layers"
 	keyWorkspace     = "workspace"
+)
+
+const (
+	descSymbolFieldsShow  = "[]SymbolField — struct fields {go_name, wire_name, go_type}; present only for struct types (and same-package struct aliases), omitted otherwise"
+	descSymbolFieldsOptIn = "[]SymbolField — struct fields {go_name, wire_name, go_type}; present only when include_fields=true (default false) and the symbol is a struct, omitted otherwise"
 )
 
 const (
@@ -1646,6 +1719,7 @@ var returnTypeSchemas = map[string]any{
 		keyPosFile:       descSourceFilePath,
 		keyPosLine:       "int — line number in source file",
 		keyExported:      "bool — whether the symbol is exported (capitalized)",
+		keyFields:        descSymbolFieldsShow,
 	},
 	"EdgeDetail": map[string]any{
 		keyFromRef:   descSourceSymbolQN,
@@ -1669,6 +1743,12 @@ var returnTypeSchemas = map[string]any{
 		keyPosFile:       descSourceFilePath,
 		keyPosLine:       descLineNumber,
 		keyExported:      "bool — whether exported",
+		keyFields:        descSymbolFieldsOptIn,
+	},
+	"SymbolField": map[string]any{
+		"go_name":   "string — Go field name (embedded fields use the embedded type expression)",
+		"wire_name": "string — effective serialization name (first of cbor, json, yaml, toml, bson, db; options stripped), else go_name",
+		"go_type":   "string — field type expression as written in source",
 	},
 	"ShowResult": map[string]any{
 		keySymbol:        "SymbolDetail — the symbol being shown",
@@ -1684,7 +1764,7 @@ var returnTypeSchemas = map[string]any{
 	"PackageResult": map[string]any{
 		keyPath:            "string — package import path",
 		keyName:            "string — package name",
-		"exported_symbols": "[]SymbolDetail — exported symbols",
+		"exported_symbols": "[]SymbolDetail — exported symbols; struct entries carry fields only when include_fields is true (default false)",
 		"import_count":     "int — number of imports",
 	},
 	"EdgeTypes": map[string]any{
@@ -1808,7 +1888,7 @@ var returnTypeSchemas = map[string]any{
 		keyFromRef:   descSourceSymbolQN,
 		keyToRef:     descTargetSymbolQN,
 		keySeverity:  "string — compatible, breaking, or unknown",
-		"fields":     "[]DriftField — field-level divergence details",
+		keyFields:    "[]DriftField — field-level divergence details",
 		keyEvidence:  descEvidence,
 		keyIndexedAt: descIndexedAt,
 		keyRepo:      descRepoModulePath,
@@ -1992,6 +2072,7 @@ func buildToolsList() []map[string]any {
 	tools = append(tools, queryTools()...)
 	tools = append(tools, sourceTools()...)
 	tools = append(tools, shapeTools()...)
+	tools = append(tools, writeToolsList()...)
 	tools = append(tools, statsTools()...)
 	return tools
 }
@@ -2076,6 +2157,7 @@ func symbolTools() []map[string]any {
 			map[string]any{
 				keyPath:              stringProp("Package import path; omit to list all packages"),
 				"include_unexported": boolProp("Include unexported symbols"),
+				keyIncludeFields:     boolProp("Attach struct fields (go_name, wire_name, go_type) to struct symbols; default false"),
 				keyIncludeTests:      boolProp("Include test packages (list mode only)"),
 				keyRepo:              repoProp(),
 			}),
@@ -2089,14 +2171,15 @@ func symbolTools() []map[string]any {
 		toolDef("search",
 			"Search Go symbols (functions, types, methods, interfaces, consts, vars): qualified names, file:line, signatures, docs. mode: substring (default) matches anywhere, prefix matches qualified-name starts, method finds methods with that name across all types. Generated and test symbols are down-ranked (never hidden) behind hand-written ones unless filtered.\n\nMatching spans every indexed field, not only the name: qualified_name, name, kind, receiver, signature and doc. A const's signature is its full literal value, so a short pattern can match a large const body and return a wide result; narrow with kind or exported. Responses over 16 KiB come back as a section manifest instead of the full text.",
 			map[string]any{
-				keyPattern:      stringProp("Pattern (case-insensitive; matches name, signature, doc, receiver, kind, not just the name)"),
-				keyMode:         stringProp("substring (default), prefix, or method"),
-				keyIncludeTests: boolProp("Include test packages and symbols"),
-				keyKind:         stringProp("Symbol kind filter (substring mode)"),
-				"exported":      boolProp("true = exported-only, false = unexported-only (substring mode)"),
-				keyFile:         stringProp("File-path substring filter (substring mode)"),
-				keyGenerated:    stringProp("any (default), exclude, or only — generated-code handling; matches are down-ranked, not hidden"),
-				keyRepo:         repoProp(),
+				keyPattern:       stringProp("Pattern (case-insensitive; matches name, signature, doc, receiver, kind, not just the name)"),
+				keyMode:          stringProp("substring (default), prefix, or method"),
+				keyIncludeTests:  boolProp("Include test packages and symbols"),
+				keyKind:          stringProp("Symbol kind filter (substring mode)"),
+				"exported":       boolProp("true = exported-only, false = unexported-only (substring mode)"),
+				keyFile:          stringProp("File-path substring filter (substring mode)"),
+				keyGenerated:     stringProp("any (default), exclude, or only — generated-code handling; matches are down-ranked, not hidden"),
+				keyIncludeFields: boolProp("Attach struct fields (go_name, wire_name, go_type) to struct results; default false"),
+				keyRepo:          repoProp(),
 			},
 			"pattern"),
 	}
@@ -2276,6 +2359,15 @@ func intProp(desc string) map[string]any {
 
 func sourceTools() []map[string]any {
 	return []map[string]any{
+		toolDef(toolFindDeclaration,
+			"Resolve a source position or a name occurrence to the indexed symbol it belongs to: pass file_path plus line (optionally column) for position mode, or file_path plus symbol for occurrence mode. Returns the qualified name, kind, and declaration file:line. Read-only; available with write mode off.",
+			map[string]any{
+				keyFilePath: stringProp("Source file path as recorded in the index"),
+				keyLine:     intProp("1-based line for position mode"),
+				"column":    intProp("Optional 1-based column, refining the position"),
+				keySymbol:   stringProp("Name occurring in the file, for occurrence mode"),
+			},
+			keyFilePath),
 		toolDef("changed_symbols",
 			"Working-tree changed symbols vs a git ref (default main), classified by change_type, optionally with blast_radius and source body; workspace: true diffs every member repo. Renamed files are listed separately as from -> to, since a symbol's PosFile is the new path while callers still reference the old one.",
 			map[string]any{
