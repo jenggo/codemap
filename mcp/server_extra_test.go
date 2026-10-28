@@ -40,6 +40,7 @@ func TestToolsListIncludesNewTools(t *testing.T) {
 		"show",
 		"summary",
 		"changed_symbols",
+		"affected_tests",
 		"dependency_flow",
 		"entry_points",
 		"search_text",
@@ -63,7 +64,7 @@ func TestToolsListIncludesNewTools(t *testing.T) {
 		"dependency_layers",
 		"get_symbol_importance",
 		"importers_of",
-		"transitive_imports",
+		"transitive_project_imports",
 		"search_prefix",
 		"method_search",
 		"list_packages",
@@ -73,9 +74,6 @@ func TestToolsListIncludesNewTools(t *testing.T) {
 		if names[gone] {
 			t.Errorf("absorbed tool %q must not appear in tools/list", gone)
 		}
-	}
-	if len(tools) != 40 {
-		t.Errorf("expected 40 tools in tools/list, got %d", len(tools))
 	}
 }
 

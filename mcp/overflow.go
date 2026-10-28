@@ -189,6 +189,12 @@ func searchResponseSections(st *store.Store, id, query string, limit int) (strin
 	return b.String(), nil, false
 }
 
+// readAllResponseSections returns every section in order, stopping once the
+// output would exceed the response limit. Concatenating a whole oversized
+// payload reproduced it above the limit, so the gate stored the read-back as a
+// new manifest: the manifest's own "returns every section" promise produced
+// another manifest, and reading a large result needed one call per section.
+// The tail is named instead of gated.
 func readAllResponseSections(st *store.Store, id string) (string, any, bool) {
 	sections, err := st.ResponseSections(id, nil)
 	if err != nil {
@@ -197,13 +203,56 @@ func readAllResponseSections(st *store.Store, id string) (string, any, bool) {
 		}
 		return fmt.Sprintf("Error: %v", err), nil, true
 	}
+	limit := responseLimit()
+	// Measure the stop notice before spending the budget, so appending it
+	// cannot push the result back over the limit the notice is there to respect.
+	notice := stopNotice(0, len(sections), limit, id)
+	budget := limit - len(notice)
 	var b strings.Builder
-	for _, sec := range sections {
-		fmt.Fprintf(&b, "section %d: %s — %d bytes\n\n", sec.SectionIdx, sec.Title, sec.ByteCount)
+	for i, sec := range sections {
+		header := fmt.Sprintf("section %d: %s — %d bytes\n\n", sec.SectionIdx, sec.Title, sec.ByteCount)
+		if b.Len()+len(header)+len(sec.Content) > budget {
+			if i == 0 {
+				// The first section alone exceeds the budget. Writing it whole
+				// reproduced an oversized payload, which the gate then stored as
+				// a new manifest — reading a large result cost one call per
+				// section. Truncate it instead and name the section to fetch.
+				b.WriteString(header)
+				b.WriteString(truncateUTF8(sec.Content, budget-b.Len()))
+				fmt.Fprintf(&b, "\n… truncated; read the whole section with {\"response_id\": %q, \"section\": %d}.\n", id, sec.SectionIdx)
+				return b.String(), nil, false
+			}
+			b.WriteString(stopNotice(i-1, len(sections), limit, id))
+			break
+		}
+		b.WriteString(header)
 		b.WriteString(sec.Content)
 		b.WriteString("\n\n")
 	}
 	return b.String(), nil, false
+}
+
+// truncateUTF8 cuts s to at most limit bytes without splitting a rune.
+func truncateUTF8(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	cut := s[:max(limit, 0)]
+	for len(cut) > 0 {
+		r, size := utf8.DecodeLastRuneInString(cut)
+		if r != utf8.RuneError || size > 1 {
+			break
+		}
+		cut = cut[:len(cut)-1]
+	}
+	return cut
+}
+
+// stopNotice names the last section included and the call that resumes.
+func stopNotice(last, total, limit int, id string) string {
+	return fmt.Sprintf("… stopped after section %d of %d to stay within the %d byte response limit. "+
+		"Read the rest with {\"response_id\": %q, \"section\": N} or narrow it with {\"query\": \"keyword\"}.\n",
+		last, total, limit, id)
 }
 
 func unknownResponseError(id string) string {

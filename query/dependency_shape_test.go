@@ -138,7 +138,7 @@ func TestDependencyFlowFixture(t *testing.T) {
 	if !hasTopImporter {
 		t.Errorf("expected top as importer, got %v", sortedKeys(importers))
 	}
-	if len(result.TransitiveImports) == 0 {
+	if len(result.TransitiveProjectImports) == 0 {
 		t.Error("expected non-empty transitive imports")
 	}
 }

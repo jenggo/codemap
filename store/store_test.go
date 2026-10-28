@@ -9,8 +9,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"codemap/vcs"
 )
 
 func TestHealthRoundTrip(t *testing.T) {
@@ -39,7 +37,7 @@ func TestHealthRoundTrip(t *testing.T) {
 	}
 }
 
-func TestHealthDirtyProvenance(t *testing.T) {
+func TestHealthStaleOnSourceChange(t *testing.T) {
 	repo := filepath.Join(t.TempDir(), "repo")
 	head := initGitRepo(t, repo)
 
@@ -54,13 +52,14 @@ func TestHealthDirtyProvenance(t *testing.T) {
 	if err := s.SetIndexedAt(time.Now()); err != nil {
 		t.Fatal(err)
 	}
+	s.RecordSourceFingerprint("", repo, nil)
 
 	h, err := s.Health()
 	if err != nil {
 		t.Fatalf("Health: %v", err)
 	}
-	if h.Dirty || h.DirtyIndexed {
-		t.Fatalf("clean tree: got dirty=%t indexed=%t", h.Dirty, h.DirtyIndexed)
+	if h.Stale {
+		t.Fatal("unchanged source must not be stale")
 	}
 
 	if err := os.WriteFile(filepath.Join(repo, "a.go"), []byte("package a\n\nvar X = 1\n"), 0o644); err != nil {
@@ -70,25 +69,8 @@ func TestHealthDirtyProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Health: %v", err)
 	}
-	if !h.Dirty || h.DirtyIndexed {
-		t.Fatalf("unseen dirty tree: got dirty=%t indexed=%t", h.Dirty, h.DirtyIndexed)
-	}
-
-	// Record the fingerprint, as a rebuild does.
-	_, fp, derr := vcs.GitDirtyDiff(repo, "HEAD")
-	if derr != nil {
-		t.Fatal(derr)
-	}
-	if err := s.SetDirtyFingerprint("", fp); err != nil {
-		t.Fatal(err)
-	}
-
-	h, err = s.Health()
-	if err != nil {
-		t.Fatalf("Health: %v", err)
-	}
-	if !h.Dirty || !h.DirtyIndexed {
-		t.Fatalf("indexed dirty tree: got dirty=%t indexed=%t", h.Dirty, h.DirtyIndexed)
+	if !h.Stale {
+		t.Fatal("edited source must be stale")
 	}
 }
 
@@ -130,8 +112,8 @@ func TestSQLiteConcurrencyConfig(t *testing.T) {
 	if err := s.db.QueryRowContext(context.Background(), "PRAGMA busy_timeout").Scan(&timeout); err != nil {
 		t.Fatal(err)
 	}
-	if timeout != 5000 {
-		t.Fatalf("busy_timeout = %d, want 5000", timeout)
+	if timeout != 10000 {
+		t.Fatalf("busy_timeout = %d, want 10000", timeout)
 	}
 	var journalMode string
 	if err := s.db.QueryRowContext(context.Background(), "PRAGMA journal_mode").Scan(&journalMode); err != nil {
@@ -142,6 +124,19 @@ func TestSQLiteConcurrencyConfig(t *testing.T) {
 	}
 	if got := s.db.Stats().MaxOpenConnections; got != 1 {
 		t.Fatalf("max open connections = %d, want 1", got)
+	}
+
+	// A transaction must take the write lock at BEGIN. With deferred mode two
+	// processes can both start as readers and deadlock on upgrade, which
+	// busy_timeout cannot break out of; the caller sees SQLITE_BUSY.
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(context.Background(),
+		`INSERT OR REPLACE INTO meta (key, value) VALUES ('txlock_probe', '1')`); err != nil {
+		t.Fatalf("write inside transaction: %v", err)
 	}
 }
 
@@ -180,20 +175,16 @@ func TestRepoIdentityMismatch(t *testing.T) {
 	}
 
 	if mismatch, known := repoIdentityMismatch(dbPath, repo); !known || mismatch {
-		t.Fatalf("expected known match for same repo+head, got mismatch=%v known=%v", mismatch, known)
+		t.Fatalf("expected known match for same repo, got mismatch=%v known=%v", mismatch, known)
 	}
 	if mismatch, known := repoIdentityMismatch(dbPath, filepath.Join(t.TempDir(), "other")); !known || !mismatch {
 		t.Fatalf("expected mismatch for different repo path, got mismatch=%v known=%v", mismatch, known)
 	}
-
-	if err := s.SetRepoMeta(repo, "deadbeef", 1, 1); err != nil {
-		t.Fatal(err)
-	}
-	if mismatch, known := repoIdentityMismatch(dbPath, repo); !known || !mismatch {
-		t.Fatalf("expected mismatch for different head, got mismatch=%v known=%v", mismatch, known)
-	}
 }
 
+// TestIsStaleOnHeadChange verifies freshness follows content, not commits: an
+// empty commit leaves the index current, and the same source committed on a new
+// HEAD is still the same source.
 func TestIsStaleOnHeadChange(t *testing.T) {
 	repo := filepath.Join(t.TempDir(), "repo")
 	head := initGitRepo(t, repo)
@@ -207,6 +198,7 @@ func TestIsStaleOnHeadChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	markIndexed(t, s, time.Now())
+	s.RecordSourceFingerprint("", repo, nil)
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -231,14 +223,14 @@ func TestIsStaleOnHeadChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !stale {
-		t.Fatal("expected stale after HEAD change")
+	if stale {
+		t.Fatal("an empty commit changes no source and must not invalidate the index")
 	}
 }
 
-// TestIsStaleOnUncommittedChanges verifies the git-diff staleness signal: an
-// uncommitted .go edit that preserves its mtime (as git apply/checkout can)
-// must still mark the database stale, because mtime-only checks would miss it.
+// TestIsStaleOnUncommittedChanges verifies an uncommitted .go edit is stale even
+// when its mtime is unchanged (as git apply/checkout can leave it): the source
+// bytes, not the timestamp, decide.
 func TestIsStaleOnUncommittedChanges(t *testing.T) {
 	repo := filepath.Join(t.TempDir(), "repo")
 	head := initGitRepo(t, repo)
@@ -252,6 +244,7 @@ func TestIsStaleOnUncommittedChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	markIndexed(t, s, time.Now())
+	s.RecordSourceFingerprint("", repo, nil)
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -268,8 +261,7 @@ func TestIsStaleOnUncommittedChanges(t *testing.T) {
 	if err := os.WriteFile(file, []byte("package a\n\nvar X = 1\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Age the file so the mtime check cannot be the deciding signal; only the
-	// git diff against HEAD can catch this edit.
+	// Age the file so no mtime signal exists; only content can decide.
 	past := time.Now().Add(-time.Hour)
 	if err := os.Chtimes(file, past, past); err != nil {
 		t.Fatal(err)
@@ -282,8 +274,8 @@ func TestIsStaleOnUncommittedChanges(t *testing.T) {
 	if !stale {
 		t.Fatal("expected stale after uncommitted .go edit")
 	}
-	if !strings.Contains(reason, "uncommitted") {
-		t.Fatalf("expected reason to mention uncommitted changes, got %q", reason)
+	if !strings.Contains(reason, "source") {
+		t.Fatalf("expected reason to mention source, got %q", reason)
 	}
 }
 
@@ -401,11 +393,11 @@ func TestBadTimestampSurfacesError(t *testing.T) {
 	}
 }
 
-// TestIsStaleFingerprintPreventsReindexLoop verifies that a working tree with
-// uncommitted .go changes is only stale while its dirty state is unseen: once
-// the index records the exact dirty-state fingerprint, the index is current
-// until the working tree changes again. Without this, a legitimately dirty
-// dev tree would trigger a reindex after every query.
+// TestIsStaleFingerprintPreventsReindexLoop verifies that a working tree edited
+// after indexing is stale exactly once: once the index records the source
+// fingerprint of those edits, the index is current until the source changes
+// again. Without this, a legitimately dirty dev tree would reindex after every
+// query.
 func TestIsStaleFingerprintPreventsReindexLoop(t *testing.T) {
 	repo := filepath.Join(t.TempDir(), "repo")
 	head := initGitRepo(t, repo)
@@ -430,7 +422,7 @@ func TestIsStaleFingerprintPreventsReindexLoop(t *testing.T) {
 		}
 	}
 
-	// Unseen uncommitted edit (aged mtime so only the git-diff signal fires).
+	// Unseen edit, aged mtime so only content can decide.
 	if err := os.WriteFile(file, []byte("package a\n\nvar X = 1\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -441,30 +433,24 @@ func TestIsStaleFingerprintPreventsReindexLoop(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !stale {
-		t.Fatal("expected stale for unseen uncommitted edit")
+		t.Fatal("expected stale for unseen edit")
 	}
-	if !strings.Contains(reason, "uncommitted") {
-		t.Fatalf("expected uncommitted reason, got %q", reason)
+	if !strings.Contains(reason, "source") {
+		t.Fatalf("expected source reason, got %q", reason)
 	}
 
 	// Record the fingerprint, as the rebuilt index writer now does.
-	_, fp, derr := vcs.GitDirtyDiff(repo, "HEAD")
-	if derr != nil {
-		t.Fatal(derr)
-	}
-	if err := s.SetDirtyFingerprint("", fp); err != nil {
-		t.Fatal(err)
-	}
+	s.RecordSourceFingerprint("", repo, nil)
 
 	stale, reason, err = StaleReason(dbPath, repo)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if stale {
-		t.Fatalf("expected fresh for already-indexed dirty state, got %q", reason)
+		t.Fatalf("expected fresh for already-indexed source, got %q", reason)
 	}
 
-	// The dirty state changes -> stale again.
+	// The source changes -> stale again.
 	if err := os.WriteFile(file, []byte("package a\n\nvar X = 2\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -475,16 +461,107 @@ func TestIsStaleFingerprintPreventsReindexLoop(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !stale {
-		t.Fatal("expected stale after dirty state changed")
+		t.Fatal("expected stale after source changed")
 	}
-	if !strings.Contains(reason, "uncommitted") {
-		t.Fatalf("expected uncommitted reason, got %q", reason)
+	if !strings.Contains(reason, "source") {
+		t.Fatalf("expected source reason, got %q", reason)
 	}
 }
 
-// TestIsStaleOnNewerMtime verifies the mtime fallback still fires when git is
-// unavailable or clean but a .go file is newer than the last index.
-func TestIsStaleOnNewerMtime(t *testing.T) {
+// TestIsStaleOnRename verifies the fingerprint covers paths, not only contents:
+// renaming a file leaves the same bytes in the tree but changes which package
+// they belong to. git is absent here, so this also covers the non-repo case.
+func TestIsStaleOnRename(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "nonrepo")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(dir, "a.go")
+	if err := os.WriteFile(src, []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := Create(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	markIndexed(t, s, time.Now())
+	s.RecordSourceFingerprint("", dir, nil)
+
+	stale, reason, err := StaleReason(dbPath, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale {
+		t.Fatalf("expected fresh for unchanged tree, got %q", reason)
+	}
+
+	if err := os.Rename(src, filepath.Join(dir, "b.go")); err != nil {
+		t.Fatal(err)
+	}
+
+	stale, reason, err = StaleReason(dbPath, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stale {
+		t.Fatal("expected stale after a .go file was renamed")
+	}
+	if !strings.Contains(reason, "source") {
+		t.Fatalf("expected source reason, got %q", reason)
+	}
+}
+
+// TestIsStaleOnAddedFile verifies an added .go file makes the index stale even
+// though no indexed file changed.
+func TestIsStaleOnAddedFile(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "nonrepo")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := Create(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	markIndexed(t, s, time.Now())
+	s.RecordSourceFingerprint("", dir, nil)
+
+	stale, reason, err := StaleReason(dbPath, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale {
+		t.Fatalf("expected fresh for unchanged tree, got %q", reason)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "b.go"), []byte("package a\n\nvar Y = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stale, reason, err = StaleReason(dbPath, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stale {
+		t.Fatal("expected stale after a .go file was added")
+	}
+	if !strings.Contains(reason, "source") {
+		t.Fatalf("expected source reason, got %q", reason)
+	}
+}
+
+// TestIsStaleOnTouch verifies a touched-but-unchanged file does not invalidate
+// the index: mtime is not an input to the fingerprint. This is the case the old
+// mtime scan got wrong, and the one formatter/editor saves produce constantly.
+func TestIsStaleOnTouch(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "nonrepo")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
@@ -499,13 +576,10 @@ func TestIsStaleOnNewerMtime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = s.Close() }()
 	markIndexed(t, s, time.Now())
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
+	s.RecordSourceFingerprint("", dir, nil)
 
-	// Bump the file's mtime into the future, strictly after the recorded
-	// indexed_at, so only the mtime signal can decide staleness.
 	future := time.Now().Add(time.Minute)
 	if err := os.Chtimes(file, future, future); err != nil {
 		t.Fatal(err)
@@ -515,11 +589,8 @@ func TestIsStaleOnNewerMtime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !stale {
-		t.Fatal("expected stale when .go mtime is newer than the index")
-	}
-	if !strings.Contains(reason, "never indexed") && !strings.Contains(reason, "newer than the last index") {
-		t.Fatalf("expected a meaningful staleness reason, got %q", reason)
+	if stale {
+		t.Fatalf("touching a file must not invalidate the index, got %q", reason)
 	}
 }
 
@@ -538,8 +609,7 @@ func initGitRepo(t *testing.T, dir string) string {
 	git("config", "user.email", "test@example.com")
 	git("config", "user.name", "test")
 
-	// Age the file so the RFC3339 (second-precision) indexed_at is never older
-	// than its mtime, isolating the test to the git-HEAD staleness path.
+	// Age the file so tests that depend on indexed_at ordering are unaffected.
 	file := filepath.Join(dir, "a.go")
 	if err := os.WriteFile(file, []byte("package a\n"), 0o644); err != nil {
 		t.Fatal(err)

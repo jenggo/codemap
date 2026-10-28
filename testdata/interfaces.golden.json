@@ -1,113 +1,25 @@
 {
   "packages": 1,
   "symbols": 8,
-  "edges": 14,
+  "edges": 8,
   "overview": [
     {
-      "Path": "codemap/testdata/interfaces",
-      "Name": "interfaces",
-      "ExportedSymbols": [
-        {
-          "QualifiedName": "codemap/testdata/interfaces.Buffer",
-          "Kind": "type",
-          "Receiver": "",
-          "Signature": "struct { data []byte }",
-          "Doc": "Buffer implements both Reader and Writer.\n",
-          "PosFile": "testdata/interfaces/interfaces.go",
-          "PosLine": 14,
-          "Exported": true,
-          "Generated": false
-        },
-        {
-          "QualifiedName": "codemap/testdata/interfaces.Buffer.Read",
-          "Kind": "method",
-          "Receiver": "Buffer",
-          "Signature": "func (p []byte) (int, error)",
-          "Doc": "Read implements the Reader interface.\n",
-          "PosFile": "testdata/interfaces/interfaces.go",
-          "PosLine": 19,
-          "Exported": true,
-          "Generated": false
-        },
-        {
-          "QualifiedName": "codemap/testdata/interfaces.Buffer.Write",
-          "Kind": "method",
-          "Receiver": "Buffer",
-          "Signature": "func (p []byte) (int, error)",
-          "Doc": "Write implements the Writer interface.\n",
-          "PosFile": "testdata/interfaces/interfaces.go",
-          "PosLine": 26,
-          "Exported": true,
-          "Generated": false
-        },
-        {
-          "QualifiedName": "codemap/testdata/interfaces.Process",
-          "Kind": "function",
-          "Receiver": "",
-          "Signature": "func (r Reader, w Writer) error",
-          "Doc": "Process reads from a Reader and writes to a Writer.\n",
-          "PosFile": "testdata/interfaces/interfaces.go",
-          "PosLine": 32,
-          "Exported": true,
-          "Generated": false
-        },
-        {
-          "QualifiedName": "codemap/testdata/interfaces.Reader",
-          "Kind": "interface",
-          "Receiver": "",
-          "Signature": "interface",
-          "Doc": "Reader defines an interface for reading data.\n",
-          "PosFile": "testdata/interfaces/interfaces.go",
-          "PosLine": 4,
-          "Exported": true,
-          "Generated": false
-        },
-        {
-          "QualifiedName": "codemap/testdata/interfaces.Reader.Read",
-          "Kind": "method",
-          "Receiver": "Reader",
-          "Signature": "func (p []byte) (n int, err error)",
-          "Doc": "",
-          "PosFile": "testdata/interfaces/interfaces.go",
-          "PosLine": 5,
-          "Exported": true,
-          "Generated": false
-        },
-        {
-          "QualifiedName": "codemap/testdata/interfaces.Writer",
-          "Kind": "interface",
-          "Receiver": "",
-          "Signature": "interface",
-          "Doc": "Writer defines an interface for writing data.\n",
-          "PosFile": "testdata/interfaces/interfaces.go",
-          "PosLine": 9,
-          "Exported": true,
-          "Generated": false
-        },
-        {
-          "QualifiedName": "codemap/testdata/interfaces.Writer.Write",
-          "Kind": "method",
-          "Receiver": "Writer",
-          "Signature": "func (p []byte) (n int, err error)",
-          "Doc": "",
-          "PosFile": "testdata/interfaces/interfaces.go",
-          "PosLine": 10,
-          "Exported": true,
-          "Generated": false
-        }
-      ],
-      "ImportCount": 0
+      "path": "codemap/testdata/interfaces",
+      "name": "interfaces",
+      "doc": "",
+      "import_count": 0,
+      "sym_count": 8
     }
   ],
   "list_packages": [
     {
-      "Path": "codemap/testdata/interfaces",
-      "Name": "interfaces",
-      "Dir": "testdata/interfaces",
-      "Doc": "",
-      "SymCount": 8,
-      "IsTest": false,
-      "IsGenerated": false
+      "path": "codemap/testdata/interfaces",
+      "name": "interfaces",
+      "dir": "testdata/interfaces",
+      "doc": "",
+      "sym_count": 8,
+      "is_test": false,
+      "is_generated": false
     }
   ]
 }

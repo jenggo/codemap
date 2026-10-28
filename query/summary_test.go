@@ -1,6 +1,7 @@
 package query_test
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -71,5 +72,32 @@ func TestSummaryCoversEveryPackage(t *testing.T) {
 		if len(p.Doc) > 120 {
 			t.Errorf("package doc too long for a summary: %d chars", len(p.Doc))
 		}
+	}
+}
+
+// TestRepoDescriptionReadsReadmeParagraph pins that summary can say what the
+// repo is. Package docs are not a substitute: the main package usually has none,
+// so "what is this repo" was answerable only by opening a file.
+func TestRepoDescriptionReadsReadmeParagraph(t *testing.T) {
+	dir := t.TempDir()
+	readme := "# Widget Service\n\n[![CI](https://example.com/badge.svg)](https://example.com)\n\n" +
+		"Widget Service tracks widgets across regions and exposes a small HTTP API.\n" +
+		"It is deployed as a single binary.\n\n## Features\n\n- nothing\n"
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte(readme), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := query.RepoDescription(dir)
+	want := "Widget Service tracks widgets across regions and exposes a small HTTP API. It is deployed as a single binary."
+	if got != want {
+		t.Fatalf("repoDescription = %q, want %q", got, want)
+	}
+}
+
+// TestRepoDescriptionMissingReadme pins that a repo without a README simply
+// carries no description rather than failing the whole summary.
+func TestRepoDescriptionMissingReadme(t *testing.T) {
+	if got := query.RepoDescription(t.TempDir()); got != "" {
+		t.Fatalf("repoDescription without README = %q, want empty", got)
 	}
 }

@@ -339,7 +339,8 @@ func TestWriteIdempotentReIndex(t *testing.T) {
 	}
 
 	// A single multi-site call (e.g. Caller -> NewService across lines) must
-	// aggregate into one row.
+	// aggregate into one row. The func-valued local f() is not a package
+	// symbol, so it contributes no call edge.
 	edges, err := s.EdgesFrom("samepair.Caller")
 	if err != nil {
 		t.Fatal(err)
@@ -348,11 +349,11 @@ func TestWriteIdempotentReIndex(t *testing.T) {
 	for _, e := range edges {
 		byType[e.EdgeType]++
 	}
-	if byType["calls"] != 4 {
-		t.Errorf("expected 4 unique call edges, got %d (%+v)", byType["calls"], edges)
+	if byType["calls"] != 3 {
+		t.Errorf("expected 3 unique call edges (NewService, Service.Get, Global), got %d (%+v)", byType["calls"], edges)
 	}
-	if byType["references"] != 2 {
-		t.Errorf("expected 2 unique reference edges (method value + field access), got %d", byType["references"])
+	if byType["references"] != 1 {
+		t.Errorf("expected 1 unique reference edge (method value only; a struct field is not a symbol), got %d", byType["references"])
 	}
 }
 

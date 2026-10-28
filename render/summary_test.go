@@ -35,7 +35,7 @@ func TestRenderSummaryFormats(t *testing.T) {
 		want   []string
 	}{
 		{FormatTOON, []string{"example.com/app", "SQLite persistence.", "modernc.org/sqlite"}},
-		{FormatJSON, []string{`"Module": "example.com/app"`, `"doc": "SQLite persistence."`}},
+		{FormatJSON, []string{`"module": "example.com/app"`, `"doc": "SQLite persistence."`}},
 		{FormatCompact, []string{"example.com/app: 2 packages", "store: 30 sym", "third_party: modernc.org/sqlite", "hubs: example.com/app/store(4)"}},
 		{FormatText, []string{"example.com/app | 2 packages", "SQLite persistence.", "entry points:"}},
 	} {

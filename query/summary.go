@@ -1,6 +1,8 @@
 package query
 
 import (
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -14,16 +16,17 @@ import (
 // what it depends on. Deliberately small — the full symbol inventory is
 // Overview's job.
 type SummaryResult struct {
-	Module       string
-	IndexedVia   string
-	GitHead      string
-	ThirdParty   []string
-	Stdlib       []string
-	Packages     []SummaryPackage
-	EntryPoints  []EntryPoint
-	Hubs         []Hub
-	TotalSymbols int
-	TotalEdges   int
+	Module       string           `json:"module"`
+	Description  string           `json:"description,omitempty"`
+	IndexedVia   string           `json:"indexed_via"`
+	GitHead      string           `json:"git_head"`
+	ThirdParty   []string         `json:"third_party"`
+	Stdlib       []string         `json:"stdlib"`
+	Packages     []SummaryPackage `json:"packages"`
+	EntryPoints  []EntryPoint     `json:"entry_points"`
+	Hubs         []Hub            `json:"hubs"`
+	TotalSymbols int              `json:"total_symbols"`
+	TotalEdges   int              `json:"total_edges"`
 }
 
 type SummaryPackage struct {
@@ -80,6 +83,7 @@ func Summary(s *store.Store, opts ...Option) (*SummaryResult, error) {
 		return result.Packages[i].Path < result.Packages[j].Path
 	})
 	result.Module = summaryModule(health.RepoPath)
+	result.Description = RepoDescription(health.RepoPath)
 
 	edges, err := s.CountEdges()
 	if err != nil {
@@ -96,6 +100,61 @@ func Summary(s *store.Store, opts ...Option) (*SummaryResult, error) {
 	result.ThirdParty, result.Stdlib = externalDeps(s, projectSet)
 	result.Hubs = summaryHubs(s, projectSet)
 	return result, nil
+}
+
+// repoDescription returns the repo's own one-paragraph self-description, taken
+// from README.md. Package docs are not a substitute: the main package usually
+// has none, so "what is this repo" was unanswerable from the index alone.
+func RepoDescription(repoPath string) string {
+	if repoPath == "" {
+		return ""
+	}
+	for _, name := range []string{"README.md", "readme.md", "README"} {
+		data, err := os.ReadFile(filepath.Join(repoPath, name))
+		if err != nil {
+			continue
+		}
+		if desc := firstParagraph(string(data)); desc != "" {
+			return desc
+		}
+	}
+	return ""
+}
+
+// firstParagraph skips the title, HTML, and badge lines that open a README and
+// returns the first prose paragraph, capped to one summary line.
+func firstParagraph(readme string) string {
+	var para []string
+	for line := range strings.SplitSeq(readme, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			if len(para) > 0 {
+				break
+			}
+			continue
+		}
+		if len(para) == 0 && isReadmeNoise(trimmed) {
+			continue
+		}
+		para = append(para, trimmed)
+	}
+	return trimDoc(strings.Join(para, " "))
+}
+
+// isReadmeNoise reports lines that introduce a README rather than describe it:
+// headings, HTML blocks, badge/shield markup, images, and bare relative links
+// such as `krucil/README.md`.
+func isReadmeNoise(line string) bool {
+	switch {
+	case strings.HasPrefix(line, "#"),
+		strings.HasPrefix(line, "<!--"),
+		strings.HasPrefix(line, "![["),
+		strings.HasPrefix(line, "[!["),
+		strings.HasPrefix(line, "<"),
+		strings.HasPrefix(line, "---"):
+		return true
+	}
+	return !strings.Contains(line, " ") && (strings.Contains(line, "/") || strings.HasSuffix(line, ".md"))
 }
 
 // summaryModule reads the module path from the repo's go.mod. The indexed

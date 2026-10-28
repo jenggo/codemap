@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"reflect"
+	"strconv"
 	"testing"
 )
 
@@ -91,6 +92,47 @@ func TestFuseDuplicateWithinList(t *testing.T) {
 	}
 	if fused[0].Score != 1.0/(DefaultK+1) {
 		t.Fatalf("duplicate contributed twice: score %v", fused[0].Score)
+	}
+}
+
+// TestFuseSources records which input lists contained each candidate.
+func TestFuseSources(t *testing.T) {
+	a := []Candidate{c("both.go", 1), c("first.go", 2)}
+	b := []Candidate{c("both.go", 1), c("second.go", 3)}
+
+	fused := Fuse(a, b, DefaultK)
+	byPath := make(map[string]Candidate, len(fused))
+	for _, cand := range fused {
+		byPath[cand.FilePath] = cand
+	}
+	if got := byPath["both.go"].Sources; !reflect.DeepEqual(got, []int{0, 1}) {
+		t.Fatalf("both.go Sources = %v, want [0 1]", got)
+	}
+	if got := byPath["first.go"].Sources; !reflect.DeepEqual(got, []int{0}) {
+		t.Fatalf("first.go Sources = %v, want [0]", got)
+	}
+	if got := byPath["second.go"].Sources; !reflect.DeepEqual(got, []int{1}) {
+		t.Fatalf("second.go Sources = %v, want [1]", got)
+	}
+}
+
+// TestRerankPreservesSources checks that reranking only reorders and rescores.
+func TestRerankPreservesSources(t *testing.T) {
+	results := []Candidate{
+		{FilePath: "a.go", LineNumber: 1, Line: "alpha beta", Score: 1.0, Sources: []int{0}},
+		{FilePath: "b.go", LineNumber: 2, Line: "alpha", Score: 0.9, Sources: []int{1}},
+		{FilePath: "b.go", LineNumber: 3, Line: "beta", Score: 0.8, Sources: []int{0, 1}},
+	}
+	reranked := RerankByProximity(results, []string{"alpha", "beta"})
+	byKey := make(map[string][]int, len(reranked))
+	for _, cand := range reranked {
+		byKey[cand.FilePath+":"+strconv.Itoa(cand.LineNumber)] = cand.Sources
+	}
+	for _, want := range results {
+		key := want.FilePath + ":" + strconv.Itoa(want.LineNumber)
+		if got := byKey[key]; !reflect.DeepEqual(got, want.Sources) {
+			t.Fatalf("%s Sources = %v, want %v", key, got, want.Sources)
+		}
 	}
 }
 

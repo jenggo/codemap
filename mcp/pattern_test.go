@@ -43,7 +43,7 @@ func newPatternTestServer(t *testing.T) *Server {
 
 func TestPatternToolFindsMatch(t *testing.T) {
 	s := newPatternTestServer(t)
-	out, isErr := s.handleTool("pattern", map[string]any{"pattern": "defer $CALL"})
+	out, _, isErr := s.handleTool("pattern", map[string]any{"pattern": "defer $CALL"})
 	if isErr {
 		t.Fatalf("pattern tool failed: %s", out)
 	}
@@ -57,7 +57,7 @@ func TestPatternToolFindsMatch(t *testing.T) {
 
 func TestPatternToolRejectsInvalidPattern(t *testing.T) {
 	s := newPatternTestServer(t)
-	out, isErr := s.handleTool("pattern", map[string]any{"pattern": "if err != nil {"})
+	out, _, isErr := s.handleTool("pattern", map[string]any{"pattern": "if err != nil {"})
 	if !isErr {
 		t.Fatalf("invalid pattern must be an error, got: %s", out)
 	}
@@ -68,7 +68,7 @@ func TestPatternToolRejectsInvalidPattern(t *testing.T) {
 
 func TestPatternToolRequiresPattern(t *testing.T) {
 	s := newPatternTestServer(t)
-	if out, isErr := s.handleTool("pattern", map[string]any{}); !isErr {
+	if out, _, isErr := s.handleTool("pattern", map[string]any{}); !isErr {
 		t.Fatalf("missing pattern must be an error, got: %s", out)
 	}
 }

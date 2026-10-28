@@ -183,11 +183,17 @@ func TestGitFileChurn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GitFileChurn: %v", err)
 	}
-	if churn["a.go"] != 2 {
-		t.Errorf("expected a.go churn=2, got %d", churn["a.go"])
+	if got := churn[filepath.Join(repo, "a.go")]; got != 2 {
+		t.Errorf("expected a.go churn=2, got %d", got)
 	}
-	if _, ok := churn["b.txt"]; ok {
+	if _, ok := churn[filepath.Join(repo, "b.txt")]; ok {
 		t.Errorf("b.txt should not be in churn map")
+	}
+	// Keys must be absolute to join against symbols.pos_file, which is absolute.
+	for key := range churn {
+		if !filepath.IsAbs(key) {
+			t.Errorf("churn key %q is not absolute", key)
+		}
 	}
 }
 
@@ -257,8 +263,8 @@ func TestOddFilenamesAreNotDropped(t *testing.T) {
 		t.Fatalf("GitFileChurn: %v", err)
 	}
 	for _, name := range oddGoNames {
-		if churn[name] != 1 {
-			t.Errorf("expected churn[%q]=1, got %d (map=%v)", name, churn[name], churn)
+		if churn[filepath.Join(repo, name)] != 1 {
+			t.Errorf("expected churn[%q]=1, got %d (map=%v)", name, churn[filepath.Join(repo, name)], churn)
 		}
 	}
 }

@@ -50,9 +50,11 @@ func TestNoCallReferencesDoubling(t *testing.T) {
 		t.Error("method value (line 6) should emit a references edge")
 	}
 
-	// Unrelated field access `svc.x` (line 8) still emits `references`.
-	if !keys[key("samepair.x", "references", 8)] {
-		t.Error("field access (line 8) should emit a references edge")
+	// Unrelated field access `svc.x` (line 8) emits no reference: a struct field
+	// is not a package symbol, so `samepair.x` named something no tool could
+	// resolve.
+	if keys[key("samepair.x", "references", 8)] {
+		t.Error("field access (line 8) must not emit a references edge to a non-symbol")
 	}
 	if keys[key("samepair.x", "calls", 8)] {
 		t.Error("field access must not emit a calls edge")
@@ -72,9 +74,10 @@ func TestNoCallReferencesDoubling(t *testing.T) {
 	}
 }
 
-// TestMethodValueAndFieldAccessStillReferenced ensures non-call selector uses
-// are untouched by the dedup change: the fixture's reference edges carry no
-// calls counterpart.
+// TestMethodValueAndFieldAccessStillReferenced ensures the dedup change does not
+// swallow non-call selector uses that do name a real symbol: a method value is
+// still referenced, while a struct field — which is not a package symbol and
+// therefore not resolvable by any other tool — is not.
 func TestMethodValueAndFieldAccessStillReferenced(t *testing.T) {
 	pr, err := parse.Run(filepath.Join("..", "testdata", "fixtures", "dedup"))
 	if err != nil {
@@ -97,7 +100,7 @@ func TestMethodValueAndFieldAccessStillReferenced(t *testing.T) {
 	if methodValueRefs != 1 {
 		t.Errorf("expected 1 method-value reference edge (use.go:6 `f := svc.Get`), got %d", methodValueRefs)
 	}
-	if fieldRefs != 2 {
-		t.Errorf("expected 2 field-access reference edges (lib.go:7 + use.go:8), got %d", fieldRefs)
+	if fieldRefs != 0 {
+		t.Errorf("expected 0 field-access reference edges, got %d: a struct field is not a symbol", fieldRefs)
 	}
 }

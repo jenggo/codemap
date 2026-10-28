@@ -218,3 +218,103 @@ func renderNode(t *testing.T, fset *token.FileSet, n ast.Node) string {
 	}
 	return b.String()
 }
+
+// TestCompositeLiteralEllipsis pins partial matching for composite literals.
+// `$T{...}` and `$T{$F: $V, ...}` are not valid Go, so without the ellipsis
+// sentinel they were a parse error or a no-match against any literal that
+// carried fields the pattern omitted.
+func TestCompositeLiteralEllipsis(t *testing.T) {
+	cases := []struct {
+		name    string
+		pattern string
+		src     string
+		want    bool
+	}{
+		{"any literal", `$T{...}`, `return types.ServerSync{IP: s.IP, Name: s.Name}`, true},
+		{"empty literal", `$T{...}`, `return types.ServerSync{}`, true},
+		{"partial fields", `$T{$F: $V, ...}`, `return types.ServerSync{IP: s.IP, Name: s.Name}`, true},
+		{"partial fields exact", `$T{$F: $V, ...}`, `return types.ServerSync{IP: s.IP}`, true},
+		{"partial fields wrong key", `$T{IP: $V, ...}`, `return types.ServerSync{Name: s.Name}`, false},
+		{"no ellipsis still exact", `$T{$F: $V}`, `return types.ServerSync{IP: s.IP, Name: s.Name}`, false},
+		{"variadic call untouched", `f($X...)`, `f(xs...)`, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := Compile(tc.pattern)
+			if err != nil {
+				t.Fatalf("Compile(%q): %v", tc.pattern, err)
+			}
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, "x.go", "package x\n\nfunc F() {\n\t"+tc.src+"\n}\n", 0)
+			if err != nil {
+				t.Fatalf("parse candidate: %v", err)
+			}
+			matched := false
+			ast.Inspect(file, func(n ast.Node) bool {
+				if n == nil || matched {
+					return false
+				}
+				if _, ok := p.Match(fset, n); ok {
+					matched = true
+				}
+				return true
+			})
+			if matched != tc.want {
+				t.Errorf("%q against %q = %v, want %v", tc.pattern, tc.src, matched, tc.want)
+			}
+		})
+	}
+}
+
+// TestEllipsisSentinelIsNotAPrefilterLiteral pins that the ellipsis marker does
+// not become a required literal token. It was added to the literal set, so the
+// file prefilter demanded the text "_cmEllipsis" and dropped every file,
+// returning "no matches" for a pattern that matched in unit tests.
+func TestEllipsisSentinelIsNotAPrefilterLiteral(t *testing.T) {
+	for _, src := range []string{`$T{...}`, `$T{$F: $V, ...}`} {
+		p, err := Compile(src)
+		if err != nil {
+			t.Fatalf("Compile(%q): %v", src, err)
+		}
+		for _, lit := range p.Literals() {
+			if lit == ellipsisSentinel {
+				t.Errorf("Compile(%q) literals = %v, must not require %q", src, p.Literals(), ellipsisSentinel)
+			}
+		}
+	}
+}
+
+// TestVariadicMetavariableRequiresVariadicCall pins that "$F($X...)" only
+// matches a call forwarding a variadic argument. CallExpr.Ellipsis is a
+// token.Pos, which the matcher skipped as a source position, so the pattern
+// matched every call in the repo.
+func TestVariadicMetavariableRequiresVariadicCall(t *testing.T) {
+	pat, err := Compile("$F($X...)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	variadic := "package p\nfunc f(xs []int) {\n\tg(xs...)\n}\n"
+	if _, got := collectMatches(t, pat, variadic); len(got) != 1 {
+		t.Fatalf("g(xs...): matches = %d, want 1", len(got))
+	}
+
+	plain := "package p\nfunc f(x int) {\n\tg(x)\n}\n"
+	if _, got := collectMatches(t, pat, plain); len(got) != 0 {
+		t.Fatalf("g(x): matches = %d, want 0", len(got))
+	}
+}
+
+// TestNonVariadicPatternSkipsVariadicCalls is the other half: a pattern without
+// the marker must not match a variadic call.
+func TestNonVariadicPatternSkipsVariadicCalls(t *testing.T) {
+	pat, err := Compile("g($X)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := "package p\nfunc f(xs []int, x int) {\n\tg(xs...)\n\tg(x)\n}\n"
+	_, got := collectMatches(t, pat, src)
+	if len(got) != 1 {
+		t.Fatalf("g($X) over g(xs...) and g(x): matches = %d, want 1", len(got))
+	}
+}

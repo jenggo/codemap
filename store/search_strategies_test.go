@@ -80,7 +80,7 @@ func TestFileMatchesFTSRankedOrdersDeterministically(t *testing.T) {
 		t.Fatalf("unstable result count: %d vs %d", len(first), len(second))
 	}
 	for i := range first {
-		if first[i] != second[i] {
+		if !reflect.DeepEqual(first[i], second[i]) {
 			t.Fatalf("ranked order not deterministic:\n%d: %+v\n%d: %+v", i, first[i], i, second[i])
 		}
 	}

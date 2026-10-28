@@ -233,7 +233,27 @@ func fromCandidates(candidates []fuse.Candidate) []store.FileMatch {
 			Line:          c.Line,
 			ContextBefore: c.ContextBefore,
 			ContextAfter:  c.ContextAfter,
+			Signals:       signalNames(c.Sources),
 		}
 	}
 	return out
+}
+
+// signalNames maps fuse source indices to retrieval strategy names. Sources
+// is ascending and deduplicated per list, so the names come out ordered and
+// unique.
+func signalNames(sources []int) []string {
+	if len(sources) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(sources))
+	for _, src := range sources {
+		switch src {
+		case 0:
+			names = append(names, "fts")
+		case 1:
+			names = append(names, "substring")
+		}
+	}
+	return names
 }

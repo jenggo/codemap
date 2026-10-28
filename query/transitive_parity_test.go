@@ -74,7 +74,7 @@ func TestTransitiveImportsParityThreePaths(t *testing.T) {
 		}
 
 		want := edgeKeys(fromQuery)
-		if got := edgeKeys(flow.TransitiveImports); !sameStrings(got, want) {
+		if got := edgeKeys(flow.TransitiveProjectImports); !sameStrings(got, want) {
 			t.Errorf("%s: DependencyFlow transitive imports differ from TransitiveImports:\n got=%v\nwant=%v", pkg, got, want)
 		}
 		if got := storeEdgeKeys(fromStore); !sameStrings(got, want) {

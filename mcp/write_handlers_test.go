@@ -82,7 +82,7 @@ func TestWriteToolsRefusedWithoutWriteMode(t *testing.T) {
 	}
 
 	for _, call := range writeToolCalls() {
-		out, isErr := s.handleTool(call.name, call.args)
+		out, _, isErr := s.handleTool(call.name, call.args)
 		if !isErr {
 			t.Errorf("%s must be refused while write mode is off", call.name)
 		}
@@ -128,7 +128,7 @@ func TestWriteToolCatalogMarksMutations(t *testing.T) {
 // TestWriteRefreshesIndex asserts a query after a write sees the new code.
 func TestWriteRefreshesIndex(t *testing.T) {
 	s, file := newWriteServer(t)
-	out, isErr := s.handleTool(toolReplaceSymbolBody, map[string]any{
+	out, _, isErr := s.handleTool(toolReplaceSymbolBody, map[string]any{
 		keyQualifiedName: "codemap/testdata/simple.helper",
 		keyBody:          "func helper(s string) string {\n\treturn s\n}\n\nfunc Added(s string) string {\n\treturn s\n}",
 	})
@@ -178,7 +178,7 @@ func TestWriteConfinedToAllowedRoots(t *testing.T) {
 		t.Fatal("a symlink escaping the allowed roots must be refused")
 	}
 
-	out, isErr := s.handleTool(toolReplaceSymbolBody, map[string]any{
+	out, _, isErr := s.handleTool(toolReplaceSymbolBody, map[string]any{
 		keyQualifiedName: "codemap/testdata/simple.helper",
 		keyBody:          "func helper(s string) string {\n\treturn \"escaped\"\n}",
 	})
@@ -198,7 +198,7 @@ func TestWriteConfinedToAllowedRoots(t *testing.T) {
 // stale row.
 func TestSafeDeleteRefreshesIndex(t *testing.T) {
 	s, _ := newWriteServer(t)
-	out, isErr := s.handleTool(toolSafeDelete, map[string]any{keyQualifiedName: "codemap/testdata/simple.helper"})
+	out, _, isErr := s.handleTool(toolSafeDelete, map[string]any{keyQualifiedName: "codemap/testdata/simple.helper"})
 	if isErr {
 		t.Fatalf("delete failed: %s", out)
 	}
@@ -221,7 +221,7 @@ func TestWriteReportsReindexFailure(t *testing.T) {
 	s.stalenessCheck = func(string, string) (bool, error) { return false, nil }
 	s.indexFn = func(string) error { return errors.New("reindex exploded") }
 
-	out, isErr := s.handleTool(toolReplaceSymbolBody, map[string]any{
+	out, _, isErr := s.handleTool(toolReplaceSymbolBody, map[string]any{
 		keyQualifiedName: "codemap/testdata/simple.helper",
 		keyBody:          "func helper(s string) string {\n\treturn s + s\n}",
 	})
@@ -243,7 +243,7 @@ func TestWriteReportsReindexFailure(t *testing.T) {
 // the tool with the override named.
 func TestSafeDeleteRefusesExported(t *testing.T) {
 	s, file := newWriteServer(t)
-	out, isErr := s.handleTool(toolSafeDelete, map[string]any{keyQualifiedName: "codemap/testdata/simple.NewParser"})
+	out, _, isErr := s.handleTool(toolSafeDelete, map[string]any{keyQualifiedName: "codemap/testdata/simple.NewParser"})
 	if !isErr {
 		t.Fatalf("expected an exported-symbol refusal, got %s", out)
 	}
@@ -312,7 +312,7 @@ func copyTreeDir(src, dst string) error {
 // packages and leaves the index resolving only the new name.
 func TestRenameSymbolRefreshesIndex(t *testing.T) {
 	s, dir := newRenameServer(t)
-	out, isErr := s.handleTool(toolRenameSymbol, map[string]any{
+	out, _, isErr := s.handleTool(toolRenameSymbol, map[string]any{
 		keyQualifiedName: "renamefixture/alpha.Target",
 		"new_name":       "NewTarget",
 	})
@@ -341,7 +341,7 @@ func TestRenameSymbolRefusedWithoutWriteMode(t *testing.T) {
 	s.writeEnabled = false
 	before := readFileString(t, filepath.Join(dir, "alpha/alpha.go"))
 
-	out, isErr := s.handleTool(toolRenameSymbol, map[string]any{
+	out, _, isErr := s.handleTool(toolRenameSymbol, map[string]any{
 		keyQualifiedName: "renamefixture/alpha.Target",
 		"new_name":       "NewTarget",
 	})
@@ -374,7 +374,7 @@ func TestRenameSymbolConfinedToAllowedRoots(t *testing.T) {
 	}
 	before := readFileString(t, filepath.Join(dir, "alpha/alpha.go"))
 
-	out, isErr := s.handleTool(toolRenameSymbol, map[string]any{
+	out, _, isErr := s.handleTool(toolRenameSymbol, map[string]any{
 		keyQualifiedName: "renamefixture/alpha.Target",
 		"new_name":       "NewTarget",
 	})
@@ -399,7 +399,7 @@ func TestFindDeclarationAvailableWithoutWriteMode(t *testing.T) {
 	s, dir := newRenameServer(t)
 	s.writeEnabled = false
 
-	out, isErr := s.handleTool(toolFindDeclaration, map[string]any{
+	out, _, isErr := s.handleTool(toolFindDeclaration, map[string]any{
 		keyFilePath: filepath.Join(dir, "alpha/alpha.go"),
 		keyLine:     float64(21),
 	})

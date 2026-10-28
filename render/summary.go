@@ -31,6 +31,7 @@ func RenderSummary(result *query.SummaryResult, opts ...Option) string {
 func renderSummaryTOON(result *query.SummaryResult) string {
 	data := map[string]any{
 		"module":      result.Module,
+		"description": result.Description,
 		"indexed_via": result.IndexedVia,
 		"git_head":    result.GitHead,
 		"totals": map[string]any{
@@ -51,6 +52,9 @@ func renderSummaryText(result *query.SummaryResult) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s | %d packages, %d symbols, %d edges | %s @ %s\n",
 		result.Module, len(result.Packages), result.TotalSymbols, result.TotalEdges, result.IndexedVia, shortHead(result.GitHead))
+	if result.Description != "" {
+		fmt.Fprintf(&b, "%s\n", result.Description)
+	}
 
 	b.WriteString("\npackages (largest first):\n")
 	for _, p := range result.Packages {

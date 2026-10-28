@@ -114,6 +114,43 @@ func parseDeclarations(src string) ([]ast.Decl, error) {
 	return f.Decls, nil
 }
 
+// ellipsisMarker and ellipsisSentinel implement partial composite literals.
+// `$T{...}` and `$T{$F: $V, ...}` are not valid Go, so the marker is rewritten
+// to an identifier that parses as one more element; the matcher then treats it
+// as "any remaining elements", matching the listed ones as a prefix.
+const (
+	ellipsisMarker   = "..."
+	ellipsisSentinel = "_cmEllipsis"
+)
+
+// ellipsisInComposite reports whether the "..." at i is a composite-literal
+// element placeholder rather than a call's variadic marker: it must sit inside a
+// braced list, so the nearest preceding byte is '{' or ',' and the nearest
+// following byte is '}' or ','. That keeps f(xs...) untouched.
+func ellipsisInComposite(src string, i int) bool {
+	prev := byte(0)
+	for j := i - 1; j >= 0; j-- {
+		if src[j] != ' ' && src[j] != '\t' && src[j] != '\n' && src[j] != '\r' {
+			prev = src[j]
+			break
+		}
+	}
+	if prev != '{' && prev != ',' {
+		return false
+	}
+	for j := i + len(ellipsisMarker); j < len(src); j++ {
+		switch src[j] {
+		case ' ', '\t', '\n', '\r':
+			continue
+		case '}', ',':
+			return true
+		default:
+			return false
+		}
+	}
+	return false
+}
+
 // substitute rewrites each $NAME metavariable to a placeholder identifier. A
 // metavariable that is the entire expression of a defer or go statement is
 // emitted as a zero-argument call of the placeholder, because Go's parser
@@ -135,6 +172,11 @@ func substitute(src string) string {
 		}
 		name, end, ok := metavariableAt(src, i)
 		if !ok {
+			if strings.HasPrefix(src[i:], ellipsisMarker) && ellipsisInComposite(src, i) {
+				b.WriteString(ellipsisSentinel)
+				i += len(ellipsisMarker)
+				continue
+			}
 			b.WriteByte(src[i])
 			i++
 			continue
@@ -225,7 +267,7 @@ func literalTokens(src string) []string {
 	seen := make(map[string]bool)
 	var out []string
 	add := func(tok string) {
-		if tok == "" || seen[tok] || isPlaceholder(tok) {
+		if tok == "" || seen[tok] || isPlaceholder(tok) || tok == ellipsisSentinel {
 			return
 		}
 		seen[tok] = true
@@ -264,21 +306,31 @@ type matcher struct {
 }
 
 var (
-	identPtrType     = reflect.TypeFor[*ast.Ident]()
-	callPtrType      = reflect.TypeFor[*ast.CallExpr]()
-	posType          = reflect.TypeFor[token.Pos]()
-	commentGroupType = reflect.TypeFor[*ast.CommentGroup]()
+	identPtrType      = reflect.TypeFor[*ast.Ident]()
+	callPtrType       = reflect.TypeFor[*ast.CallExpr]()
+	exprInterfaceType = reflect.TypeFor[ast.Expr]()
+	posType           = reflect.TypeFor[token.Pos]()
+	commentGroupType  = reflect.TypeFor[*ast.CommentGroup]()
 )
 
 // skipField reports whether an AST struct field carries no matched structure:
 // source positions, comments, and the deprecated ident->object/scope links
 // differ between independently parsed trees.
+//
+// CallExpr.Ellipsis is the one position that does carry structure: it is set
+// exactly when the call forwards a variadic argument, so skipping it made
+// "$F($X...)" match every call. matchStruct compares it as a boolean.
 func skipField(f reflect.StructField) bool {
-	if f.Type == posType || f.Type == commentGroupType {
+	if f.Type == posType {
+		return f.Name != fieldEllipsis
+	}
+	if f.Type == commentGroupType {
 		return true
 	}
 	return f.Name == "Obj" || f.Name == "Scope"
 }
+
+const fieldEllipsis = "Ellipsis"
 
 func (m *matcher) matchValue(pv, cv reflect.Value) bool {
 	// Metavariables are checked before the type comparison because a
@@ -318,6 +370,17 @@ func (m *matcher) matchIndirect(pv, cv reflect.Value) bool {
 }
 
 func (m *matcher) matchSlice(pv, cv reflect.Value) bool {
+	if prefixLen, ok := trailingEllipsis(pv); ok {
+		if cv.Len() < prefixLen {
+			return false
+		}
+		for i := range prefixLen {
+			if !m.matchValue(pv.Index(i), cv.Index(i)) {
+				return false
+			}
+		}
+		return true
+	}
 	if pv.Len() != cv.Len() {
 		return false
 	}
@@ -327,6 +390,23 @@ func (m *matcher) matchSlice(pv, cv reflect.Value) bool {
 		}
 	}
 	return true
+}
+
+// trailingEllipsis reports how many leading pattern elements precede an
+// ellipsis sentinel, when the slice ends with one. Only expression lists can
+// carry it, so other slices keep exact-length matching.
+func trailingEllipsis(pv reflect.Value) (int, bool) {
+	if pv.Type().Elem() != exprInterfaceType || pv.Len() == 0 {
+		return 0, false
+	}
+	last, ok := asNode(pv.Index(pv.Len() - 1))
+	if !ok {
+		return 0, false
+	}
+	if id, ok := last.(*ast.Ident); ok && id.Name == ellipsisSentinel {
+		return pv.Len() - 1, true
+	}
+	return 0, false
 }
 
 // metavariableName reports whether the pattern value is a metavariable: a
@@ -373,6 +453,12 @@ func (m *matcher) matchStruct(pv, cv reflect.Value) bool {
 	for i := 0; i < pv.NumField(); i++ {
 		f := t.Field(i)
 		if !f.IsExported() || skipField(f) {
+			continue
+		}
+		if f.Name == fieldEllipsis {
+			if pv.Field(i).IsZero() != cv.Field(i).IsZero() {
+				return false
+			}
 			continue
 		}
 		if !m.matchValue(pv.Field(i), cv.Field(i)) {

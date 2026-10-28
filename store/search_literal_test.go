@@ -39,6 +39,10 @@ func seedSearchModule(t *testing.T) *Store {
 
 		// camelCase identifier used to exercise trigram substring matching.
 		"camel.go": "package lit\n\n// GetSymbolBody resolves a symbol\nfunc GetSymbolBody() {}\n",
+
+		// Mid-identifier substring: the porter tokenizer indexes whole words
+		// only, so "Inspector" found nothing although containerInspector exists.
+		"images.go": "package lit\n\ntype containerInspector interface{ Inspect() }\n",
 	})
 
 	res, files := parseModule(t, dir)
@@ -477,6 +481,69 @@ func TestBuildSymbolFTSQuery(t *testing.T) {
 	}
 }
 
+// TestBuildSymbolRunsFTSQuery pins the second-pass shape: each term becomes an
+// AND of its identifier runs, so punctuation no longer glues a run to a phrase
+// that no single column can hold.
+func TestBuildSymbolRunsFTSQuery(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", ""},
+		{"-", ""},
+		{"simple", `(("simple" OR {name} : "simple"*))`},
+		{"fetchWithFallback[T any]",
+			`(("fetchWithFallback" OR {name} : "fetchWithFallback"*) AND ("T" OR {name} : "T"*)) AND (("any" OR {name} : "any"*))`},
+		{"user-service",
+			`(("user" OR {name} : "user"*) AND ("service" OR {name} : "service"*))`},
+	}
+	for _, tc := range cases {
+		if got := buildSymbolRunsFTSQuery(tc.in); got != tc.want {
+			t.Errorf("buildSymbolRunsFTSQuery(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestSearchSymbolsSourceTextWithTypeParams covers a declaration searched by
+// its own source text. The name lives in the name column and the type-parameter
+// clause in the signature column, so the phrase form cannot match; the runs
+// pass has to. Two decoys hold half the pattern each — the clause fragments
+// without the name, and the name without the clause — pinning that the runs
+// are ANDed within one row and never across two symbols.
+func TestSearchSymbolsSourceTextWithTypeParams(t *testing.T) {
+	dir := writeModule(t, map[string]string{
+		"pkg/report.go":   "package report\n\nfunc fetchWithFallback[T any](x T) T { return x }\n",
+		"pkg/other.go":    "package report\n\n// only the clause fragments T and any live here\nfunc unrelated(v int) int { return v }\n",
+		"pkg/nameonly.go": "package report\n\n// fetchWithFallback is named here but its clause is not\nfunc nameOnly(v int) int { return v }\n",
+	})
+	res, files := parseModule(t, dir)
+	s, err := Create(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	if err := s.Write(res, files, nil); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	syms, err := s.SearchSymbols("fetchWithFallback[T any]", "", nil, "", false, GeneratedAny)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	var found bool
+	for _, sym := range syms {
+		if sym.Name == "fetchWithFallback" {
+			found = true
+		}
+		if sym.Name == "unrelated" || sym.Name == "nameOnly" {
+			t.Fatalf("over-matched a symbol holding only half the pattern: %+v", sym)
+		}
+	}
+	if !found {
+		t.Fatalf("source-text search did not return fetchWithFallback, got: %+v", syms)
+	}
+}
+
 // TestSearchSymbolsPartialIdentifier verifies that a partial identifier
 // matches every symbol whose name starts with it (bleve-style prefix search),
 // while a name-scoped prefix never over-matches unrelated columns.
@@ -515,6 +582,20 @@ func TestSearchSymbolsPartialIdentifier(t *testing.T) {
 			wantName: "",
 			decoy:    "FooXBar",
 		},
+		{
+			// porter indexes whole words, so the FTS pass returns nothing and
+			// the substring fallback has to find the camelCase tail.
+			name:     "mid-identifier substring matches",
+			pattern:  "Inspector",
+			wantName: "containerInspector",
+			decoy:    "",
+		},
+		{
+			name:     "mid-identifier substring inside another word matches",
+			pattern:  "ymbolBod",
+			wantName: "GetSymbolBody",
+			decoy:    "",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -533,5 +614,52 @@ func TestSearchSymbolsPartialIdentifier(t *testing.T) {
 				t.Fatalf("pattern %q over-matched decoy %q: %v", tc.pattern, tc.decoy, names)
 			}
 		})
+	}
+}
+
+// TestSearchSymbolsDocHitDoesNotHideNameHit pins the union between the FTS and
+// substring passes. FTS indexes whole words, so a doc comment mentioning a name
+// satisfies the query; when that result suppressed the substring pass, searching
+// an exported function's name returned only the unexported variables whose doc
+// mentions it and hid the function itself.
+func TestSearchSymbolsDocHitDoesNotHideNameHit(t *testing.T) {
+	dir := writeModule(t, map[string]string{
+		"metrics.go": `package lit
+
+// latestAvgCPU holds the latest average CPU usage, updated by the collector.
+var (
+	latestAvgCPU   float64
+	latestAvgCPUMu sync.RWMutex
+)
+
+// GetLatestAvgCPU safely gets the latest average CPU usage.
+func GetLatestAvgCPU() float64 { return 0 }
+
+// SetLatestAvgCPU safely sets the latest average CPU usage.
+func SetLatestAvgCPU(val float64) {}
+`,
+	})
+	res, files := parseModule(t, dir)
+	s, err := Create(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Write(res, files, nil); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	syms, err := s.SearchSymbols("LatestAvgCPU", "", nil, "", false, GeneratedAny)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	names := map[string]bool{}
+	for _, sym := range syms {
+		names[sym.Name] = true
+	}
+	for _, want := range []string{"GetLatestAvgCPU", "SetLatestAvgCPU", "latestAvgCPU", "latestAvgCPUMu"} {
+		if !names[want] {
+			t.Errorf("pattern LatestAvgCPU did not return %q; got %v", want, names)
+		}
 	}
 }

@@ -1,113 +1,25 @@
 {
   "packages": 1,
   "symbols": 8,
-  "edges": 15,
+  "edges": 12,
   "overview": [
     {
-      "Path": "codemap/testdata/embedding",
-      "Name": "embedding",
-      "ExportedSymbols": [
-        {
-          "QualifiedName": "codemap/testdata/embedding.AnotherBase",
-          "Kind": "type",
-          "Receiver": "",
-          "Signature": "struct { Value int }",
-          "Doc": "AnotherBase provides different common functionality.\n",
-          "PosFile": "testdata/embedding/embedding.go",
-          "PosLine": 25,
-          "Exported": true,
-          "Generated": false
-        },
-        {
-          "QualifiedName": "codemap/testdata/embedding.AnotherBase.GetValue",
-          "Kind": "method",
-          "Receiver": "AnotherBase",
-          "Signature": "func () int",
-          "Doc": "GetValue returns the base value.\n",
-          "PosFile": "testdata/embedding/embedding.go",
-          "PosLine": 30,
-          "Exported": true,
-          "Generated": false
-        },
-        {
-          "QualifiedName": "codemap/testdata/embedding.Base",
-          "Kind": "type",
-          "Receiver": "",
-          "Signature": "struct { ID int }",
-          "Doc": "Base provides common functionality.\n",
-          "PosFile": "testdata/embedding/embedding.go",
-          "PosLine": 4,
-          "Exported": true,
-          "Generated": false
-        },
-        {
-          "QualifiedName": "codemap/testdata/embedding.Base.GetName",
-          "Kind": "method",
-          "Receiver": "Base",
-          "Signature": "func () string",
-          "Doc": "GetName returns the base name.\n",
-          "PosFile": "testdata/embedding/embedding.go",
-          "PosLine": 9,
-          "Exported": true,
-          "Generated": false
-        },
-        {
-          "QualifiedName": "codemap/testdata/embedding.Extended",
-          "Kind": "type",
-          "Receiver": "",
-          "Signature": "struct { Base; Name string }",
-          "Doc": "Extended embeds Base and adds more functionality.\n",
-          "PosFile": "testdata/embedding/embedding.go",
-          "PosLine": 14,
-          "Exported": true,
-          "Generated": false
-        },
-        {
-          "QualifiedName": "codemap/testdata/embedding.Extended.GetFullName",
-          "Kind": "method",
-          "Receiver": "Extended",
-          "Signature": "func () string",
-          "Doc": "GetFullName returns the full name combining base and extended.\n",
-          "PosFile": "testdata/embedding/embedding.go",
-          "PosLine": 20,
-          "Exported": true,
-          "Generated": false
-        },
-        {
-          "QualifiedName": "codemap/testdata/embedding.MultiEmbed",
-          "Kind": "type",
-          "Receiver": "",
-          "Signature": "struct { Base; AnotherBase; Label string }",
-          "Doc": "MultiEmbed embeds both Base and AnotherBase.\n",
-          "PosFile": "testdata/embedding/embedding.go",
-          "PosLine": 35,
-          "Exported": true,
-          "Generated": false
-        },
-        {
-          "QualifiedName": "codemap/testdata/embedding.MultiEmbed.GetInfo",
-          "Kind": "method",
-          "Receiver": "MultiEmbed",
-          "Signature": "func () string",
-          "Doc": "GetInfo returns combined information from all embedded types.\n",
-          "PosFile": "testdata/embedding/embedding.go",
-          "PosLine": 42,
-          "Exported": true,
-          "Generated": false
-        }
-      ],
-      "ImportCount": 0
+      "path": "codemap/testdata/embedding",
+      "name": "embedding",
+      "doc": "",
+      "import_count": 0,
+      "sym_count": 8
     }
   ],
   "list_packages": [
     {
-      "Path": "codemap/testdata/embedding",
-      "Name": "embedding",
-      "Dir": "testdata/embedding",
-      "Doc": "",
-      "SymCount": 8,
-      "IsTest": false,
-      "IsGenerated": false
+      "path": "codemap/testdata/embedding",
+      "name": "embedding",
+      "dir": "testdata/embedding",
+      "doc": "",
+      "sym_count": 8,
+      "is_test": false,
+      "is_generated": false
     }
   ]
 }

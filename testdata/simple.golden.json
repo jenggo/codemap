@@ -1,58 +1,25 @@
 {
   "packages": 1,
   "symbols": 4,
-  "edges": 4,
+  "edges": 2,
   "overview": [
     {
-      "Path": "codemap/testdata/simple",
-      "Name": "simple",
-      "ExportedSymbols": [
-        {
-          "QualifiedName": "codemap/testdata/simple.NewParser",
-          "Kind": "function",
-          "Receiver": "",
-          "Signature": "func (input string) *Parser",
-          "Doc": "NewParser creates a new Parser.\n",
-          "PosFile": "testdata/simple/parser.go",
-          "PosLine": 9,
-          "Exported": true,
-          "Generated": false
-        },
-        {
-          "QualifiedName": "codemap/testdata/simple.Parser",
-          "Kind": "type",
-          "Receiver": "",
-          "Signature": "struct { input string }",
-          "Doc": "Parser parses input and produces output.\n",
-          "PosFile": "testdata/simple/parser.go",
-          "PosLine": 4,
-          "Exported": true,
-          "Generated": false
-        },
-        {
-          "QualifiedName": "codemap/testdata/simple.Parser.Parse",
-          "Kind": "method",
-          "Receiver": "Parser",
-          "Signature": "func () (string, error)",
-          "Doc": "Parse processes the input and returns a result.\n",
-          "PosFile": "testdata/simple/parser.go",
-          "PosLine": 14,
-          "Exported": true,
-          "Generated": false
-        }
-      ],
-      "ImportCount": 0
+      "path": "codemap/testdata/simple",
+      "name": "simple",
+      "doc": "",
+      "import_count": 0,
+      "sym_count": 4
     }
   ],
   "list_packages": [
     {
-      "Path": "codemap/testdata/simple",
-      "Name": "simple",
-      "Dir": "testdata/simple",
-      "Doc": "",
-      "SymCount": 4,
-      "IsTest": false,
-      "IsGenerated": false
+      "path": "codemap/testdata/simple",
+      "name": "simple",
+      "dir": "testdata/simple",
+      "doc": "",
+      "sym_count": 4,
+      "is_test": false,
+      "is_generated": false
     }
   ]
 }

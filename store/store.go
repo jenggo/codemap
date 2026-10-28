@@ -38,11 +38,19 @@ func cachedRegex(pattern string) (*regexp.Regexp, error) {
 }
 
 func openDB(path string) (*sql.DB, error) {
-	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	// busy_timeout makes a competing writer wait rather than fail with
+	// SQLITE_BUSY; WAL lets readers proceed while one writer holds the write
+	// lock. _txlock=immediate takes the write lock at BEGIN instead of on the
+	// first write, so two processes cannot both start deferred, both read, then
+	// deadlock on upgrade — the failure that surfaced as
+	// "database is locked (5) (SQLITE_BUSY)" when several agents reindexed at once.
+	dsn := path + "?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
+	// SQLite allows one writer; serialising this process's access keeps its own
+	// transactions from contending with each other for the single connection.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	return db, nil
@@ -101,7 +109,7 @@ func NormalizeQualifiedName(qn string) string {
 	return parenReceiverRe.ReplaceAllString(qn, ".$1.")
 }
 
-const schemaVersion = 4
+const schemaVersion = 5
 
 const schemaSQL = `
 CREATE TABLE IF NOT EXISTS repos (
@@ -125,7 +133,7 @@ CREATE TABLE IF NOT EXISTS packages (
 
 CREATE TABLE IF NOT EXISTS symbols (
     id              INTEGER PRIMARY KEY,
-    qualified_name  TEXT    NOT NULL UNIQUE,
+    qualified_name  TEXT    NOT NULL,
     package_id      INTEGER NOT NULL REFERENCES packages(id),
     name            TEXT    NOT NULL,
     kind            TEXT    NOT NULL,
@@ -172,6 +180,7 @@ CREATE TABLE IF NOT EXISTS diagnostics (
 
 CREATE INDEX IF NOT EXISTS idx_symbols_package   ON symbols(package_id);
 CREATE INDEX IF NOT EXISTS idx_symbols_qualified  ON symbols(qualified_name);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_symbols_decl ON symbols(qualified_name, pos_file, pos_line);
 CREATE INDEX IF NOT EXISTS idx_symbols_kind        ON symbols(kind);
 CREATE INDEX IF NOT EXISTS idx_symbols_repo        ON symbols(repo_id);
 CREATE INDEX IF NOT EXISTS idx_symbols_pos_file    ON symbols(pos_file);
@@ -442,6 +451,12 @@ func ensureSchema(db *sql.DB) error {
 		return err
 	}
 
+	// Symbol identity keyed on declaration site. Runs last so every additive
+	// column above exists in the table being rebuilt.
+	if err := migrateSymbolDeclarationKey(ctx, db); err != nil {
+		return err
+	}
+
 	if _, err := db.ExecContext(ctx, `INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)`, strconv.Itoa(schemaVersion)); err != nil {
 		return err
 	}
@@ -622,6 +637,102 @@ func migrateFileContentFTS(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("migrate file_content_fts: rebuild: %w", err)
 	}
 	return nil
+}
+
+// migrateSymbolDeclarationKey rebuilds the symbols table so identity is the
+// declaration site, not the qualified name alone.
+//
+// A package may declare the same qualified name twice — every `func init()` in
+// a package is `pkg.init` — and the old UNIQUE(qualified_name) collapsed them,
+// so a file whose only symbol was an init reported no symbols at all. The
+// unique key is now (qualified_name, pos_file, pos_line), which still makes a
+// re-index idempotent.
+func migrateSymbolDeclarationKey(ctx context.Context, db *sql.DB) error {
+	hasConstraint, err := symbolsTableHasUniqueConstraint(db)
+	if err != nil {
+		return err
+	}
+	if !hasConstraint {
+		return nil
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE symbols_declkey (
+			id              INTEGER PRIMARY KEY,
+			qualified_name  TEXT    NOT NULL,
+			package_id      INTEGER NOT NULL REFERENCES packages(id),
+			name            TEXT    NOT NULL,
+			kind            TEXT    NOT NULL,
+			receiver        TEXT,
+			signature       TEXT,
+			doc             TEXT,
+			pos_file        TEXT    NOT NULL,
+			pos_line        INTEGER NOT NULL,
+			exported        BOOLEAN NOT NULL DEFAULT FALSE,
+			is_test         BOOLEAN NOT NULL DEFAULT FALSE,
+			is_generated    BOOLEAN NOT NULL DEFAULT FALSE,
+			complexity      INTEGER NOT NULL DEFAULT 0,
+			churn_count     INTEGER NOT NULL DEFAULT 0,
+			importance      REAL    NOT NULL DEFAULT 0.0,
+			repo_id         INTEGER REFERENCES repos(id),
+			fields_json     TEXT
+		)`,
+		`INSERT INTO symbols_declkey SELECT * FROM symbols`,
+		`DROP TABLE symbols`,
+		`ALTER TABLE symbols_declkey RENAME TO symbols`,
+		`CREATE INDEX idx_symbols_package   ON symbols(package_id)`,
+		`CREATE INDEX idx_symbols_qualified ON symbols(qualified_name)`,
+		`CREATE INDEX idx_symbols_kind      ON symbols(kind)`,
+		`CREATE INDEX idx_symbols_repo      ON symbols(repo_id)`,
+		`CREATE INDEX idx_symbols_pos_file  ON symbols(pos_file)`,
+		`CREATE UNIQUE INDEX idx_symbols_decl ON symbols(qualified_name, pos_file, pos_line)`,
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migrate symbol declaration key: %w", err)
+		}
+	}
+	// symbols_fts is external-content over symbols; rowids were preserved by the
+	// copy, but a rebuild makes the mapping authoritative.
+	if _, err := db.ExecContext(ctx, `INSERT INTO symbols_fts(symbols_fts) VALUES('rebuild')`); err != nil {
+		return fmt.Errorf("migrate symbol declaration key: rebuild fts: %w", err)
+	}
+	return nil
+}
+
+// symbolsTableHasUniqueConstraint reports whether the symbols table still
+// carries a UNIQUE constraint (origin 'u' in PRAGMA index_list). A plain
+// CREATE UNIQUE INDEX has origin 'c', so this distinguishes the old
+// UNIQUE(qualified_name) table from the new declaration-keyed one even after
+// the index has been created.
+func symbolsTableHasUniqueConstraint(db *sql.DB) (bool, error) {
+	rows, err := db.QueryContext(context.Background(), `PRAGMA index_list(symbols)`)
+	if err != nil {
+		return false, fmt.Errorf("inspect symbols constraints: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return false, err
+	}
+	for rows.Next() {
+		values := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range values {
+			ptrs[i] = &values[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return false, err
+		}
+		for i, name := range cols {
+			if name != "origin" {
+				continue
+			}
+			if origin, ok := values[i].(string); ok && origin == "u" {
+				return true, nil
+			}
+		}
+	}
+	return false, rows.Err()
 }
 
 // migrateResponseChunks creates the response_chunks FTS5 table on databases
@@ -852,6 +963,12 @@ func (s *Store) maybeFail(stage, key string) error {
 		return nil
 	}
 	return s.testHook(stage, key)
+}
+
+// SetTestHook installs the fault-injection hook, so a test in another package
+// can exercise its caller's handling of a write failure. A nil hook clears it.
+func (s *Store) SetTestHook(hook func(stage, key string) error) {
+	s.testHook = hook
 }
 
 func (s *Store) Write(result *resolve.Result, files map[string]string, churn map[string]int) error {
@@ -1413,21 +1530,25 @@ func sanitizeFTSQuery(pattern string) string {
 // emits a parenthesized OR group: the exact phrase (matching the whole token
 // anywhere in the indexed columns) OR a name-column-scoped prefix (matching
 // symbol names that begin with the term). Groups are AND-joined so multi-term
-// patterns keep their current whole-token AND semantics while gaining prefix
-// support. The name-column scope keeps a prefix from over-matching unrelated
-// columns (e.g. "pkg:F" must not match "Foo" via the qualified_name column).
-// This mirrors bleve's PrefixQuery: an identifier search on a partial name
+// patterns keep their whole-token AND semantics while gaining prefix support.
+// The name-column scope keeps a prefix from over-matching unrelated columns
+// (e.g. "pkg:F" must not match "Foo" via the qualified_name column). This
+// mirrors bleve's PrefixQuery: an identifier search on a partial name
 // ("GetSym") returns every symbol whose name starts with it ("GetSymbol",
 // "GetSymbolBody") instead of silently matching nothing.
+//
+// An FTS5 phrase can never span a column boundary, so a pattern quoting a
+// declaration's own source text fails: "fetchWithFallback[T any]" is stored
+// with the name in the name column and the clause in the signature column, and
+// no single column holds both halves. searchSymbolsByRuns serves that case.
 func buildSymbolFTSQuery(pattern string) string {
 	pattern = strings.TrimSpace(pattern)
 	if pattern == "" {
 		return ""
 	}
 
-	terms := strings.Fields(pattern)
 	var groups []string
-	for _, t := range terms {
+	for t := range strings.FieldsSeq(pattern) {
 		t = strings.ReplaceAll(t, `"`, `""`)
 		if isPunctuationOnly(t) {
 			continue
@@ -1438,6 +1559,42 @@ func buildSymbolFTSQuery(pattern string) string {
 		return ""
 	}
 	return strings.Join(groups, " AND ")
+}
+
+// buildSymbolRunsFTSQuery is buildSymbolFTSQuery for a pattern that only makes
+// sense as its constituent identifier runs: each term becomes an AND of its
+// runs, so "fetchWithFallback[T any]" asks for "fetchWithFallback", "T" and
+// "any" in any indexed column instead of for two impossible phrases. It is a
+// second pass, not a replacement — the phrase form stays the first pass so a
+// pattern like "user-service" still cannot match a row that merely mentions
+// both words apart.
+func buildSymbolRunsFTSQuery(pattern string) string {
+	var groups []string
+	for term := range strings.FieldsSeq(pattern) {
+		runs := identifierRuns(term)
+		if len(runs) == 0 {
+			continue
+		}
+		parts := make([]string, len(runs))
+		for i, r := range runs {
+			r = strings.ReplaceAll(r, `"`, `""`)
+			parts[i] = `("` + r + `" OR {name} : "` + r + `"*)`
+		}
+		groups = append(groups, "("+strings.Join(parts, " AND ")+")")
+	}
+	if len(groups) == 0 {
+		return ""
+	}
+	return strings.Join(groups, " AND ")
+}
+
+// identifierRuns splits a term into its Go identifier runs. The FTS tokenizer
+// separates on the same boundaries, so these are exactly the tokens a row must
+// carry for the term to occur in it.
+func identifierRuns(term string) []string {
+	return strings.FieldsFunc(term, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_'
+	})
 }
 
 // isPunctuationOnly reports whether s consists entirely of non-letter,
@@ -1485,60 +1642,63 @@ func ftsNeedsFullScan(pattern string) bool {
 }
 
 type Package struct {
-	Path        string
-	Name        string
-	Dir         string
-	Doc         string
+	Path        string `json:"path"`
+	Name        string `json:"name"`
+	Dir         string `json:"dir"`
+	Doc         string `json:"doc"`
 	Repo        string `json:"repo,omitempty"`
-	SymCount    int
-	IsTest      bool
-	IsGenerated bool
+	SymCount    int    `json:"sym_count"`
+	IsTest      bool   `json:"is_test"`
+	IsGenerated bool   `json:"is_generated"`
 }
 
 // SymbolField mirrors extract.StructField: one struct field's Go name,
-// effective wire name and type. Persisted as JSON on the symbols row.
+// effective wire name and type, plus the fields of an inline anonymous struct.
+// Persisted as JSON on the symbols row.
 type SymbolField struct {
-	GoName   string `json:"go_name,omitempty"`
-	WireName string `json:"wire_name,omitempty"`
-	GoType   string `json:"go_type,omitempty"`
+	GoName   string        `json:"go_name,omitempty"`
+	WireName string        `json:"wire_name,omitempty"`
+	GoType   string        `json:"go_type,omitempty"`
+	Fields   []SymbolField `json:"fields,omitempty"`
 }
 
 type Symbol struct {
-	QualifiedName string
-	PackagePath   string
-	Name          string
-	Kind          string
-	Receiver      string
-	Signature     string
-	Doc           string
-	PosFile       string
-	Repo          string `json:"repo,omitempty"`
-	Fields        []SymbolField
-	PosLine       int
-	Complexity    int
-	ChurnCount    int
-	Importance    float64
-	Exported      bool
-	IsTest        bool
-	IsGenerated   bool
+	QualifiedName string        `json:"qualified_name"`
+	PackagePath   string        `json:"package_path"`
+	Name          string        `json:"name"`
+	Kind          string        `json:"kind"`
+	Receiver      string        `json:"receiver"`
+	Signature     string        `json:"signature"`
+	Doc           string        `json:"doc"`
+	PosFile       string        `json:"pos_file"`
+	Repo          string        `json:"repo,omitempty"`
+	Fields        []SymbolField `json:"fields,omitempty"`
+	PosLine       int           `json:"pos_line"`
+	Complexity    int           `json:"complexity"`
+	ChurnCount    int           `json:"churn_count"`
+	Importance    float64       `json:"importance"`
+	Exported      bool          `json:"exported"`
+	IsTest        bool          `json:"is_test"`
+	IsGenerated   bool          `json:"is_generated"`
 }
 
 // Diagnostic is one indexed type-check or parse error: the file (absolute),
 // position within it, and the compiler message.
 type Diagnostic struct {
-	File    string
-	Message string
+	File    string `json:"file"`
+	Message string `json:"message"`
 	Repo    string `json:"repo,omitempty"`
-	Line    int
-	Col     int
+	Line    int    `json:"line"`
+	Col     int    `json:"col"`
 }
 
 type FileMatch struct {
-	FilePath      string
-	Line          string
-	ContextBefore string
-	ContextAfter  string
-	LineNumber    int
+	FilePath      string   `json:"file_path"`
+	Line          string   `json:"line"`
+	ContextBefore string   `json:"context_before"`
+	ContextAfter  string   `json:"context_after"`
+	Signals       []string `json:"signals,omitempty"`
+	LineNumber    int      `json:"line_number"`
 }
 
 // writeDeferredRows applies churn counters and compile diagnostics after the
@@ -1842,6 +2002,55 @@ func (s *Store) SymbolsByPackage(pkgPath string, includeTests bool) ([]Symbol, e
 	return scanSymbols(rows)
 }
 
+// TypeDeclarationsNamed returns every declared type whose bare name is name.
+// A short name is ambiguous when two packages declare the same one, so callers
+// need the full set before they can match signature mentions exactly.
+func (s *Store) TypeDeclarationsNamed(name string, includeTests bool) ([]Symbol, error) {
+	query := `SELECT ` + symbolColumns + `
+		` + symbolFrom + `
+		WHERE s.name = ? AND s.kind IN ('type', 'interface', 'alias')
+	`
+	args := []any{name}
+	if !includeTests {
+		query += andIsTestFalse
+	}
+	query += orderByQualifiedName
+
+	rows, err := s.db.QueryContext(context.Background(), query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return scanSymbols(rows)
+}
+
+// SymbolsByNames returns the symbols with the given qualified names, batched so
+// a caller resolving many edge endpoints issues one query per 500 names rather
+// than one per name.
+func (s *Store) SymbolsByNames(names []string) ([]Symbol, error) {
+	if len(names) == 0 {
+		return []Symbol{}, nil
+	}
+	var out []Symbol
+	for _, batch := range chunks(names, edgesInBatchSize) {
+		args := make([]any, len(batch))
+		for i, n := range batch {
+			args[i] = NormalizeQualifiedName(n)
+		}
+		rows, err := s.db.QueryContext(context.Background(),
+			`SELECT `+symbolColumns+` `+symbolFrom+`
+			WHERE s.qualified_name IN (`+inPlaceholders(len(batch))+`)`, args...)
+		if err != nil {
+			return nil, err
+		}
+		syms, err := scanSymbols(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, syms...)
+	}
+	return out, nil
+}
+
 func (s *Store) SymbolByName(qualifiedName string) (*Symbol, error) {
 	qualifiedName = NormalizeQualifiedName(qualifiedName)
 	var sym Symbol
@@ -1862,6 +2071,27 @@ func (s *Store) SymbolByName(qualifiedName string) (*Symbol, error) {
 		}
 	}
 	return &sym, nil
+}
+
+// SymbolsByNameExact returns every declaration sharing a qualified name. A Go
+// package may declare several funcs with the same name when they live in
+// different files (init is the common case), so a name can map to more than one
+// declaration and a caller that shows one of them is showing an arbitrary one.
+func (s *Store) SymbolsByNameExact(qualifiedName string, includeTests bool) ([]Symbol, error) {
+	query := `SELECT ` + symbolColumns + `
+		` + symbolFrom + `
+		WHERE s.qualified_name = ?
+	`
+	args := []any{NormalizeQualifiedName(qualifiedName)}
+	if !includeTests {
+		query += andIsTestFalse
+	}
+	query += orderByQualifiedName + ", s.pos_file"
+	rows, err := s.db.QueryContext(context.Background(), query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return scanSymbols(rows)
 }
 
 func (s *Store) EdgesFrom(ref string) ([]Edge, error) {
@@ -2028,9 +2258,18 @@ func (s *Store) CountEdges() (int, error) {
 // ImportCounts returns, for every source package path, how many import edges
 // leave it. Built with one grouped query so callers such as Overview avoid one
 // edge query per package.
+// ImportCounts returns each package's runtime import count. Test-file imports
+// are excluded: they are not part of the package's dependency surface, and
+// counting them made "how coupled is this package" wrong by the number of test
+// dependencies. An import reached from both a test and a non-test file counts
+// once, since the non-test site keeps it.
 func (s *Store) ImportCounts() (map[string]int, error) {
-	rows, err := s.db.QueryContext(context.Background(),
-		`SELECT from_ref, COUNT(*) FROM edges WHERE edge_type = ? GROUP BY from_ref`, edgeTypeImports)
+	rows, err := s.db.QueryContext(context.Background(), `
+		SELECT e.from_ref, COUNT(DISTINCT e.to_ref)
+		FROM edges e, json_each(e.sites) site
+		WHERE e.edge_type = ?
+		  AND json_extract(site.value, '$.file') NOT LIKE '%\_test.go' ESCAPE '\'
+		GROUP BY e.from_ref`, edgeTypeImports)
 	if err != nil {
 		return nil, err
 	}
@@ -2046,6 +2285,17 @@ func (s *Store) ImportCounts() (map[string]int, error) {
 		counts[from] = n
 	}
 	return counts, rows.Err()
+}
+
+// Counts returns the number of packages, symbols, and edges actually stored.
+// The write path dedups symbols by qualified name and edges by
+// (from_ref, to_ref, edge_type), so the resolve result's lengths overstate what
+// a query will find and must not be reported as the index size.
+func (s *Store) Counts() (packages, symbols, edges int, err error) {
+	err = s.db.QueryRowContext(context.Background(), `
+		SELECT (SELECT COUNT(*) FROM packages), (SELECT COUNT(*) FROM symbols), (SELECT COUNT(*) FROM edges)
+	`).Scan(&packages, &symbols, &edges)
+	return packages, symbols, edges, err
 }
 
 // WriteContracts replaces all contract intelligence data for a repo atomically.
@@ -2226,7 +2476,7 @@ func (s *Store) QueryContracts(filter ContractFilter) ([]Contract, error) {
 	}
 	defer func() { _ = rows.Close() }()
 
-	var contracts []Contract
+	contracts := make([]Contract, 0)
 	for rows.Next() {
 		var c Contract
 		var repo sql.NullString
@@ -2265,7 +2515,7 @@ func (s *Store) QueryRuntimeContracts(kind RuntimeContractKind, repo string) ([]
 	}
 	defer func() { _ = rows.Close() }()
 
-	var results []RuntimeContract
+	results := make([]RuntimeContract, 0)
 	for rows.Next() {
 		var rc RuntimeContract
 		var repo sql.NullString
@@ -2309,7 +2559,7 @@ func (s *Store) QueryDrift(severity DriftSeverity, repo string) ([]DriftReport, 
 	}
 	defer func() { _ = rows.Close() }()
 
-	var results []DriftReport
+	results := make([]DriftReport, 0)
 	for rows.Next() {
 		var d DriftReport
 		var repo sql.NullString
@@ -2459,6 +2709,26 @@ func scanEdges(rows *sql.Rows) ([]Edge, error) {
 	return edges, nil
 }
 
+// SymbolsInFile returns every symbol whose pos_file is exactly path. Unlike
+// SearchSymbolsByFile it matches the whole path, so two files sharing a suffix
+// cannot be confused, and it is what a per-file diff needs.
+func (s *Store) SymbolsInFile(path string, includeTests bool) ([]Symbol, error) {
+	query := `SELECT ` + symbolColumns + `
+		` + symbolFrom + `
+		WHERE s.pos_file = ?
+	`
+	args := []any{path}
+	if !includeTests {
+		query += andIsTestFalse
+	}
+	query += orderByQualifiedName
+	rows, err := s.db.QueryContext(context.Background(), query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return scanSymbols(rows)
+}
+
 func (s *Store) SearchSymbolsByFile(filePattern, kind string, exported *bool, includeTests bool, generated GeneratedFilter) ([]Symbol, error) {
 	query := `SELECT ` + symbolColumns + `
 		` +
@@ -2492,6 +2762,62 @@ func (s *Store) SearchSymbolsByFile(filePattern, kind string, exported *bool, in
 func (s *Store) SearchSymbols(pattern, kind string, exported *bool, pkgPath string, includeTests bool, generated GeneratedFilter) ([]Symbol, error) {
 	ftsQuery := buildSymbolFTSQuery(pattern)
 	if ftsQuery == "" {
+		// No word-bearing term: FTS cannot serve this, and a LIKE over the
+		// escaped pattern would only match a literal "%".
+		return nil, nil
+	}
+
+	syms, err := s.searchSymbolsFTS(ftsQuery, kind, exported, pkgPath, includeTests, generated)
+	if err != nil {
+		return nil, err
+	}
+	// Second pass: a pattern quoting source text that FTS stores across two
+	// columns ("fetchWithFallback[T any]") cannot match as a phrase, but its
+	// identifier runs can.
+	runs, err := s.searchSymbolsFTS(buildSymbolRunsFTSQuery(pattern), kind, exported, pkgPath, includeTests, generated)
+	if err != nil {
+		return nil, err
+	}
+	// The substring pass is a union, not a fallback. FTS indexes whole words, so
+	// a doc-only hit used to satisfy the query and suppress the identifier
+	// match: searching "LatestAvgCPU" returned two unexported vars whose doc
+	// mentions it and hid GetLatestAvgCPU/SetLatestAvgCPU. The documented
+	// substring semantics is "matches anywhere", so every pass contributes.
+	sub, err := s.searchSymbolsBySubstring(pattern, kind, exported, pkgPath, includeTests, generated)
+	if err != nil {
+		return nil, err
+	}
+	return mergeSymbols(syms, runs, sub), nil
+}
+
+// mergeSymbols concatenates symbol lists, keeping the first occurrence of each
+// qualified name. Earlier lists carry the stricter match, so they win.
+func mergeSymbols(lists ...[]Symbol) []Symbol {
+	var total int
+	for _, l := range lists {
+		total += len(l)
+	}
+	if total == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, total)
+	out := make([]Symbol, 0, total)
+	for _, l := range lists {
+		for _, sym := range l {
+			if seen[sym.QualifiedName] {
+				continue
+			}
+			seen[sym.QualifiedName] = true
+			out = append(out, sym)
+		}
+	}
+	return out
+}
+
+// searchSymbolsFTS runs one FTS5 expression. An empty expression yields nil
+// without touching the database.
+func (s *Store) searchSymbolsFTS(expr, kind string, exported *bool, pkgPath string, includeTests bool, generated GeneratedFilter) ([]Symbol, error) {
+	if expr == "" {
 		return nil, nil
 	}
 
@@ -2502,8 +2828,39 @@ func (s *Store) SearchSymbols(pattern, kind string, exported *bool, pkgPath stri
 		LEFT JOIN repos r ON r.id = s.repo_id
 		WHERE symbols_fts MATCH ?
 	`
-	args := []any{ftsQuery}
+	args := []any{expr}
+	query, args = appendSymbolFilters(query, args, kind, exported, pkgPath, includeTests, generated)
+	query += orderByQualifiedName
 
+	rows, err := s.db.QueryContext(context.Background(), query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return scanSymbols(rows)
+}
+
+// searchSymbolsBySubstring serves the substring semantics the tool documents
+// when the tokenizer cannot. porter indexes whole words, so a pattern starting
+// mid-identifier ("Inspector" for containerInspector) matched nothing and the
+// caller saw a false "does not exist".
+func (s *Store) searchSymbolsBySubstring(pattern, kind string, exported *bool, pkgPath string, includeTests bool, generated GeneratedFilter) ([]Symbol, error) {
+	query := `SELECT ` + symbolColumns + `
+		` + symbolFrom + `
+		WHERE (` + likeMatch("s.name") + ` OR ` + likeMatch("s.qualified_name") + ` OR ` + likeMatch("s.signature") + ` OR ` + likeMatch("s.doc") + `)
+	`
+	pat := likePattern(pattern)
+	args := []any{pat, pat, pat, pat}
+	query, args = appendSymbolFilters(query, args, kind, exported, pkgPath, includeTests, generated)
+	query += orderByQualifiedName
+
+	rows, err := s.db.QueryContext(context.Background(), query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return scanSymbols(rows)
+}
+
+func appendSymbolFilters(query string, args []any, kind string, exported *bool, pkgPath string, includeTests bool, generated GeneratedFilter) (string, []any) {
 	if kind != "" {
 		query += " AND s.kind = ?"
 		args = append(args, kind)
@@ -2519,24 +2876,21 @@ func (s *Store) SearchSymbols(pattern, kind string, exported *bool, pkgPath stri
 	if !includeTests {
 		query += andIsTestFalse
 	}
-	query += generatedClause(generated)
-	query += orderByQualifiedName
-
-	rows, err := s.db.QueryContext(context.Background(), query, args...)
-	if err != nil {
-		return nil, err
-	}
-	return scanSymbols(rows)
+	return query + generatedClause(generated), args
 }
 
 func (s *Store) SearchByQualifiedNamePrefix(prefix string, includeTests bool) ([]Symbol, error) {
+	// A bare-name prefix ("Calc" for pkg.CalculateSLA) is what callers mean by
+	// "prefix"; requiring the full qualified-name prefix returned nothing. The
+	// parentheses keep the appended is_test filter applying to both arms.
 	query := `SELECT ` + symbolColumns + `
 		` +
 		symbolFrom + `
-		WHERE ` +
-		likeMatch("s.qualified_name") + `
+		WHERE (` +
+		likeMatch("s.qualified_name") + ` OR ` + likeMatch("s.name") + `)
 	`
-	args := []any{escapeLike(prefix) + "%"}
+	prefixPattern := escapeLike(prefix) + "%"
+	args := []any{prefixPattern, prefixPattern}
 
 	if !includeTests {
 		query += andIsTestFalse
@@ -2611,17 +2965,23 @@ func (s *Store) TransitiveImports(pkgPath string) ([]Edge, error) {
 }
 
 func (s *Store) SearchByType(typeName string, includeTests bool) ([]Symbol, error) {
+	// Signatures and field types are both candidate surfaces. The trailing
+	// sentinel makes a type that ends the signature (a bare return type such as
+	// `func() *SLAState`) match the same "<name> " clause a parameter does.
+	// Field matches are a coarse superset; callers narrow them with
+	// mentionsType so a short name does not match a longer one.
 	query := `SELECT ` + symbolColumns + `
 		` +
 		symbolFrom + `
-		WHERE s.signature LIKE '%' || ? || ' %' ESCAPE '\'
-		   OR s.signature LIKE '%' || ? || ')%' ESCAPE '\'
-		   OR s.signature LIKE '%' || ? || ',%' ESCAPE '\'
+		WHERE s.signature || ' ' LIKE '%' || ? || ' %' ESCAPE '\'
+		   OR s.signature || ' ' LIKE '%' || ? || ')%' ESCAPE '\'
+		   OR s.signature || ' ' LIKE '%' || ? || ',%' ESCAPE '\'
+		   OR s.fields_json LIKE '%' || ? || '%' ESCAPE '\'
 	` // The three '%.' || ? variants are subsumed: '%' matches the dot boundary,
 	// so "<type> " / "<type>)" / "<type>," already match after a '.'. Keeping a
 	// minimal clause set lets the planner reuse one LIKE index/scan predicate.
 	escaped := escapeLike(typeName)
-	args := []any{escaped, escaped, escaped}
+	args := []any{escaped, escaped, escaped, escaped}
 
 	if !includeTests {
 		query += andIsTestFalse
@@ -2722,8 +3082,9 @@ func (s *Store) SetIndexedAt(t time.Time) error {
 	return err
 }
 
-// SetRepoMeta records which repo and git revision an index was built from so
-// staleness checks can detect when a DB was built elsewhere or on another HEAD.
+// SetRepoMeta records which repo an index was built from, so staleness checks
+// can detect a DB built for a different path. gitHead is provenance for display
+// (health, summary) only: freshness is decided by the source fingerprint.
 func (s *Store) SetRepoMeta(repoPath, gitHead string, packageCount, symbolCount int) error {
 	return s.SetRepoMetaWith(repoPath, gitHead, packageCount, symbolCount, "")
 }
@@ -2878,11 +3239,11 @@ func (s *Store) SetRepoMissing(modulePath string, missing bool) error {
 	return err
 }
 
-// IsRepoStale reports whether a member has .go files newer than its last
-// index. A repo with no recorded index time is stale. A missing checkout is
+// IsRepoStale reports whether a member's indexed source no longer matches its
+// checkout. A repo with no recorded index time is stale. A missing checkout is
 // not stale — it is missing, which callers distinguish separately.
 func (s *Store) IsRepoStale(modulePath string) (bool, error) {
-	indexedAt, ok, err := s.RepoIndexedAt(modulePath)
+	_, ok, err := s.RepoIndexedAt(modulePath)
 	if err != nil {
 		return false, err
 	}
@@ -2904,24 +3265,11 @@ func (s *Store) IsRepoStale(modulePath string) (bool, error) {
 	if dir == "" {
 		return false, nil
 	}
-
-	// Same dirty-state logic as StaleReason: uncommitted .go edits make the
-	// index stale unless the exact state is already recorded.
-	dirty, fp, derr := vcs.GitDirtyDiff(dir, "HEAD")
-	if derr == nil {
-		stored, sok := s.dirtyFingerprint(modulePath)
-		if sok && stored == fp && !hasNewerGoFiles(dir, indexedAt) {
-			return false, nil
-		}
-		if dirty {
-			return true, nil
-		}
-	}
-	return hasNewerGoFiles(dir, indexedAt), nil
+	return s.sourceStale(modulePath, dir), nil
 }
 
 // RepoState returns the lifecycle state of a member: indexed, stale, or
-// missing. A member whose checkout vanished is missing regardless of mtimes.
+// missing. A member whose checkout vanished is missing regardless of content.
 func (s *Store) RepoState(r Repo) string {
 	if r.Missing {
 		return repoStateMissing
@@ -2929,11 +3277,10 @@ func (s *Store) RepoState(r Repo) string {
 	if _, err := os.Stat(r.Dir); os.IsNotExist(err) {
 		return repoStateMissing
 	}
-	indexedAt, ok, _ := s.RepoIndexedAt(r.ModulePath)
-	if !ok {
+	if _, ok, _ := s.RepoIndexedAt(r.ModulePath); !ok {
 		return repoStateStale
 	}
-	if hasNewerGoFiles(r.Dir, indexedAt) {
+	if s.sourceStale(r.ModulePath, r.Dir) {
 		return repoStateStale
 	}
 	return repoStateIndexed
@@ -2956,8 +3303,7 @@ type HealthInfo struct {
 	RepoPath     string
 	GitHead      string
 	IndexedVia   string // "go-list" or "dir-walk"; empty if unknown
-	Dirty        bool   // uncommitted .go changes when health was computed
-	DirtyIndexed bool   // index fingerprint matches the current dirty diff
+	Stale        bool   // indexed source no longer matches the checkout
 	PackageCount int
 	SymbolCount  int
 }
@@ -3004,10 +3350,8 @@ func (s *Store) Health() (HealthInfo, error) {
 	if err := rows.Err(); err != nil {
 		return h, err
 	}
-	if dirty, fp, derr := vcs.GitDirtyDiff(h.RepoPath, "HEAD"); derr == nil && dirty {
-		h.Dirty = true
-		stored, ok := readMetaDB(s.db, dirtyFingerprintKey)
-		h.DirtyIndexed = ok && stored == fp
+	if h.RepoPath != "" {
+		h.Stale = s.sourceStale("", h.RepoPath)
 	}
 	return h, nil
 }
@@ -3288,9 +3632,8 @@ func (s *Store) FileContentsByRepo() (map[string]map[string]string, error) {
 		if err := rows.Scan(&path, &content, &repo); err != nil {
 			return nil, err
 		}
-		if repo == "" {
-			continue
-		}
+		// Single-repo rows carry no repo assignment and bucket under "".
+		// Dropping them left runtime-contract extraction with no files.
 		if out[repo] == nil {
 			out[repo] = make(map[string]string)
 		}
@@ -3396,41 +3739,39 @@ func (s *Store) IndexedAt() (time.Time, error) {
 }
 
 // IsStale reports whether the database at dbPath should be rebuilt for the
-// repo at repoPath. A database is stale when it was never indexed, was indexed
-// for a different repo path or git HEAD, holds uncommitted .go edits relative
-// to HEAD, or has .go files newer than its index timestamp.
+// repo at repoPath.
 func IsStale(dbPath, repoPath string) (bool, error) {
 	stale, _, err := StaleReason(dbPath, repoPath)
 	return stale, err
 }
 
-// StaleReason reports whether dbPath is stale for repoPath and why. It composes
-// the same checks IsStale performs but surfaces the deciding factor so callers
-// can distinguish "uncommitted .go changes", "a .go file is newer than the
-// index", "indexed on another HEAD/path", "never indexed", and "index current".
-// Repos where git is unavailable or the repo is not under git fall back to the
-// mtime comparison only.
+// StaleReason reports whether dbPath is stale for repoPath and why. The index is
+// current exactly when the source fingerprint of the checkout matches the one
+// recorded at index time; every other case — never indexed, indexed for another
+// path, built by another analyzer, or edited/added/deleted source — is stale.
+//
+// Nothing here consults git. A commit, checkout or branch switch that leaves the
+// source bytes alone leaves the index current, and an uncommitted edit that
+// leaves them different makes it stale; the two cases git could not separate.
 func StaleReason(dbPath, repoPath string) (bool, string, error) {
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
 		return true, "database does not exist; never indexed", nil
 	}
 
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := openDB(dbPath)
 	if err != nil {
 		return true, fmt.Sprintf("open %s: %v", dbPath, err), nil
 	}
 	defer func() { _ = db.Close() }()
 
-	indexedAt, ok, err := readIndexedAtDB(db)
-	if err != nil {
+	if _, ok, err := readIndexedAtDB(db); err != nil {
 		return true, fmt.Sprintf("indexed_at meta unreadable: %v", err), nil
-	}
-	if !ok {
+	} else if !ok {
 		return true, "no indexed_at meta (never indexed)", nil
 	}
 
 	if mismatch, known := repoIdentityMismatchDB(db, repoPath); known && mismatch {
-		return true, "indexed for a different repo path or git HEAD than the served repo", nil
+		return true, "indexed for a different repo path than the served repo", nil
 	}
 
 	// An index built before generated-code detection has no provenance marker and
@@ -3446,49 +3787,71 @@ func StaleReason(dbPath, repoPath string) (bool, string, error) {
 		return true, "index was built by a different analyzer version", nil
 	}
 
-	// Uncommitted edits do not change HEAD, so mtime-based checks can miss them
-	// (e.g. git apply preserving timestamps). Diffing against HEAD catches a
-	// diverged working tree deterministically — unless that exact dirty state
-	// has already been indexed (recorded via the dirty_fingerprint meta key),
-	// in which case the index already reflects the working tree.
-	dirty, fp, derr := vcs.GitDirtyDiff(repoPath, "HEAD")
-	if derr == nil {
-		stored, ok := readMetaDB(db, dirtyFingerprintKey)
-		if ok && stored == fp && !hasNewerGoFiles(repoPath, indexedAt) {
-			return false, "index reflects the current working tree", nil
-		}
-		if dirty {
-			return true, "uncommitted .go changes not covered by the current index", nil
-		}
+	stored, ok := readMetaDB(db, sourceFingerprintKey)
+	if !ok {
+		return true, "index has no source fingerprint", nil
 	}
-
-	if hasNewerGoFiles(repoPath, indexedAt) {
-		return true, "a .go file is newer than the last index", nil
+	current, err := hashSource(repoPath, nil)
+	if err != nil {
+		return true, fmt.Sprintf("hash source: %v", err), nil
 	}
-
+	if current != stored {
+		return true, "indexed source no longer matches the working tree", nil
+	}
 	return false, "index is current", nil
 }
 
-// dirtyFingerprintKey records the working-tree .go diff a database was indexed
-// from. Scoped per module (key "dirty_fingerprint" for single-repo databases,
-// "dirty_fingerprint:<module>" for workspace members).
-const dirtyFingerprintKey = "dirty_fingerprint"
+// sourceFingerprintKey records the hash of the source an index was built from.
+// Scoped per module: "source_fingerprint" for single-repo databases,
+// "source_fingerprint:<module>" for workspace members.
+const sourceFingerprintKey = "source_fingerprint"
 
-func dirtyFingerprintMetaKey(modulePath string) string {
+func sourceFingerprintMetaKey(modulePath string) string {
 	if modulePath == "" {
-		return dirtyFingerprintKey
+		return sourceFingerprintKey
 	}
-	return dirtyFingerprintKey + ":" + modulePath
+	return sourceFingerprintKey + ":" + modulePath
 }
 
-// SetDirtyFingerprint records the working-tree .go diff fingerprint the index
-// was built from, so staleness checks can tell "already indexed this exact
-// dirty state" from "new uncommitted edits since the index".
-func (s *Store) SetDirtyFingerprint(modulePath, fp string) error {
+// SetSourceFingerprint records the source hash the index was built from.
+func (s *Store) SetSourceFingerprint(modulePath, fp string) error {
 	_, err := s.db.ExecContext(context.Background(),
 		`INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`,
-		dirtyFingerprintMetaKey(modulePath), fp)
+		sourceFingerprintMetaKey(modulePath), fp)
 	return err
+}
+
+// RecordSourceFingerprint hashes dir and records it for modulePath, so the
+// staleness check can tell an index that reflects the checkout from one that
+// does not. known supplies file contents already read for this index; the hash
+// must cover the bytes that were parsed, not whatever is on disk later.
+// Failures are silently ignored: the worst case is one extra reindex.
+func (s *Store) RecordSourceFingerprint(modulePath, dir string, known map[string]string) {
+	if fp, err := hashSource(dir, known); err == nil {
+		_ = s.SetSourceFingerprint(modulePath, fp)
+	}
+}
+
+// sourceFingerprint reads the hash recorded when this module was indexed.
+func (s *Store) sourceFingerprint(modulePath string) (string, bool) {
+	var val string
+	err := s.db.QueryRowContext(context.Background(),
+		`SELECT value FROM meta WHERE key = ?`, sourceFingerprintMetaKey(modulePath)).Scan(&val)
+	if err != nil {
+		return "", false
+	}
+	return val, true
+}
+
+// sourceStale reports whether dir's source differs from what was indexed for
+// modulePath. An unhashable tree counts as stale: a rebuild is the safe answer.
+func (s *Store) sourceStale(modulePath, dir string) bool {
+	stored, ok := s.sourceFingerprint(modulePath)
+	if !ok {
+		return true
+	}
+	current, err := hashSource(dir, nil)
+	return err != nil || current != stored
 }
 
 // churnDegradedKey records why git churn was unavailable at index time, so
@@ -3528,32 +3891,11 @@ func (s *Store) ChurnDegraded() (string, error) {
 	return val, nil
 }
 
-// RecordDirtyFingerprint captures the working-tree .go diff fingerprint of dir
-// into this database's meta for modulePath ("" for single-repo databases), so
-// staleness checks know the index already reflects this exact dirty state.
-// Failures are silently ignored: the worst case is one extra reindex.
-func (s *Store) RecordDirtyFingerprint(dir, modulePath string) {
-	if _, fp, err := vcs.GitDirtyDiff(dir, "HEAD"); err == nil {
-		_ = s.SetDirtyFingerprint(modulePath, fp)
-	}
-}
-
-// dirtyFingerprint reads the fingerprint recorded when this module was indexed.
-func (s *Store) dirtyFingerprint(modulePath string) (string, bool) {
-	var val string
-	err := s.db.QueryRowContext(context.Background(),
-		`SELECT value FROM meta WHERE key = ?`, dirtyFingerprintMetaKey(modulePath)).Scan(&val)
-	if err != nil {
-		return "", false
-	}
-	return val, true
-}
-
 // repoIdentityMismatch reports whether the DB was indexed for a different repo
-// path or git HEAD than repoPath. known is false for legacy DBs (no meta) or
-// when git is unavailable, so callers fall back to mtime-only staleness.
+// path than repoPath. known is false for legacy DBs with no recorded path, so
+// callers fall back to the source fingerprint alone.
 func repoIdentityMismatch(dbPath, repoPath string) (mismatch, known bool) {
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := openDB(dbPath)
 	if err != nil {
 		return true, true
 	}
@@ -3574,15 +3916,7 @@ func repoIdentityMismatchDB(db *sql.DB, repoPath string) (mismatch, known bool) 
 	if filepath.Clean(metaRepo) != filepath.Clean(absRepo) {
 		return true, true
 	}
-	metaHead, ok := readMetaDB(db, "git_head")
-	if !ok {
-		return false, false
-	}
-	head, err := vcs.GitHead(absRepo)
-	if err != nil {
-		return false, false
-	}
-	return metaHead != head, true
+	return false, true
 }
 
 func readMetaDB(db *sql.DB, key string) (string, bool) {
@@ -3607,49 +3941,4 @@ func readIndexedAtDB(db *sql.DB) (time.Time, bool, error) {
 		return time.Time{}, false, fmt.Errorf("parse indexed_at %q: %w", val, err)
 	}
 	return indexedAt, true, nil
-}
-
-func hasNewerGoFiles(repoPath string, indexedAt time.Time) bool {
-	stale := false
-	err := filepath.Walk(repoPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil || stale {
-			return err
-		}
-		if !info.IsDir() {
-			return nil
-		}
-		if skipStaleDir(info.Name()) {
-			return filepath.SkipDir
-		}
-		if dirHasNewerGoFile(path, indexedAt) {
-			stale = true
-			return filepath.SkipDir
-		}
-		return nil
-	})
-	if err != nil {
-		return true
-	}
-	return stale
-}
-
-func skipStaleDir(name string) bool {
-	return strings.HasPrefix(name, ".") || name == "vendor" || name == "node_modules"
-}
-
-func dirHasNewerGoFile(dir string, indexedAt time.Time) bool {
-	entries, _ := os.ReadDir(dir)
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") {
-			continue
-		}
-		fi, err := e.Info()
-		if err != nil {
-			continue
-		}
-		if fi.ModTime().After(indexedAt) {
-			return true
-		}
-	}
-	return false
 }

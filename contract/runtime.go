@@ -3,6 +3,7 @@ package contract
 import (
 	"bytes"
 	"fmt"
+	"path"
 	"regexp"
 	"strings"
 	"sync/atomic"
@@ -44,6 +45,13 @@ type RuntimeExtractor struct {
 	// ConfigPatterns are regexes matching config literals that name a produced
 	// entity (e.g. `StreamConfig{Name: "..."}`); capture group 1 is the literal.
 	ConfigPatterns []string
+	// LiteralPatterns are regexes matched against raw file content, for entities
+	// that never reach a known method call: a key prefix held in a local
+	// variable (`prefix := "krucil/"`) or a wildcard subject passed to a helper.
+	// Each regex must match a quoted literal and capture group 1 is the entity.
+	// Scanning is gated by ImportsMatch, so the shape alone never creates an
+	// entity in a file that does not speak the protocol.
+	LiteralPatterns []string
 	// ArgIndex selects the first string-literal argument holding the entity,
 	// 0-based. Every string-literal argument from ArgIndex to the call end is
 	// captured (multi-key commands). Default 0 captures the first string
@@ -98,7 +106,11 @@ func DefaultRuntimeExtractors() []RuntimeExtractor {
 			ImportsMatch:    []string{extractorNameRedis, "valkey", "rueidis", "keydb"},
 			ProducerMethods: redisWriterMethods,
 			ConsumerMethods: redisReaderMethods,
-			Normalize:       NormalizeRedisKey,
+			LiteralPatterns: []string{
+				// A key prefix bound to a variable, e.g. `prefix := "krucil/"`.
+				`"([a-z][a-z0-9_-]*/)"`,
+			},
+			Normalize: NormalizeRedisKey,
 		},
 		{
 			Kind:            store.RuntimeContractJetStream,
@@ -108,6 +120,11 @@ func DefaultRuntimeExtractors() []RuntimeExtractor {
 			ConsumerMethods: []string{"Subscribe", "SubscribeSync"},
 			ConfigPatterns: []string{
 				`StreamConfig\s*\{[^}]*?(?:Name|Subject|FilterSubject)\s*:\s*\[?[^"]*"([^"\n]+)"`,
+			},
+			LiteralPatterns: []string{
+				// A wildcard subject passed to a project helper, e.g.
+				// `addStream(ctx, S, []string{"agent.task.>"}, ...)`.
+				`"([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*\.>)"`,
 			},
 			Normalize: NormalizeJetStreamSubject,
 		},
@@ -141,6 +158,7 @@ const WSTypePrefix = "MsgType"
 // call-site methods indexed by role.
 type compiledExtractor struct {
 	config    *regexp.Regexp
+	literal   *regexp.Regexp
 	normalize func(string) string
 	methods   map[string]store.ContractDirection
 	def       RuntimeExtractor
@@ -152,6 +170,9 @@ func (e RuntimeExtractor) compile() *compiledExtractor {
 	ce := &compiledExtractor{def: e, normalize: e.Normalize}
 	if len(e.ConfigPatterns) > 0 {
 		ce.config = regexp.MustCompile(strings.Join(e.ConfigPatterns, "|"))
+	}
+	if len(e.LiteralPatterns) > 0 {
+		ce.literal = regexp.MustCompile(strings.Join(e.LiteralPatterns, "|"))
 	}
 	ce.decode = e.DecodeSwitch
 	ce.methods = make(map[string]store.ContractDirection, len(e.ProducerMethods)+len(e.ConsumerMethods))
@@ -210,6 +231,9 @@ func mergeRuntimeExtractor(base, c RuntimeExtractor) RuntimeExtractor {
 	}
 	if len(c.ConfigPatterns) > 0 {
 		m.ConfigPatterns = unionStrings(base.ConfigPatterns, c.ConfigPatterns)
+	}
+	if len(c.LiteralPatterns) > 0 {
+		m.LiteralPatterns = unionStrings(base.LiteralPatterns, c.LiteralPatterns)
 	}
 	if c.ConstPrefix != "" {
 		m.ConstPrefix = c.ConstPrefix
@@ -372,7 +396,7 @@ func extractConstContracts(ce *compiledExtractor, symbols map[string]store.Symbo
 			Pattern:   ce.normalize(value),
 			FromRef:   qn,
 			Direction: store.ContractDirectionShared,
-			Evidence:  fmt.Sprintf("%s type constant %q in %s", ce.def.Name, value, repo),
+			Evidence:  fmt.Sprintf("%s type constant %q at %s:%d", ce.def.Name, value, sym.PosFile, sym.PosLine),
 			IndexedAt: now,
 			Repo:      repo,
 		})
@@ -388,21 +412,57 @@ func extractCallSiteContracts(ce *compiledExtractor, symbols map[string]store.Sy
 		return nil
 	}
 	contracts := make([]store.RuntimeContract, 0)
+	var consts caseConsts
+	if ce.decode {
+		consts = buildCaseConsts(symbols)
+	}
 	for path, content := range files {
 		if !allowedByImports(ce, imports[path]) {
 			continue
 		}
+		// The pattern pass is a fallback for a literal that never reaches a
+		// known method call, so a site an earlier pass already recorded must
+		// not be reported again as "shared". DeleteServer's "cached/" appeared
+		// twice for this reason, once as producer and once as shared.
+		recorded := make(map[string]bool)
 		if len(ce.methods) > 0 {
-			contracts = append(contracts, extractCallLiterals(ce, symbols, []byte(content), path, repo, now)...)
+			callContracts := extractCallLiterals(ce, symbols, []byte(content), path, repo, now)
+			markRecorded(recorded, callContracts)
+			contracts = append(contracts, callContracts...)
 		}
 		if ce.config != nil {
-			contracts = append(contracts, extractConfigLiterals(ce, symbols, content, path, repo, now)...)
+			configContracts := extractConfigLiterals(ce, symbols, content, path, repo, now)
+			markRecorded(recorded, configContracts)
+			contracts = append(contracts, configContracts...)
+		}
+		if ce.literal != nil {
+			contracts = append(contracts, extractPatternLiterals(ce, symbols, content, path, repo, now, recorded)...)
 		}
 		if ce.decode && constPrefixPresent(ce, content, symbols, path) {
-			contracts = append(contracts, extractDecodeSwitchLiterals(ce, symbols, content, path, repo, now)...)
+			contracts = append(contracts, extractDecodeSwitchLiterals(ce, symbols, consts, content, path, repo, now)...)
 		}
 	}
 	return contracts
+}
+
+// markRecorded notes the (from_ref, pattern, line) triples a pass has already
+// claimed, so a later pass cannot re-emit the same site.
+func markRecorded(recorded map[string]bool, contracts []store.RuntimeContract) {
+	for _, c := range contracts {
+		recorded[siteKey(c.FromRef, c.Pattern, c.Evidence)] = true
+	}
+}
+
+// siteKey identifies a capture site. Evidence reads "<name> <direction> literal
+// %q at <path>:<line>", so only the trailing "at <path>:<line>" identifies the
+// site; the direction word must not, or a producer and a shared capture at the
+// same place would look distinct.
+func siteKey(fromRef, pattern, evidence string) string {
+	site := evidence
+	if i := strings.LastIndex(evidence, " at "); i >= 0 {
+		site = evidence[i:]
+	}
+	return fromRef + "\x00" + pattern + "\x00" + site
 }
 
 // allowedByImports reports whether the extractor's import gate permits scanning
@@ -462,16 +522,166 @@ func extractConfigLiterals(ce *compiledExtractor, symbols map[string]store.Symbo
 	return contracts
 }
 
-func extractDecodeSwitchLiterals(ce *compiledExtractor, symbols map[string]store.Symbol, content, path, repo, now string) []store.RuntimeContract {
+// extractPatternLiterals captures protocol literals that never reach a known
+// method call — a key prefix bound to a local variable, or a wildcard subject
+// handed to a project helper. The extractor's import gate has already confirmed
+// the file speaks the protocol, so shape plus gate is the evidence.
+func extractPatternLiterals(ce *compiledExtractor, symbols map[string]store.Symbol, content, path, repo, now string, recorded map[string]bool) []store.RuntimeContract {
 	var contracts []store.RuntimeContract
+	seen := make(map[string]bool)
 	for i, line := range strings.Split(content, "\n") {
-		lineNo := i + 1
-		for _, lit := range collectCaseLiterals([]byte(line)) {
-			fromRef := enclosingSymbol(symbols, path, lineNo)
-			contracts = append(contracts, decodeCaseContract(ce, lit, fromRef, path, lineNo, repo, now))
+		for _, m := range ce.literal.FindAllStringSubmatch(line, -1) {
+			if len(m) < 2 || m[1] == "" {
+				continue
+			}
+			pattern := ce.normalize(m[1])
+			if seen[pattern] {
+				continue
+			}
+			seen[pattern] = true
+			fromRef := enclosingSymbol(symbols, path, i+1)
+			contract := newCallContract(ce, store.ContractDirectionShared, m[1], fromRef, path, i+1, repo, now)
+			if recorded[siteKey(contract.FromRef, contract.Pattern, contract.Evidence)] {
+				continue
+			}
+			contracts = append(contracts, contract)
 		}
 	}
 	return contracts
+}
+
+func extractDecodeSwitchLiterals(ce *compiledExtractor, symbols map[string]store.Symbol, consts caseConsts, content, path, repo, now string) []store.RuntimeContract {
+	lines := strings.Split(content, "\n")
+	src := []byte(content)
+	pkgPath := filePackagePath(symbols, path)
+	var contracts []store.RuntimeContract
+	for _, kw := range caseKeywords(src) {
+		lineNo := bytes.Count(src[:kw], []byte{'\n'}) + 1
+		// Only a switch on a message-type discriminator decodes wire types. A
+		// status or record-type switch in the same file is application logic;
+		// capturing it produced "FAILED"/"EXECVE" as ws_type contracts.
+		if subject, ok := owningSwitchSubject(lines, lineNo-1); !ok || !isMsgTypeSubject(subject) {
+			continue
+		}
+		fromRef := enclosingSymbol(symbols, path, lineNo)
+		for _, operand := range caseOperands(src, kw) {
+			for _, lit := range consts.values(pkgPath, operand) {
+				contracts = append(contracts, decodeCaseContract(ce, lit, fromRef, path, lineNo, repo, now))
+			}
+		}
+	}
+	return contracts
+}
+
+// caseOperands reads the operand list of the `case` clause starting at src[i],
+// up to the terminating ':' at bracket depth zero. A clause spans several lines
+// as soon as gofmt wraps it, and a line-based scan then dropped every operand
+// after the first — which is how `deploy`, `status`, and `watcher` went missing
+// from a single wrapped `case` list.
+func caseOperands(src []byte, i int) []string {
+	var out []string
+	depth := 0
+	start := i
+	flush := func(end int) {
+		if operand := strings.TrimSpace(string(src[start:end])); operand != "" {
+			out = append(out, operand)
+		}
+	}
+	for i < len(src) {
+		switch src[i] {
+		case '"', '`', '\'':
+			i = skipStringLiteral(src, i)
+			continue
+		case '/':
+			if i+1 < len(src) && (src[i+1] == '/' || src[i+1] == '*') {
+				i = skipIgnored(src, i)
+				continue
+			}
+		case '(', '[', '{':
+			depth++
+		case '}', ')', ']':
+			if depth == 0 {
+				return out
+			}
+			depth--
+		case ',':
+			if depth == 0 {
+				flush(i)
+				start = i + 1
+			}
+		case ':':
+			if depth == 0 {
+				flush(i)
+				return out
+			}
+		}
+		i++
+	}
+	return out
+}
+
+// caseConsts resolves a case operand to the string values it denotes, so a
+// switch listing a constant captures the wire value instead of the identifier.
+// A bare name resolves within the file's own package; a selector resolves
+// against any package whose base name matches the qualifier.
+type caseConsts struct {
+	byQualifiedName map[string][]string
+	byBaseName      map[string][]string
+}
+
+func buildCaseConsts(symbols map[string]store.Symbol) caseConsts {
+	c := caseConsts{
+		byQualifiedName: make(map[string][]string),
+		byBaseName:      make(map[string][]string),
+	}
+	for qn, sym := range symbols {
+		if sym.Kind != kindConst || sym.PackagePath == "" {
+			continue
+		}
+		value := extractStringConst(sym.Signature)
+		if value == "" {
+			continue
+		}
+		c.byQualifiedName[qn] = append(c.byQualifiedName[qn], value)
+		key := path.Base(sym.PackagePath) + "." + sym.Name
+		c.byBaseName[key] = append(c.byBaseName[key], value)
+	}
+	return c
+}
+
+// values returns the string values an operand denotes: the literal itself when
+// it is quoted, else the constants its identifier names. A non-constant operand
+// (a type-switch case, an expression) yields nothing.
+func (c caseConsts) values(pkgPath, operand string) []string {
+	if lit, ok := quotedLiteral(operand); ok {
+		return []string{lit}
+	}
+	if strings.ContainsAny(operand, " \t()+") {
+		return nil
+	}
+	if strings.Contains(operand, ".") {
+		return c.byBaseName[operand]
+	}
+	return c.byQualifiedName[pkgPath+"."+operand]
+}
+
+// quotedLiteral reports whether the operand is exactly one quoted string.
+func quotedLiteral(operand string) (string, bool) {
+	if operand == "" || (operand[0] != '"' && operand[0] != '`') {
+		return "", false
+	}
+	lit, end := scanStringLiteral([]byte(operand), 0)
+	return lit, end == len(operand)
+}
+
+// filePackagePath returns the package a file's declarations belong to.
+func filePackagePath(symbols map[string]store.Symbol, path string) string {
+	for _, sym := range symbols {
+		if sym.PosFile == path && sym.PackagePath != "" {
+			return sym.PackagePath
+		}
+	}
+	return ""
 }
 
 // newCallContract builds a runtime contract for a call-site or config-literal
@@ -742,31 +952,117 @@ func scanStringLiteral(src []byte, i int) (string, int) {
 	return string(src[i+1 : j-1]), j
 }
 
-var caseKwRe = regexp.MustCompile(`case\s+`)
-
-// collectCaseLiterals extracts the string-literal operand of every `case "x":`
-// (or backtick) clause on a single line, using the shared literal scanner.
-// Comment-only lines are skipped to avoid capturing commented-out cases.
-func collectCaseLiterals(line []byte) []string {
-	if len(line) == 0 {
-		return nil
-	}
-	trimmed := bytes.TrimSpace(line)
-	if bytes.HasPrefix(trimmed, []byte("//")) || bytes.HasPrefix(trimmed, []byte("/*")) {
-		return nil
-	}
-	var out []string
-	for _, idx := range caseKwRe.FindAllIndex(line, -1) {
-		i := idx[1]
-		for i < len(line) && (line[i] == ' ' || line[i] == '\t') {
+// caseKeywords returns the offset just past every `case` keyword, skipping
+// strings and comments so a commented-out or quoted `case` is never a clause.
+func caseKeywords(src []byte) []int {
+	var out []int
+	for i := 0; i < len(src); {
+		i = skipIgnored(src, i)
+		if i >= len(src) {
+			break
+		}
+		if !isIdentStart(src[i]) {
 			i++
+			continue
 		}
-		if i < len(line) && (line[i] == '"' || line[i] == '`') {
-			lit, _ := scanStringLiteral(line, i)
-			out = append(out, lit)
+		j := i
+		for j < len(src) && isIdentPart(src[j]) {
+			j++
 		}
+		if string(src[i:j]) == "case" {
+			out = append(out, j)
+		}
+		i = j
 	}
 	return out
+}
+
+// msgTypeSubjects are the selector field names that carry a message-type
+// discriminator. A decode switch on one of these decodes wire message types; a
+// switch on any other subject (a status string, an audit record type) is
+// application logic and must not become a ws_type contract.
+var msgTypeSubjects = map[string]bool{
+	"For":     true,
+	"MsgType": true,
+	"Msgtype": true,
+}
+
+// switchSubject returns the expression a line's `switch` statement switches on.
+// ok is false for an expression switch (`switch {`) and for non-switch lines.
+func switchSubject(line string) (string, bool) {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "switch") {
+		return "", false
+	}
+	rest, _, found := strings.Cut(trimmed[len("switch"):], "{")
+	if !found {
+		return "", false
+	}
+	subject := strings.TrimSpace(rest)
+	if subject == "" {
+		return "", false
+	}
+	return subject, true
+}
+
+// isMsgTypeSubject reports whether a switch subject names a message-type field.
+// A bare identifier qualifies only when it says so in its name, because
+// `switch msgType` is common while `switch status` is not a wire discriminator.
+func isMsgTypeSubject(subject string) bool {
+	if _, field, found := strings.CutLast(subject, "."); found {
+		return msgTypeSubjects[field]
+	}
+	return strings.Contains(strings.ToLower(subject), "msgtype")
+}
+
+// owningSwitchSubject finds the switch statement a case clause belongs to: the
+// nearest preceding `switch` whose body has not been closed. Brace depth is
+// tracked with strings and comments skipped, because gofmt puts a `case` at the
+// same indent as its `switch`, so indentation cannot identify the owner.
+func owningSwitchSubject(lines []string, caseIdx int) (string, bool) {
+	depth := 0
+	for i := caseIdx - 1; i >= 0; i-- {
+		// Backwards, a closing brace opens a block we just left, and an opening
+		// brace closes one. Depth below zero means this line opened the block
+		// that contains the case clause.
+		depth -= braceDelta(lines[i])
+		if depth >= 0 {
+			continue
+		}
+		if subject, ok := switchSubject(lines[i]); ok {
+			return subject, true
+		}
+		depth = 0
+	}
+	return "", false
+}
+
+// braceDelta returns net '{' minus '}' on a line, ignoring strings, runes, and
+// comments so a literal like "{" does not skew the depth.
+func braceDelta(line string) int {
+	src := []byte(line)
+	delta := 0
+	for i := 0; i < len(src); {
+		switch src[i] {
+		case '"', '`', '\'':
+			i = skipStringLiteral(src, i)
+			continue
+		case '/':
+			if i+1 < len(src) && (src[i+1] == '/' || src[i+1] == '*') {
+				i = skipIgnored(src, i)
+				if i < len(src) && src[i] == '\n' {
+					i++
+				}
+				continue
+			}
+		case '{':
+			delta++
+		case '}':
+			delta--
+		}
+		i++
+	}
+	return delta
 }
 
 // contentHasIdentPrefix reports whether the source contains an identifier

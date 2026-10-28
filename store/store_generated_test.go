@@ -189,6 +189,7 @@ func TestStaleUntilGeneratedProvenanceRecorded(t *testing.T) {
 	if err := s.SetIndexedAt(time.Now()); err != nil {
 		t.Fatal(err)
 	}
+	s.RecordSourceFingerprint("", repo, files)
 
 	stale, reason, err = StaleReason(dbPath, repo)
 	if err != nil {

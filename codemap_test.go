@@ -546,11 +546,11 @@ func TestPackageQuery(t *testing.T) {
 	if pkg.Name != "simple" {
 		t.Errorf("expected name 'simple', got '%s'", pkg.Name)
 	}
-	if len(pkg.ExportedSymbols) == 0 {
+	if len(pkg.Symbols) == 0 {
 		t.Fatal("expected at least one exported symbol")
 	}
 
-	for _, sym := range pkg.ExportedSymbols {
+	for _, sym := range pkg.Symbols {
 		if sym.PosFile == "" {
 			t.Errorf("expected PosFile for %s", sym.QualifiedName)
 		}
@@ -986,20 +986,20 @@ func TestPackageWithUnexported(t *testing.T) {
 		t.Fatalf("package query error: %v", err)
 	}
 
-	exportedCount := len(pkg.ExportedSymbols)
+	exportedCount := len(pkg.Symbols)
 
 	pkgWithUnexported, err := query.Package(s, "codemap/testdata/simple", query.WithUnexported())
 	if err != nil {
 		t.Fatalf("package query with unexported error: %v", err)
 	}
 
-	if len(pkgWithUnexported.ExportedSymbols) <= exportedCount {
+	if len(pkgWithUnexported.Symbols) <= exportedCount {
 		t.Errorf("expected WithUnexported to return more symbols than without (%d <= %d)",
-			len(pkgWithUnexported.ExportedSymbols), exportedCount)
+			len(pkgWithUnexported.Symbols), exportedCount)
 	}
 
 	hasUnexported := false
-	for _, sym := range pkgWithUnexported.ExportedSymbols {
+	for _, sym := range pkgWithUnexported.Symbols {
 		if !sym.Exported {
 			hasUnexported = true
 			break

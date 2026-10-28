@@ -9,6 +9,7 @@ import (
 	"go/token"
 	"math"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -31,6 +32,7 @@ type Options struct {
 	IncludeTests      bool
 	IncludeUnexported bool
 	IncludeFields     bool
+	IncludeSymbols    bool
 }
 
 // Option mutates query Options. Alias of opt.Option[Options], so existing
@@ -74,6 +76,15 @@ func WithFields() Option {
 	}
 }
 
+// WithSymbols makes overview include each package's full symbol list. Off by
+// default: the inventory was 248 KB on a mid-sized repo, always over the
+// response limit, so orientation cost a round trip before it could be read.
+func WithSymbols() Option {
+	return func(o *Options) {
+		o.IncludeSymbols = true
+	}
+}
+
 // WithEdgeTypes restricts returned edges to the given types. Kept variadic
 // so call sites can pass both single values and spread slices.
 func WithEdgeTypes(types ...string) Option {
@@ -83,25 +94,27 @@ func WithEdgeTypes(types ...string) Option {
 }
 
 type PackageSummary struct {
-	Path            string
-	Name            string
-	Repo            string `json:"repo,omitempty"`
-	ExportedSymbols []SymbolDetail
-	ImportCount     int
+	Path        string         `json:"path"`
+	Name        string         `json:"name"`
+	Doc         string         `json:"doc"`
+	Repo        string         `json:"repo,omitempty"`
+	Symbols     []SymbolDetail `json:"symbols,omitempty"`
+	ImportCount int            `json:"import_count"`
+	SymCount    int            `json:"sym_count"`
 }
 
 type SymbolDetail struct {
-	QualifiedName string
-	Kind          string
-	Receiver      string
-	Signature     string
-	Doc           string
-	PosFile       string
+	QualifiedName string              `json:"qualified_name"`
+	Kind          string              `json:"kind"`
+	Receiver      string              `json:"receiver"`
+	Signature     string              `json:"signature"`
+	Doc           string              `json:"doc"`
+	PosFile       string              `json:"pos_file"`
 	Repo          string              `json:"repo,omitempty"`
 	Fields        []store.SymbolField `json:"fields,omitempty"`
-	PosLine       int
-	Exported      bool
-	Generated     bool
+	PosLine       int                 `json:"pos_line"`
+	Exported      bool                `json:"exported"`
+	Generated     bool                `json:"generated"`
 }
 
 type EdgeDetail struct {
@@ -114,20 +127,26 @@ type EdgeDetail struct {
 	Sites     []store.Site `json:"sites"`
 	PosLine   int          `json:"pos_line"`
 	SiteCount int          `json:"site_count"`
+	External  bool         `json:"external,omitempty"`
+	Dispatch  bool         `json:"dispatch,omitempty"`
 }
 
 type ShowResult struct {
 	IncomingEdges []EdgeDetail `json:"incoming_edges"`
 	OutgoingEdges []EdgeDetail `json:"outgoing_edges"`
 	Symbol        SymbolDetail `json:"symbol"`
+	// Declarations counts declarations sharing the queried qualified name. More
+	// than one means the payload describes one of several and its edges are
+	// merged across all of them, so a reader must know which file it is seeing.
+	Declarations int `json:"declarations,omitempty"`
 }
 
 type OverviewResult struct {
-	Packages      []PackageSummary
-	Repos         []RepoSummary
-	TotalPackages int
-	TotalSymbols  int
-	TotalEdges    int
+	Packages      []PackageSummary `json:"packages"`
+	Repos         []RepoSummary    `json:"repos"`
+	TotalPackages int              `json:"total_packages"`
+	TotalSymbols  int              `json:"total_symbols"`
+	TotalEdges    int              `json:"total_edges"`
 }
 
 // RepoSummary reports one workspace member's lifecycle state and index time.
@@ -139,17 +158,17 @@ type RepoSummary struct {
 }
 
 type SearchResult struct {
-	QualifiedName string
-	Kind          string
-	Signature     string
-	Doc           string
-	Receiver      string
-	PosFile       string
+	QualifiedName string              `json:"qualified_name"`
+	Kind          string              `json:"kind"`
+	Signature     string              `json:"signature"`
+	Doc           string              `json:"doc"`
+	Receiver      string              `json:"receiver"`
+	PosFile       string              `json:"pos_file"`
 	Repo          string              `json:"repo,omitempty"`
 	Fields        []store.SymbolField `json:"fields,omitempty"`
-	PosLine       int
-	Exported      bool
-	Generated     bool
+	PosLine       int                 `json:"pos_line"`
+	Exported      bool                `json:"exported"`
+	Generated     bool                `json:"generated"`
 }
 
 func edgeTypeAllowed(edgeType string, allowed []string) bool {
@@ -251,6 +270,7 @@ const kindAlias = "alias"
 const changeTypeModified = "modified"
 const changeTypeAdded = "added"
 const changeTypeRemoved = "removed"
+const changeTypeRenamed = "renamed"
 
 // traverse walks the edge graph level by level, fetching every edge for the
 // whole frontier in one batched query per depth instead of one query per
@@ -332,7 +352,60 @@ func CallersOf(s *store.Store, qualifiedName string, opts ...Option) ([]EdgeDeta
 	if err != nil {
 		return nil, err
 	}
-	return filterEdges(edges, options.Repo), nil
+	if err := markExternal(s, edges); err != nil {
+		return nil, err
+	}
+	dispatch, err := dispatchRows(s, qualifiedName)
+	if err != nil {
+		return nil, err
+	}
+	return filterEdges(append(edges, dispatch...), options.Repo), nil
+}
+
+// dispatchRows returns the sites where a method's receiver type escapes into an
+// interface. Such a method has no calls edge onto itself, so without these rows
+// a method reached only through interface dispatch reads as uncalled. The rows
+// point at the receiver type, not at a synthesised call: dispatch does not
+// claim a call site that the code does not have.
+func dispatchRows(s *store.Store, qualifiedName string) ([]EdgeDetail, error) {
+	sym, err := s.SymbolByName(qualifiedName)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if sym.Kind != kindMethod || sym.Receiver == "" {
+		return nil, nil
+	}
+	recvQN := sym.PackagePath + "." + receiverBaseName(sym.Receiver)
+	recv, err := s.SymbolByName(recvQN)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if recv.Kind == kindInterface {
+		return nil, nil
+	}
+	edges, err := s.EdgesTo(recvQN)
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]EdgeDetail, 0, len(edges))
+	for _, e := range edges {
+		if e.EdgeType != edgeTypeReferences && e.EdgeType != edgeTypeSatisfies && e.EdgeType != edgeTypeEmbeds {
+			continue
+		}
+		if e.FromRef == recvQN || strings.HasPrefix(e.FromRef, recvQN+".") {
+			continue
+		}
+		row := edgeToDetail(e)
+		row.Dispatch = true
+		rows = append(rows, row)
+	}
+	return rows, nil
 }
 
 func CalleesOf(s *store.Store, qualifiedName string, opts ...Option) ([]EdgeDetail, error) {
@@ -349,7 +422,42 @@ func CalleesOf(s *store.Store, qualifiedName string, opts ...Option) ([]EdgeDeta
 	if err != nil {
 		return nil, err
 	}
+	if err := markExternal(s, edges); err != nil {
+		return nil, err
+	}
 	return filterEdges(edges, options.Repo), nil
+}
+
+// markExternal flags edges whose far endpoint is not in the index, so a reader
+// can tell "this call goes to stdlib or a dependency" from "this symbol is in
+// the project". Without it every graph read ends in a follow-up show that
+// errors, and the caller has to know Go's stdlib by heart to interpret a ref.
+// The check is one batched lookup per call, not one per edge.
+func markExternal(s *store.Store, edges []EdgeDetail) error {
+	if len(edges) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(edges))
+	for _, e := range edges {
+		if e.ToRef != "" {
+			names = append(names, e.ToRef)
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	known, err := s.SymbolsByNames(names)
+	if err != nil {
+		return fmt.Errorf("mark external refs: %w", err)
+	}
+	present := make(map[string]bool, len(known))
+	for _, sym := range known {
+		present[sym.QualifiedName] = true
+	}
+	for i := range edges {
+		edges[i].External = edges[i].ToRef != "" && !present[edges[i].ToRef]
+	}
+	return nil
 }
 
 // requireSymbol rejects an unknown start node. Without it a typo (or a
@@ -370,13 +478,14 @@ func Show(s *store.Store, qualifiedName string, opts ...Option) (*ShowResult, er
 	options := &Options{}
 	opt.Apply(options, opts)
 
-	sym, err := s.SymbolByName(qualifiedName)
+	decls, err := s.SymbolsByNameExact(qualifiedName, options.IncludeTests)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, symbolMissError(s, qualifiedName)
-		}
 		return nil, err
 	}
+	if len(decls) == 0 {
+		return nil, symbolMissError(s, qualifiedName)
+	}
+	sym := decls[0]
 	if repoMismatch(sym.Repo, options.Repo) {
 		return nil, fmt.Errorf("symbol %s not found in repo %s", qualifiedName, options.Repo)
 	}
@@ -405,6 +514,7 @@ func Show(s *store.Store, qualifiedName string, opts ...Option) (*ShowResult, er
 			Generated:     sym.IsGenerated,
 			Repo:          sym.Repo,
 		},
+		Declarations:  len(decls),
 		IncomingEdges: []EdgeDetail{},
 		OutgoingEdges: []EdgeDetail{},
 	}
@@ -415,6 +525,9 @@ func Show(s *store.Store, qualifiedName string, opts ...Option) (*ShowResult, er
 
 	for _, e := range outgoing {
 		result.OutgoingEdges = append(result.OutgoingEdges, edgeToDetail(e))
+	}
+	if err := markExternal(s, result.OutgoingEdges); err != nil {
+		return nil, err
 	}
 
 	return result, nil
@@ -429,7 +542,7 @@ func Overview(s *store.Store, opts ...Option) (*OverviewResult, error) {
 		return nil, err
 	}
 
-	result := &OverviewResult{}
+	result := &OverviewResult{Repos: []RepoSummary{}}
 
 	importCounts, err := s.ImportCounts()
 	if err != nil {
@@ -444,7 +557,7 @@ func Overview(s *store.Store, opts ...Option) (*OverviewResult, error) {
 			continue
 		}
 
-		summary, err := buildPackageSummary(s, p, options.IncludeTests, importCounts)
+		summary, err := buildPackageSummary(s, p, options.IncludeTests, options.IncludeSymbols, importCounts)
 		if err != nil {
 			return nil, err
 		}
@@ -452,13 +565,14 @@ func Overview(s *store.Store, opts ...Option) (*OverviewResult, error) {
 	}
 
 	result.TotalPackages = len(result.Packages)
-	for _, pkg := range result.Packages {
-		result.TotalSymbols += len(pkg.ExportedSymbols)
-	}
-	totalEdges, err := s.CountEdges()
+	// Totals are index-wide, matching reindex and health. Summing the exported
+	// rows per package reported roughly a third of the index and made the two
+	// tools disagree about how big the repo is.
+	_, totalSymbols, totalEdges, err := s.Counts()
 	if err != nil {
-		return nil, fmt.Errorf("overview: counting edges: %w", err)
+		return nil, fmt.Errorf("overview: counting rows: %w", err)
 	}
+	result.TotalSymbols = totalSymbols
 	result.TotalEdges = totalEdges
 
 	repos, err := s.WorkspaceHealth()
@@ -480,27 +594,31 @@ func Overview(s *store.Store, opts ...Option) (*OverviewResult, error) {
 	return result, nil
 }
 
-func buildPackageSummary(s *store.Store, p store.Package, includeTests bool, importCounts map[string]int) (PackageSummary, error) {
+func buildPackageSummary(s *store.Store, p store.Package, includeTests, includeSymbols bool, importCounts map[string]int) (PackageSummary, error) {
+	summary := PackageSummary{
+		Path:        p.Path,
+		Name:        p.Name,
+		Doc:         p.Doc,
+		Repo:        p.Repo,
+		ImportCount: importCounts[p.Path],
+		SymCount:    p.SymCount,
+	}
+	if !includeSymbols {
+		return summary, nil
+	}
+
 	syms, err := s.SymbolsByPackage(p.Path, includeTests)
 	if err != nil {
 		return PackageSummary{}, fmt.Errorf("overview: symbols for %s: %w", p.Path, err)
 	}
-
-	summary := PackageSummary{
-		Path:        p.Path,
-		Name:        p.Name,
-		Repo:        p.Repo,
-		ImportCount: importCounts[p.Path],
-
-		ExportedSymbols: symbolDetails(syms, false, false)}
-
+	summary.Symbols = symbolDetails(syms, false, false)
 	return summary, nil
 }
 
 // symbolDetails converts store symbols to query details, keeping only exported
 // symbols unless includeUnexported is set. Fields are attached only on request.
 func symbolDetails(syms []store.Symbol, includeUnexported, includeFields bool) []SymbolDetail {
-	var symbols []SymbolDetail
+	symbols := make([]SymbolDetail, 0, len(syms))
 	for _, sym := range syms {
 		if !includeUnexported && !sym.Exported {
 			continue
@@ -558,9 +676,12 @@ func Search(s *store.Store, pattern string, opts ...Option) ([]SearchResult, err
 	var syms []store.Symbol
 	var err error
 	if options.File != "" {
-		syms, err = s.SearchSymbolsByFile(options.File, options.Kind, options.Exported, options.IncludeTests, options.Generated)
+		syms, err = s.SearchSymbolsByFile(options.File, "", nil, options.IncludeTests, options.Generated)
+		if err == nil {
+			syms = filterSymbolsByPattern(syms, pattern)
+		}
 	} else {
-		syms, err = s.SearchSymbols(pattern, options.Kind, options.Exported, options.Package, options.IncludeTests, options.Generated)
+		syms, err = s.SearchSymbols(pattern, "", nil, options.Package, options.IncludeTests, options.Generated)
 	}
 	if err != nil {
 		return nil, err
@@ -568,13 +689,76 @@ func Search(s *store.Store, pattern string, opts ...Option) ([]SearchResult, err
 
 	// Rank the matches before projecting them, so the ordering keys (test and
 	// generated provenance) do not have to be carried on the result payload.
-	if options.File == "" {
-		sortSymbolsForSearch(syms, strings.ToLower(pattern))
-	}
+	sortSymbolsForSearch(syms, strings.ToLower(pattern))
 
 	result := searchResultsFromSymbols(syms, options.IncludeFields)
 
-	return filterSearchResults(result, options.Repo), nil
+	return filterSearchResults(filterSearchResultsByOptions(result, options), options.Repo), nil
+}
+
+// filterSearchResultsByOptions applies the kind, exported and file filters to a
+// projected result set. Every search mode goes through it, so an argument the
+// caller passed is never silently dropped; prefix and method mode used to
+// ignore kind and exported entirely.
+func filterSearchResultsByOptions(results []SearchResult, options *Options) []SearchResult {
+	if options.Kind == "" && options.Exported == nil && options.File == "" {
+		return results
+	}
+	out := make([]SearchResult, 0, len(results))
+	for _, r := range results {
+		if !kindMatches(r.Kind, options.Kind) {
+			continue
+		}
+		if options.Exported != nil && r.Exported != *options.Exported {
+			continue
+		}
+		if options.File != "" && !strings.Contains(r.PosFile, options.File) {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// kindMatches reports whether a symbol kind satisfies a kind filter. "type"
+// also accepts interfaces and aliases: both name a type, and excluding them
+// made a type lookup miss a live alias with no hint that it existed under
+// another kind. A filter naming interface or alias stays exact.
+func kindMatches(kind, want string) bool {
+	if want == "" {
+		return true
+	}
+	if kind == want {
+		return true
+	}
+	return want == kindType && (kind == kindInterface || kind == kindAlias)
+}
+
+// filterSymbolsByPattern applies the pattern to symbols already narrowed by a
+// file filter. The file query only knows the path, so without this the pattern
+// was silently dropped and a scoped search returned every symbol in the file.
+// Matching mirrors the FTS columns: name, qualified name, signature and doc.
+func filterSymbolsByPattern(syms []store.Symbol, pattern string) []store.Symbol {
+	pattern = strings.ToLower(strings.TrimSpace(pattern))
+	if pattern == "" {
+		return syms
+	}
+	out := make([]store.Symbol, 0, len(syms))
+	for _, sym := range syms {
+		if symbolMatchesPattern(sym, pattern) {
+			out = append(out, sym)
+		}
+	}
+	return out
+}
+
+func symbolMatchesPattern(sym store.Symbol, patternLower string) bool {
+	for _, field := range []string{sym.Name, sym.QualifiedName, sym.Signature, sym.Doc} {
+		if strings.Contains(strings.ToLower(field), patternLower) {
+			return true
+		}
+	}
+	return false
 }
 
 func matchTier(nameLower, patternLower string) int {
@@ -602,19 +786,22 @@ func kindPriority(kind string) int {
 // then kind, and finally pushes test and generated symbols after non-test,
 // non-generated ones at the same rank. Down-ranking never removes a match.
 func sortSymbolsForSearch(syms []store.Symbol, patternLower string) {
-	// Lowercase the qualified names once; the comparator fires O(n log n) times
-	// and would otherwise re-lower the same string per comparison.
-	keys := make([]string, len(syms))
-	for i := range syms {
-		keys[i] = strings.ToLower(syms[i].QualifiedName)
+	// Tiers are keyed by qualified name, not by slice position: sort.SliceStable
+	// swaps elements, so a position-keyed cache would compare the wrong tiers.
+	// The tier takes the better of the bare name and the qualified name, so an
+	// exact name match (config.Config for "Config") outranks a doc match.
+	tiers := make(map[string]int, len(syms))
+	for _, sym := range syms {
+		tiers[sym.QualifiedName] = min(
+			matchTier(strings.ToLower(sym.Name), patternLower),
+			matchTier(strings.ToLower(sym.QualifiedName), patternLower),
+		)
 	}
 	sort.SliceStable(syms, func(i, j int) bool {
 		a := &syms[i]
 		b := &syms[j]
 
-		aTier := matchTier(keys[i], patternLower)
-		bTier := matchTier(keys[j], patternLower)
-		if aTier != bTier {
+		if aTier, bTier := tiers[a.QualifiedName], tiers[b.QualifiedName]; aTier != bTier {
 			return aTier < bTier
 		}
 
@@ -655,17 +842,48 @@ func filterGenerated(results []SearchResult, filter store.GeneratedFilter) []Sea
 	return out
 }
 
+// resolveTypeName maps a caller's type name to the qualified name it declares.
+// Both forms are accepted, because a caller has no way to know which one the
+// tool it is about to call expects: "MessageStore" and
+// "emak/pkg/mqueue.MessageStore" name the same type. An unresolvable name is an
+// error, never an empty result — "no implementers" and "no such type" are
+// different answers.
+func resolveTypeName(s *store.Store, typeName string) (string, error) {
+	pkgPath, short := splitTypeQualifier(typeName)
+	decls, err := s.TypeDeclarationsNamed(short, true)
+	if err != nil {
+		return "", err
+	}
+	if pkgPath != "" {
+		decls = filterByPackage(decls, pkgPath)
+	}
+	if len(decls) == 0 {
+		return "", fmt.Errorf("type not found: %s", typeName)
+	}
+	if len(decls) > 1 {
+		return "", fmt.Errorf("type not found: %s is declared in %d packages (%s, ...); qualify it",
+			typeName, len(decls), decls[0].PackagePath)
+	}
+	return decls[0].QualifiedName, nil
+}
+
 func MethodsOf(s *store.Store, typeName string, opts ...Option) ([]SymbolDetail, error) {
 	options := &Options{}
 	opt.Apply(options, opts)
 
-	syms, err := s.MethodsByReceiver(typeName, options.IncludeTests)
+	resolved, err := resolveTypeName(s, typeName)
+	if err != nil {
+		return nil, err
+	}
+	// The resolved name is exact, so a qualified query cannot pick up the
+	// methods of a same-named type in another package.
+	syms, err := s.MethodsByQualifiedReceiver(resolved, options.IncludeTests)
 	if err != nil {
 		return nil, err
 	}
 
 	if len(syms) == 0 {
-		return nil, fmt.Errorf("type not found: %s", typeName)
+		return []SymbolDetail{}, nil
 	}
 
 	results := make([]SymbolDetail, 0, len(syms))
@@ -692,11 +910,12 @@ func MethodsOf(s *store.Store, typeName string, opts ...Option) ([]SymbolDetail,
 }
 
 type PackageResult struct {
-	Path            string
-	Name            string
-	Repo            string `json:"repo,omitempty"`
-	ExportedSymbols []SymbolDetail
-	ImportCount     int
+	Path        string         `json:"path"`
+	Name        string         `json:"name"`
+	Doc         string         `json:"doc"`
+	Repo        string         `json:"repo,omitempty"`
+	Symbols     []SymbolDetail `json:"symbols"`
+	ImportCount int            `json:"import_count"`
 }
 
 func Package(s *store.Store, pkgPath string, opts ...Option) (*PackageResult, error) {
@@ -724,23 +943,18 @@ func Package(s *store.Store, pkgPath string, opts ...Option) (*PackageResult, er
 		return nil, err
 	}
 
-	importEdges, err := s.EdgesFrom(pkgPath)
+	importCounts, err := s.ImportCounts()
 	if err != nil {
-		return nil, fmt.Errorf("package %s: import edges: %w", pkgPath, err)
-	}
-	importCount := 0
-	for _, e := range importEdges {
-		if e.EdgeType == edgeTypeImports {
-			importCount++
-		}
+		return nil, fmt.Errorf("package %s: import counts: %w", pkgPath, err)
 	}
 
 	return &PackageResult{
-		Path:            found.Path,
-		Name:            found.Name,
-		ImportCount:     importCount,
-		ExportedSymbols: symbolDetails(syms, options.IncludeUnexported, options.IncludeFields),
-		Repo:            found.Repo,
+		Path:        found.Path,
+		Name:        found.Name,
+		Doc:         found.Doc,
+		ImportCount: importCounts[pkgPath],
+		Symbols:     symbolDetails(syms, options.IncludeUnexported, options.IncludeFields),
+		Repo:        found.Repo,
 	}, nil
 }
 
@@ -790,7 +1004,7 @@ func ImportersOf(s *store.Store, pkgPath string, opts ...Option) ([]EdgeDetail, 
 		return nil, err
 	}
 
-	result := filterEdgesByType(edges, allowTypes)
+	result := filterEdgesByType(dropTestOnlyImports(edges), allowTypes)
 	result = filterEdges(result, options.Repo)
 	if len(result) > 0 {
 		return result, nil
@@ -806,6 +1020,32 @@ func ImportersOf(s *store.Store, pkgPath string, opts ...Option) ([]EdgeDetail, 
 	return result, nil
 }
 
+// dropTestOnlyImports removes import edges whose only sites are _test.go files,
+// so "who imports this package" answers with the runtime dependency surface and
+// agrees with ImportsOf. Without it a package imported solely by a test showed
+// up as an importer while its own outgoing edges omitted the same import.
+func dropTestOnlyImports(edges []store.Edge) []store.Edge {
+	out := edges[:0]
+	for _, e := range edges {
+		if e.EdgeType == edgeTypeImports && !dropTestImportSites(&e) {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// runtimeImportEdges loads every import edge with its test-only sites removed.
+// Every import reader goes through it so one package's imports cannot differ
+// between imports_of, transitive imports, dependency_flow and the hub counts.
+func runtimeImportEdges(s *store.Store) ([]store.Edge, error) {
+	edges, err := s.EdgesByType(edgeTypeImports)
+	if err != nil {
+		return nil, err
+	}
+	return dropTestOnlyImports(edges), nil
+}
+
 func filterEdgesByType(edges []store.Edge, allowTypes []string) []EdgeDetail {
 	result := make([]EdgeDetail, 0, len(edges))
 	for _, e := range edges {
@@ -817,7 +1057,7 @@ func filterEdgesByType(edges []store.Edge, allowTypes []string) []EdgeDetail {
 }
 
 func importersViaShortPath(s *store.Store, pkgPath string, allowTypes []string) ([]EdgeDetail, error) {
-	allImports, err := s.EdgesByType(edgeTypeImports)
+	allImports, err := runtimeImportEdges(s)
 	if err != nil {
 		return nil, fmt.Errorf("importers of %s: import edges: %w", pkgPath, err)
 	}
@@ -870,17 +1110,42 @@ func ImportsOf(s *store.Store, pkgPath string, opts ...Option) ([]EdgeDetail, er
 
 	result := make([]EdgeDetail, 0)
 	for _, e := range edges {
-		if edgeTypeAllowed(e.EdgeType, allowTypes) {
-			d := edgeToDetail(e)
-			if e.EdgeType == edgeTypeImports && !indexed[e.ToRef] {
-				if targetModule := modulePathForRef(e.ToRef, knownModules); targetModule != "" {
-					d.State = "not indexed"
-				}
-			}
-			result = append(result, d)
+		if !edgeTypeAllowed(e.EdgeType, allowTypes) {
+			continue
 		}
+		if e.EdgeType == edgeTypeImports && !dropTestImportSites(&e) {
+			continue
+		}
+		d := edgeToDetail(e)
+		if e.EdgeType == edgeTypeImports && !indexed[e.ToRef] {
+			if targetModule := modulePathForRef(e.ToRef, knownModules); targetModule != "" {
+				d.State = "not indexed"
+			}
+		}
+		result = append(result, d)
 	}
 	return filterEdges(result, options.Repo), nil
+}
+
+// dropTestImportSites removes the _test.go sites from an import edge and
+// reports whether any remain. A test-only import is not part of the package's
+// runtime dependency surface, so listing it made the graph say emak/config
+// imports testing. An import used by both keeps its non-test sites.
+func dropTestImportSites(e *store.Edge) bool {
+	kept := make([]store.Site, 0, len(e.Sites))
+	for _, site := range e.Sites {
+		if !strings.HasSuffix(site.File, "_test.go") {
+			kept = append(kept, site)
+		}
+	}
+	if len(kept) == 0 {
+		return false
+	}
+	e.Sites = kept
+	e.SiteCount = len(kept)
+	e.PosFile = kept[0].File
+	e.PosLine = kept[0].Line
+	return true
 }
 
 // modulePathForRef returns the configured module path that owns ref (ref is a
@@ -911,8 +1176,9 @@ func SearchByPrefix(s *store.Store, prefix string, opts ...Option) ([]SearchResu
 	sortSymbolsForSearch(syms, strings.ToLower(prefix))
 
 	result := searchResultsFromSymbols(syms, options.IncludeFields)
+	result = filterSearchResultsByOptions(filterGenerated(result, options.Generated), options)
 
-	return filterSearchResults(filterGenerated(result, options.Generated), options.Repo), nil
+	return filterSearchResults(result, options.Repo), nil
 }
 
 func TransitiveImports(s *store.Store, pkgPath string, opts ...Option) ([]EdgeDetail, error) {
@@ -932,7 +1198,7 @@ func TransitiveImports(s *store.Store, pkgPath string, opts ...Option) ([]EdgeDe
 		return filterEdges(legacy, options.Repo), nil
 	}
 
-	allImports, err := s.EdgesByType(edgeTypeImports)
+	allImports, err := runtimeImportEdges(s)
 	if err != nil {
 		return nil, err
 	}
@@ -985,27 +1251,332 @@ func transitiveImportBFS(pkgPath string, adj map[string][]store.Edge, projectSet
 	return out
 }
 
+// mentionsTypeAs reports whether text uses name as a type: bare, or qualified
+// by one of the packages that declare it. "gitlab.Response" and "FirstRun bool"
+// must not count for Response and Run.
+func mentionsTypeAs(text, name string, pkgs map[string]bool) bool {
+	for start := 0; ; {
+		i := strings.Index(text[start:], name)
+		if i < 0 {
+			return false
+		}
+		i += start
+		end := i + len(name)
+		if (i == 0 || !isIdentChar(text[i-1])) && (end == len(text) || !isIdentChar(text[end])) {
+			if i == 0 || text[i-1] != '.' || qualifiedByKnownPkg(text[:i-1], pkgs) {
+				return true
+			}
+		}
+		start = i + 1
+	}
+}
+
+// qualifiedByKnownPkg reports whether the text before a dot ends with one of
+// the declaring package names.
+func qualifiedByKnownPkg(prefix string, pkgs map[string]bool) bool {
+	for name := range pkgs {
+		if strings.HasSuffix(prefix, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func fieldsMentionTypeAs(fields []store.SymbolField, name string, pkgs map[string]bool) bool {
+	for _, f := range fields {
+		if mentionsTypeAs(f.GoType, name, pkgs) {
+			return true
+		}
+	}
+	return false
+}
+
+func isIdentChar(b byte) bool {
+	return b == '_' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9'
+}
+
+// TypeUsage returns the symbols whose signatures or fields use the named type.
+// A short name is resolved to its declaration first: matching a bare string
+// against signatures reported "*gitlab.Response" and "fantasy.ToolResponse" for
+// "Response", and matched field names like "FirstRun" for "Run". A qualified
+// name must name a package the index knows, so a stale path errors instead of
+// silently answering about a different package.
 func TypeUsage(s *store.Store, typeName string, opts ...Option) ([]SearchResult, error) {
 	options := &Options{}
 	opt.Apply(options, opts)
 
-	syms, err := s.SearchByType(typeName, options.IncludeTests)
+	pkgPath, short := splitTypeQualifier(typeName)
+	decls, err := s.TypeDeclarationsNamed(short, options.IncludeTests)
+	if err != nil {
+		return nil, err
+	}
+	if len(decls) == 0 {
+		return nil, fmt.Errorf("type not found: %s", short)
+	}
+
+	// Ambiguity is judged before narrowing to one package: two packages
+	// declaring the same name make a bare mention undecidable, and a qualified
+	// query still has to tell the two apart.
+	ambiguous := len(decls) > 1
+	if pkgPath != "" {
+		decls = filterByPackage(decls, pkgPath)
+		if len(decls) == 0 {
+			return nil, fmt.Errorf("type not found: %s", typeName)
+		}
+	}
+
+	names := make(map[string]bool, len(decls))
+	pkgs := make(map[string]bool, len(decls))
+	for _, d := range decls {
+		names[path.Base(d.PackagePath)] = true
+		pkgs[d.PackagePath] = true
+	}
+
+	// With the name declared more than once, a bare mention belongs to whichever
+	// declaring package the using package imports, and a qualified query must
+	// still exclude the other declaration's users.
+	var imports map[string]map[string]bool
+	if ambiguous {
+		imports, err = packageImports(s)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	users, err := signatureUsers(s, short, pkgs, names, imports, options.IncludeTests)
+	if err != nil {
+		return nil, err
+	}
+	embedders, err := embeddingSymbols(s, short, pkgs, options.IncludeTests)
+	if err != nil {
+		return nil, err
+	}
+	// A type is also "used" by code that names it outside a signature: a method
+	// receiver, a composite literal, a type assertion. show already reports those
+	// as incoming references, so type_usage answers from the same set instead of
+	// being narrower than show for the same question.
+	referrers, err := referencingSymbols(s, decls, options.IncludeTests)
 	if err != nil {
 		return nil, err
 	}
 
-	result := searchResultsFromSymbols(syms, false)
+	merged := mergeUsage(users, embedders, referrers)
+	return filterSearchResults(searchResultsFromSymbols(merged, false), options.Repo), nil
+}
 
-	return filterSearchResults(result, options.Repo), nil
+// mergeUsage concatenates usage lists, keeping one row per qualified name. The
+// same symbol can reach a type through a signature and through a reference.
+func mergeUsage(lists ...[]store.Symbol) []store.Symbol {
+	var total int
+	for _, l := range lists {
+		total += len(l)
+	}
+	seen := make(map[string]bool, total)
+	merged := make([]store.Symbol, 0, total)
+	for _, l := range lists {
+		for _, sym := range l {
+			if seen[sym.QualifiedName] {
+				continue
+			}
+			seen[sym.QualifiedName] = true
+			merged = append(merged, sym)
+		}
+	}
+	return merged
+}
+
+// referencingSymbols returns the symbols with a reference edge to one of the
+// type's declarations. Receivers, composite literals and type assertions reach
+// the type this way and through no signature, so without it type_usage missed
+// live types that show reported three incoming references for.
+func referencingSymbols(s *store.Store, decls []store.Symbol, includeTests bool) ([]store.Symbol, error) {
+	names := make([]string, 0, len(decls))
+	for _, d := range decls {
+		names = append(names, d.QualifiedName)
+	}
+	edges, err := s.EdgesForNodes(names, []string{edgeTypeReferences, edgeTypeCalls}, false)
+	if err != nil {
+		return nil, fmt.Errorf("type usage: references: %w", err)
+	}
+	froms := make([]string, 0, len(edges))
+	for _, e := range edges {
+		if e.EdgeType == edgeTypeReferences || e.EdgeType == edgeTypeCalls {
+			froms = append(froms, e.FromRef)
+		}
+	}
+	if len(froms) == 0 {
+		return nil, nil
+	}
+	syms, err := s.SymbolsByNames(froms)
+	if err != nil {
+		return nil, fmt.Errorf("type usage: referencing symbols: %w", err)
+	}
+	out := make([]store.Symbol, 0, len(syms))
+	for _, sym := range syms {
+		if !includeTests && sym.IsTest {
+			continue
+		}
+		out = append(out, sym)
+	}
+	return out, nil
+}
+
+// splitTypeQualifier splits "pkg/path.Type" into its package path and bare
+// name. The split is at the last dot: a module path contains dots of its own
+// ("example.com/p.Widget"), so a first-dot cut yields a bogus package.
+func splitTypeQualifier(typeName string) (string, string) {
+	pkgPath, short, ok := strings.CutLast(typeName, ".")
+	if !ok {
+		return "", typeName
+	}
+	return pkgPath, short
+}
+
+func filterByPackage(syms []store.Symbol, pkgPath string) []store.Symbol {
+	out := make([]store.Symbol, 0, len(syms))
+	for _, sym := range syms {
+		if sym.PackagePath == pkgPath {
+			out = append(out, sym)
+		}
+	}
+	return out
+}
+
+// signatureUsers returns the symbols whose signature or fields use the type.
+// A mention qualifies when it is bare or carries one of the declaring
+// packages' names, so "types.ServerSync" counts and "gitlab.Response" does not
+// for Response. When imports is non-nil the name is declared more than once,
+// so a bare mention only counts inside a package that imports a declaring one.
+func signatureUsers(s *store.Store, short string, declaringPkg, names map[string]bool, imports map[string]map[string]bool, includeTests bool) ([]store.Symbol, error) {
+	syms, err := s.SearchByType(short, includeTests)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]store.Symbol, 0, len(syms))
+	for _, sym := range syms {
+		if !signatureUsesType(sym, short, declaringPkg, names, imports) {
+			continue
+		}
+		out = append(out, sym)
+	}
+	return out, nil
+}
+
+func signatureUsesType(sym store.Symbol, short string, declaringPkg, names map[string]bool, imports map[string]map[string]bool) bool {
+	if !mentionsTypeAs(sym.Signature, short, names) && !fieldsMentionTypeAs(sym.Fields, short, names) {
+		return false
+	}
+	if imports == nil {
+		return true
+	}
+	// A declaring package uses its own type bare; any other package must name
+	// it qualified or import a declaring one.
+	if declaringPkg[sym.PackagePath] {
+		return true
+	}
+	return mentionsQualified(sym.Signature, short, names) || importsDeclaring(sym.PackagePath, names, imports)
+}
+
+// mentionsQualified reports whether text names the type behind one of the
+// declaring packages' names, which settles an ambiguous short name.
+func mentionsQualified(text, name string, pkgs map[string]bool) bool {
+	for pkg := range pkgs {
+		if strings.Contains(text, pkg+"."+name) {
+			return true
+		}
+	}
+	return false
+}
+
+// importsDeclaring reports whether pkgPath imports any package whose name is
+// one of pkgs. Two packages can share a name, so the import's own last element
+// is what a bare mention would resolve to.
+func importsDeclaring(pkgPath string, names map[string]bool, imports map[string]map[string]bool) bool {
+	for imp := range imports[pkgPath] {
+		if names[path.Base(imp)] {
+			return true
+		}
+	}
+	return false
+}
+
+// packageImports maps each package path to the import paths it declares.
+func packageImports(s *store.Store) (map[string]map[string]bool, error) {
+	edges, err := runtimeImportEdges(s)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]map[string]bool, len(edges))
+	for _, e := range edges {
+		if out[e.FromRef] == nil {
+			out[e.FromRef] = make(map[string]bool)
+		}
+		out[e.FromRef][e.ToRef] = true
+	}
+	return out, nil
+}
+
+// embedTargetInPkgs reports whether an embeds edge target names typeName in one
+// of the packages that declare it. The target is "<pkg>.<Type>", so the package
+// is everything before the last dot.
+func embedTargetInPkgs(toRef, typeName string, pkgs map[string]bool) bool {
+	if !strings.HasSuffix(toRef, "."+typeName) {
+		return false
+	}
+	return pkgs[strings.TrimSuffix(toRef, "."+typeName)]
+}
+
+// embeddingSymbols returns the structs that embed typeName. The signature scan
+// in SearchByType cannot see these: an embedded field ends in ";" or a newline,
+// neither of which is a signature boundary it matches on, so a type used only
+// through embedding reported zero usages while blast_radius counted its
+// embedders correctly.
+func embeddingSymbols(s *store.Store, typeName string, pkgs map[string]bool, includeTests bool) ([]store.Symbol, error) {
+	edges, err := s.EdgesByType(edgeTypeEmbeds)
+	if err != nil {
+		return nil, err
+	}
+
+	suffix := "." + typeName
+	var refs []string
+	seen := make(map[string]bool)
+	for _, e := range edges {
+		if e.ToRef != typeName && !strings.HasSuffix(e.ToRef, suffix) {
+			continue
+		}
+		if !embedTargetInPkgs(e.ToRef, typeName, pkgs) {
+			continue
+		}
+		if seen[e.FromRef] {
+			continue
+		}
+		seen[e.FromRef] = true
+		refs = append(refs, e.FromRef)
+	}
+
+	syms, err := s.SymbolsByNames(refs)
+	if err != nil {
+		return nil, err
+	}
+	if includeTests {
+		return syms, nil
+	}
+	out := make([]store.Symbol, 0, len(syms))
+	for _, sym := range syms {
+		if !sym.IsTest {
+			out = append(out, sym)
+		}
+	}
+	return out, nil
 }
 
 type PathStep struct {
-	From     string
-	To       string
-	EdgeType string
-	PosFile  string
-	Repo     string
-	PosLine  int
+	From     string `json:"from"`
+	To       string `json:"to"`
+	EdgeType string `json:"edge_type"`
+	PosFile  string `json:"pos_file"`
+	Repo     string `json:"repo"`
+	PosLine  int    `json:"pos_line"`
 }
 
 type pathNode struct {
@@ -1032,6 +1603,15 @@ func FindPath(s *store.Store, from, to string, maxDepth int, opts ...Option) ([]
 	opt.Apply(options, opts)
 	if maxDepth <= 0 {
 		maxDepth = 10
+	}
+
+	// Reject a mistyped endpoint the same way callers_of does. Returning
+	// "no path" for a name that does not exist reads as "these are unrelated".
+	if err := requireSymbol(s, from); err != nil {
+		return nil, err
+	}
+	if err := requireSymbol(s, to); err != nil {
+		return nil, err
 	}
 
 	// Contract edges (non-suggested, non-suppressed) join the traversal so
@@ -1070,8 +1650,13 @@ func FindPath(s *store.Store, from, to string, maxDepth int, opts ...Option) ([]
 	return nil, fmt.Errorf("%w from %s to %s", ErrNoPath, from, to)
 }
 
-// expandPathNode enqueues every out- and in-edge of current (respecting a repo
-// scope) plus cross-repo contract edges as the next BFS frontier.
+// expandPathNode enqueues every out-edge of current (respecting a repo scope)
+// plus forward cross-repo contract edges as the next BFS frontier.
+//
+// Only forward edges are followed. Traversing in-edges produced chains that
+// looked contiguous but were not reachability: "A reaches B" was answered with
+// a hop that only exists as "B references A", and paths were routed through
+// type nodes that cannot call anything.
 func expandPathNode(s *store.Store, current pathNode, repo string, queue []pathNode, visited map[string]bool, contracts []store.Contract) ([]pathNode, error) {
 	outEdges, err := s.EdgesFrom(current.name)
 	if err != nil {
@@ -1083,29 +1668,12 @@ func expandPathNode(s *store.Store, current pathNode, repo string, queue []pathN
 		}
 	}
 
-	inEdges, err := s.EdgesTo(current.name)
-	if err != nil {
-		return nil, fmt.Errorf("find_path: edges to %s: %w", current.name, err)
-	}
-	for _, e := range inEdges {
-		if !repoMismatch(e.Repo, repo) {
-			queue = enqueueIfUnvisited(e.FromRef, e, current.path, visited, queue)
-		}
-	}
-
 	for _, c := range contracts {
-		if c.Suggested {
+		if c.Suggested || c.FromRef != current.name {
 			continue
 		}
-		switch {
-		case c.FromRef == current.name:
-			if !repoMismatch(c.Repo, repo) {
-				queue = enqueueIfUnvisited(c.ToRef, contractToEdge(c), current.path, visited, queue)
-			}
-		case c.ToRef == current.name:
-			if !repoMismatch(c.Repo, repo) {
-				queue = enqueueIfUnvisited(c.FromRef, contractToEdge(c), current.path, visited, queue)
-			}
+		if !repoMismatch(c.Repo, repo) {
+			queue = enqueueIfUnvisited(c.ToRef, contractToEdge(c), current.path, visited, queue)
 		}
 	}
 	return queue, nil
@@ -1133,18 +1701,26 @@ func MethodSearch(s *store.Store, methodName string, opts ...Option) ([]SearchRe
 	sortSymbolsForSearch(syms, strings.ToLower(methodName))
 
 	result := searchResultsFromSymbols(syms, options.IncludeFields)
-	return filterSearchResults(filterGenerated(result, options.Generated), options.Repo), nil
+	result = filterSearchResultsByOptions(filterGenerated(result, options.Generated), options)
+
+	return filterSearchResults(result, options.Repo), nil
 }
 
 type InterfaceImpl struct {
-	Interface  string
-	ImplType   string
-	ImplMethod string
-	PosFile    string
-	PosLine    int
+	Interface  string `json:"interface"`
+	ImplType   string `json:"impl_type"`
+	ImplMethod string `json:"impl_method"`
+	PosFile    string `json:"pos_file"`
+	PosLine    int    `json:"pos_line"`
 }
 
 func InterfaceImplementations(s *store.Store, interfaceName string, opts ...Option) ([]InterfaceImpl, error) {
+	resolved, err := resolveTypeName(s, interfaceName)
+	if err != nil {
+		return nil, err
+	}
+	interfaceName = resolved
+
 	satisfiesEdges, err := s.EdgesTo(interfaceName)
 	if err != nil {
 		return nil, err
@@ -1159,13 +1735,21 @@ func InterfaceImplementations(s *store.Store, interfaceName string, opts ...Opti
 		}
 	}
 
+	methodNames, err := interfaceMethodNames(s, interfaceName)
+	if err != nil {
+		return nil, err
+	}
+
 	results := make([]InterfaceImpl, 0)
 	for _, implType := range implTypes {
-		methods, err := s.MethodsByQualifiedReceiver(implType, false)
+		methods, err := s.MethodsByQualifiedReceiver(implType, true)
 		if err != nil {
 			continue
 		}
 		for _, m := range methods {
+			if !methodNames[m.Name] {
+				continue
+			}
 			results = append(results, InterfaceImpl{
 				Interface:  interfaceName,
 				ImplType:   implType,
@@ -1178,12 +1762,45 @@ func InterfaceImplementations(s *store.Store, interfaceName string, opts ...Opti
 	return results, nil
 }
 
-func extractShortName(qualifiedName string) string {
-	parts := strings.Split(qualifiedName, ".")
-	if len(parts) == 0 {
-		return qualifiedName
+// interfaceMethodNames collects the method names an interface declares,
+// following embedded interfaces so a composed interface reports every method
+// its implementers must supply. Only these names belong in an implementation
+// report; the implementer's other methods are unrelated surface.
+//
+// Test symbols are included: an interface declared in a _test.go file has its
+// methods indexed as test symbols, and excluding them made interface_impls
+// report zero implementations for such an interface while all_edges reported
+// the satisfies edge.
+func interfaceMethodNames(s *store.Store, interfaceName string) (map[string]bool, error) {
+	names := make(map[string]bool)
+	visited := map[string]bool{interfaceName: true}
+	queue := []string{interfaceName}
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+
+		methods, err := s.MethodsByQualifiedReceiver(current, true)
+		if err != nil {
+			return nil, err
+		}
+		for _, m := range methods {
+			names[m.Name] = true
+		}
+
+		edges, err := s.EdgesFrom(current)
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range edges {
+			if e.EdgeType != edgeTypeEmbeds || visited[e.ToRef] {
+				continue
+			}
+			visited[e.ToRef] = true
+			queue = append(queue, e.ToRef)
+		}
 	}
-	return parts[len(parts)-1]
+	return names, nil
 }
 
 // symbolMissError turns a lookup miss into an actionable error with near-name
@@ -1258,11 +1875,11 @@ func symbolCandidateRank(sym store.Symbol, short, pkgPrefix string) int {
 }
 
 type UnusedSymbol struct {
-	QualifiedName string
-	Kind          string
-	Signature     string
-	PosFile       string
-	PosLine       int
+	QualifiedName string `json:"qualified_name"`
+	Kind          string `json:"kind"`
+	Signature     string `json:"signature"`
+	PosFile       string `json:"pos_file"`
+	PosLine       int    `json:"pos_line"`
 }
 
 // reachableSymbols returns every qualified name reachable from the live root
@@ -1338,6 +1955,11 @@ func UnusedSymbols(s *store.Store, opts ...Option) ([]UnusedSymbol, error) {
 	}
 
 	unused := make([]UnusedSymbol, 0)
+	interfaceNames := interfaceQualifiedNames(allSyms)
+	dispatched, err := interfaceDispatchedMethods(s, allSyms, reachable)
+	if err != nil {
+		return nil, err
+	}
 	for _, sym := range allSyms {
 		if sym.Exported || sym.IsGenerated {
 			continue
@@ -1345,7 +1967,12 @@ func UnusedSymbols(s *store.Store, opts ...Option) ([]UnusedSymbol, error) {
 		if liveByDesign(sym, pkgMain) {
 			continue
 		}
-		if !reachable[sym.QualifiedName] {
+		// An interface method is a declaration implementers satisfy, not a
+		// callable that needs a caller; removing it breaks every implementer.
+		if sym.Kind == kindMethod && interfaceNames[strings.TrimSuffix(sym.QualifiedName, "."+sym.Name)] {
+			continue
+		}
+		if !reachable[sym.QualifiedName] && !dispatched[sym.QualifiedName] {
 			unused = append(unused, UnusedSymbol{
 				QualifiedName: sym.QualifiedName,
 				Kind:          sym.Kind,
@@ -1358,11 +1985,39 @@ func UnusedSymbols(s *store.Store, opts ...Option) ([]UnusedSymbol, error) {
 	return unused, nil
 }
 
+// interfaceDispatchedMethods returns the concrete methods reachable only through
+// an interface. A call to iface.Method is recorded against the interface's
+// declaration, so without this every implementer's same-named method looks
+// uncalled — and deleting one would break a live call path.
+func interfaceDispatchedMethods(s *store.Store, allSyms []store.Symbol, reachable map[string]bool) (map[string]bool, error) {
+	edges, err := s.EdgesByType(edgeTypeSatisfies)
+	if err != nil {
+		return nil, err
+	}
+
+	implementers := make(map[string][]string)
+	for _, e := range edges {
+		implementers[e.ToRef] = append(implementers[e.ToRef], e.FromRef)
+	}
+
+	dispatched := make(map[string]bool)
+	for _, sym := range allSyms {
+		if sym.Kind != kindMethod || !reachable[sym.QualifiedName] {
+			continue
+		}
+		iface := strings.TrimSuffix(sym.QualifiedName, "."+sym.Name)
+		for _, impl := range implementers[iface] {
+			dispatched[impl+"."+sym.Name] = true
+		}
+	}
+	return dispatched, nil
+}
+
 type Cycle struct {
-	Path []string
+	Path []string `json:"path"`
 	// Truncated is set on the last element of a truncated result: the graph
 	// contains more distinct cycles than the returned set (limited by maxCycles).
-	Truncated bool
+	Truncated bool `json:"truncated"`
 }
 
 // maxCycles bounds cycle enumeration on adversarial graphs. Pathological
@@ -1546,12 +2201,12 @@ func SymbolsInFile(s *store.Store, filePath string, opts ...Option) ([]SearchRes
 }
 
 type BlastRadius struct {
-	Symbol            string
-	DirectCallers     int
-	TransitiveCallers int
-	Implementations   int
-	Embedders         int
-	TypeUsers         int
+	Symbol            string `json:"symbol"`
+	DirectCallers     int    `json:"direct_callers"`
+	TransitiveCallers int    `json:"transitive_callers"`
+	Implementations   int    `json:"implementations"`
+	Embedders         int    `json:"embedders"`
+	TypeUsers         int    `json:"type_users"`
 }
 
 // errSymbolMissing distinguishes a non-existent symbol from a query failure in
@@ -1568,7 +2223,8 @@ func GetBlastRadius(s *store.Store, qualifiedName string, depth int, opts ...Opt
 
 	// Verify the symbol exists so an empty blast radius for a typo'd or removed
 	// symbol is never mistaken for a genuine (empty) result.
-	if _, err := s.SymbolByName(qualifiedName); err != nil {
+	target, err := s.SymbolByName(qualifiedName)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("%w: %s", errSymbolMissing, qualifiedName)
 		}
@@ -1590,10 +2246,16 @@ func GetBlastRadius(s *store.Store, qualifiedName string, depth int, opts ...Opt
 
 	implCount, embedCount := countSatisfiesAndEmbeds(directCallers, options.Repo)
 
-	shortName := extractShortName(qualifiedName)
-	typeUsers, err := TypeUsage(s, shortName, opts...)
-	if err != nil {
-		return nil, err
+	// Only a declared type has signature users. A function or const has none,
+	// and asking TypeUsage for it now errors instead of returning the substring
+	// noise the loose matcher produced.
+	typeUsers := 0
+	if target.Kind == kindType || target.Kind == kindInterface || target.Kind == kindAlias {
+		users, err := TypeUsage(s, qualifiedName, opts...)
+		if err != nil {
+			return nil, err
+		}
+		typeUsers = len(users)
 	}
 
 	return &BlastRadius{
@@ -1602,7 +2264,7 @@ func GetBlastRadius(s *store.Store, qualifiedName string, depth int, opts ...Opt
 		TransitiveCallers: len(transitiveCallers),
 		Implementations:   implCount,
 		Embedders:         embedCount,
-		TypeUsers:         len(typeUsers),
+		TypeUsers:         typeUsers,
 	}, nil
 }
 
@@ -1841,6 +2503,7 @@ func matchGenDecl(d *ast.GenDecl, fset *token.FileSet, posLine int, name, kind s
 // declSpan is a declaration located in a source file: the file's bytes, the
 // declaration node, and the offsets a caller needs to read or rewrite it.
 type declSpan struct {
+	fset         *token.FileSet
 	node         ast.Node
 	data         []byte
 	startOff     int
@@ -1886,6 +2549,7 @@ func symbolSpan(filePath string, posLine int, receiver, name, kind string) (*dec
 
 	span := func(m *spanMatch) *declSpan {
 		return &declSpan{
+			fset:         fset,
 			data:         data,
 			node:         m.node,
 			startOff:     m.startOff,
@@ -1915,15 +2579,6 @@ func symbolSpan(filePath string, posLine int, receiver, name, kind string) (*dec
 	return nil, fmt.Errorf("declaration not found: %s (kind=%s) at line %d in %s", name, kind, posLine, filePath)
 }
 
-func symbolEndLine(filePath string, posLine int, receiver, name, kind string) (int, error) {
-	span, err := symbolSpan(filePath, posLine, receiver, name, kind)
-	if err != nil {
-		return 0, err
-	}
-	lineOffsets := computeLineOffsets(span.data)
-	return offsetToLine(lineOffsets, span.endOff), nil
-}
-
 func genDeclTokForKind(kind string) (token.Token, bool) {
 	switch kind {
 	case "type", "interface", "struct":
@@ -1951,16 +2606,16 @@ func typeDocOffset(fset *token.FileSet, gd *ast.GenDecl, spec *ast.TypeSpec) int
 }
 
 type SymbolBodyResult struct {
-	QualifiedName string
-	Kind          string
-	PosFile       string
-	Body          string
-	ContextBefore string
-	ContextAfter  string
-	PosLine       int
-	PosEndLine    int
-	GroupMembers  int
-	PartOfGroup   bool
+	QualifiedName string `json:"qualified_name"`
+	Kind          string `json:"kind"`
+	PosFile       string `json:"pos_file"`
+	Body          string `json:"body"`
+	ContextBefore string `json:"context_before,omitempty"`
+	ContextAfter  string `json:"context_after,omitempty"`
+	PosLine       int    `json:"pos_line"`
+	PosEndLine    int    `json:"pos_end_line"`
+	GroupMembers  int    `json:"group_members,omitempty"`
+	PartOfGroup   bool   `json:"part_of_group"`
 }
 
 func GetSymbolBody(s *store.Store, qualifiedName string, contextLines int, includeDoc bool) (*SymbolBodyResult, error) {
@@ -2061,19 +2716,19 @@ func sliceLines(data []byte, offsets []int, startLine, endLine int) string {
 }
 
 type Layer struct {
-	Packages []string
-	Level    int
+	Packages []string `json:"packages"`
+	Level    int      `json:"level"`
 }
 
 type Hub struct {
-	Package string
-	FanIn   int
-	FanOut  int
+	Package string `json:"package"`
+	FanIn   int    `json:"fan_in"`
+	FanOut  int    `json:"fan_out"`
 }
 
 type LayersResult struct {
-	Layers []Layer
-	Hubs   []Hub
+	Layers []Layer `json:"layers"`
+	Hubs   []Hub   `json:"hubs"`
 }
 
 type hubEntry struct {
@@ -2083,7 +2738,7 @@ type hubEntry struct {
 }
 
 func buildProjectGraph(s *store.Store, projectSet map[string]bool) (graph map[string][]string, fanIn, fanOut map[string]int, err error) {
-	imports, err := s.EdgesByType(edgeTypeImports)
+	imports, err := runtimeImportEdges(s)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -2243,14 +2898,14 @@ func resolveProjectTarget(toRef string, projectSet map[string]bool) string {
 }
 
 type FlowResult struct {
-	Package           string
-	Imports           []EdgeDetail
-	Importers         []EdgeDetail
-	TransitiveImports []EdgeDetail
+	Package                  string       `json:"package"`
+	Imports                  []EdgeDetail `json:"imports"`
+	Importers                []EdgeDetail `json:"importers"`
+	TransitiveProjectImports []EdgeDetail `json:"transitive_project_imports"`
 }
 
 func directImports(pkgPath string, allImports []store.Edge, projectSet map[string]bool) []EdgeDetail {
-	var out []EdgeDetail
+	out := []EdgeDetail{}
 	for _, e := range allImports {
 		if e.FromRef == pkgPath && (projectSet[e.ToRef] || resolveProjectTarget(e.ToRef, projectSet) != "") {
 			out = append(out, edgeToDetail(e))
@@ -2260,7 +2915,7 @@ func directImports(pkgPath string, allImports []store.Edge, projectSet map[strin
 }
 
 func directImporters(pkgPath string, allImports []store.Edge, reverseMap map[string]string) []EdgeDetail {
-	var out []EdgeDetail
+	out := []EdgeDetail{}
 	for _, e := range allImports {
 		if e.ToRef == pkgPath {
 			out = append(out, edgeToDetail(e))
@@ -2329,27 +2984,27 @@ func DependencyFlow(s *store.Store, pkgPath string) (*FlowResult, error) {
 	if !found {
 		return nil, fmt.Errorf("package not found: %s", pkgPath)
 	}
-	allImports, err := s.EdgesByType(edgeTypeImports)
+	allImports, err := runtimeImportEdges(s)
 	if err != nil {
 		return nil, err
 	}
 	reverseMap := buildImportPathMap(allImports, projectSet)
 
 	return &FlowResult{
-		Package:           pkgPath,
-		Imports:           directImports(pkgPath, allImports, projectSet),
-		Importers:         directImporters(pkgPath, allImports, reverseMap),
-		TransitiveImports: transitiveImports(pkgPath, store.BuildImportAdjacency(allImports), projectSet),
+		Package:                  pkgPath,
+		Imports:                  directImports(pkgPath, allImports, projectSet),
+		Importers:                directImporters(pkgPath, allImports, reverseMap),
+		TransitiveProjectImports: transitiveImports(pkgPath, store.BuildImportAdjacency(allImports), projectSet),
 	}, nil
 }
 
 type EntryPoint struct {
-	QualifiedName string
-	Kind          string
-	Signature     string
-	PosFile       string
-	Reason        string
-	PosLine       int
+	QualifiedName string `json:"qualified_name"`
+	Kind          string `json:"kind"`
+	Signature     string `json:"signature"`
+	PosFile       string `json:"pos_file"`
+	Reason        string `json:"reason"`
+	PosLine       int    `json:"pos_line"`
 }
 
 var defaultEntryHeuristics = []string{kindMain, "test", "uncalled_exported"}
@@ -2402,9 +3057,15 @@ func checkEntryHeuristics(out []EntryPoint, seen map[string]bool, sym store.Symb
 	if allowed["uncalled_exported"] && !isTest && sym.Exported && (sym.Kind == kindFunction || sym.Kind == kindMethod) && !incoming[sym.QualifiedName] && !isTestEntryName(sym.Name) {
 		out = addEntryPoint(out, seen, sym, "uncalled_exported")
 	}
-	if allowed["handler_sig"] && !isTest && sym.Kind == kindMethod && containsHTTPHandler(sym.Signature) {
+	// HTTP handlers are usually plain functions (func Sync(w, r)), not methods;
+	// restricting this to methods made the heuristic return nothing on an
+	// HTTP-serving repo.
+	if allowed["handler_sig"] && !isTest && containsHTTPHandler(sym.Signature) {
 		out = addEntryPoint(out, seen, sym, "handler_sig")
 	}
+	// A name-only heuristic: Run/Start/Serve are as often worker loops as HTTP
+	// handlers, so this reason means "named lifecycle entry point", not
+	// "handler". handler_sig is the one that proves a handler signature.
 	if allowed["handler_name"] && !isTest && sym.Kind == kindMethod && handlerNames[sym.Name] {
 		out = addEntryPoint(out, seen, sym, "handler_name")
 	}
@@ -2487,6 +3148,18 @@ func liveByDesign(sym store.Symbol, pkgMain map[string]bool) bool {
 	return sym.Name == kindMain && pkgMain[sym.PackagePath]
 }
 
+// interfaceQualifiedNames returns the qualified names of every interface in
+// the given symbol set, so a method can be traced back to an interface receiver.
+func interfaceQualifiedNames(syms []store.Symbol) map[string]bool {
+	names := make(map[string]bool)
+	for _, sym := range syms {
+		if sym.Kind == "interface" {
+			names[sym.QualifiedName] = true
+		}
+	}
+	return names
+}
+
 // mainPackages returns the set of package paths whose package clause is
 // `main`. It is the authoritative answer to "does a func main() here actually
 // start a program", which a path suffix check cannot give.
@@ -2526,35 +3199,38 @@ func extractPkgPath(qn string) string {
 }
 
 type ChangedSymbol struct {
-	BlastRadius   *BlastRadius
-	QualifiedName string
-	Kind          string
-	ChangeType    string
-	PosFile       string
-	Body          string
+	BlastRadius   *BlastRadius `json:"blast_radius,omitempty"`
+	QualifiedName string       `json:"qualified_name"`
+	Kind          string       `json:"kind"`
+	ChangeType    string       `json:"change_type"`
+	RenamedFrom   string       `json:"renamed_from,omitempty"`
+	shape         string
+	PosFile       string `json:"pos_file"`
+	Body          string `json:"body,omitempty"`
 	Repo          string `json:"repo,omitempty"`
-	PosLine       int
+	PosLine       int    `json:"pos_line"`
 }
 
 // RenamedFile records a file that moved, so a changed symbol's PosFile can be
 // traced back to the path callers and imports still reference.
 type RenamedFile struct {
-	From string
-	To   string
+	From string `json:"from"`
+	To   string `json:"to"`
 }
 
 type ChangedSymbolsSummary struct {
-	Modified     int
-	Added        int
-	Removed      int
-	FilesChanged int
-	Renamed      int
+	Modified     int `json:"modified"`
+	Added        int `json:"added"`
+	Removed      int `json:"removed"`
+	FilesChanged int `json:"files_changed"`
+	Renamed      int `json:"renamed"`
 }
 
 type ChangedSymbolsResult struct {
-	Symbols []ChangedSymbol
-	Renamed []RenamedFile
-	Summary ChangedSymbolsSummary
+	Symbols       []ChangedSymbol       `json:"symbols"`
+	Renamed       []RenamedFile         `json:"renamed"`
+	CompileErrors []store.Diagnostic    `json:"compile_errors,omitempty"`
+	Summary       ChangedSymbolsSummary `json:"summary"`
 }
 
 func ChangedSymbols(s *store.Store, repoDir, ref string, withBlast, includeBodies, includeTests bool) (*ChangedSymbolsResult, error) {
@@ -2570,37 +3246,180 @@ func ChangedSymbols(s *store.Store, repoDir, ref string, withBlast, includeBodie
 	if err != nil {
 		return nil, err
 	}
+	untracked, err := vcs.GitUntrackedFiles(repoDir)
+	if err != nil {
+		return nil, err
+	}
 
 	result := &ChangedSymbolsResult{
-		Summary: ChangedSymbolsSummary{FilesChanged: len(statuses)},
+		Renamed: []RenamedFile{},
+		Summary: ChangedSymbolsSummary{FilesChanged: len(statuses) + len(untracked)},
 	}
 	seen := make(map[string]bool)
 
 	for _, st := range statuses {
 		if st.Status == "D" {
-			if err := processDeletedFile(s, repoDir, ref, result, st.Path, withBlast, includeTests, seen); err != nil {
+			if err := processDeletedFile(s, repoDir, ref, result, st.Path, withBlast, seen); err != nil {
 				return nil, err
 			}
 			continue
-		}
-		hunks, herr := vcs.GitHunks(repoDir, ref, st.Path)
-		if herr != nil {
-			return nil, fmt.Errorf("changed_symbols: git hunks for %s: %w", st.Path, herr)
-		}
-		ct := changeTypeModified
-		if strings.HasPrefix(st.Status, "A") {
-			ct = changeTypeAdded
 		}
 		if st.Status != "" && (st.Status[0] == 'R' || st.Status[0] == 'C') {
 			result.Renamed = append(result.Renamed, RenamedFile{From: st.OldPath, To: st.Path})
 			result.Summary.Renamed++
 		}
-		if err := processChangedFile(s, result, st.Path, ct, withBlast, includeBodies, includeTests, seen, hunks); err != nil {
+		if err := processChangedFile(s, repoDir, ref, result, filepath.Join(repoDir, st.Path), withBlast, includeBodies, includeTests, seen); err != nil {
+			return nil, err
+		}
+	}
+	for _, path := range untracked {
+		if err := processChangedFile(s, repoDir, ref, result, filepath.Join(repoDir, path), withBlast, includeBodies, includeTests, seen); err != nil {
 			return nil, err
 		}
 	}
 
+	reportRenames(result)
+	if err := attachCompileErrors(s, result); err != nil {
+		return nil, err
+	}
 	return result, nil
+}
+
+// attachCompileErrors copies the index's recorded type-check and parse errors
+// onto the delta, unfiltered: a dangling call site lives in a file the change
+// did not touch, which is precisely the case the section exists to surface.
+func attachCompileErrors(s *store.Store, result *ChangedSymbolsResult) error {
+	diags, err := s.Diagnostics("")
+	if err != nil {
+		return fmt.Errorf("changed_symbols: diagnostics: %w", err)
+	}
+	if len(diags) > 0 {
+		result.CompileErrors = diags
+	}
+	return nil
+}
+
+// reportRenames turns a removed+added pair with the same masked shape into one
+// renamed symbol. Without it a rename surfaced as a modification of the new
+// name plus nothing at all for the old one, so the old name callers still use
+// disappeared from the answer.
+func reportRenames(result *ChangedSymbolsResult) {
+	removed := make(map[string][]int)
+	for i, sym := range result.Symbols {
+		if sym.ChangeType == changeTypeRemoved && sym.shape != "" {
+			removed[sym.shape] = append(removed[sym.shape], i)
+		}
+	}
+	if len(removed) == 0 {
+		return
+	}
+	dropped := make(map[int]bool)
+	for i := range result.Symbols {
+		sym := &result.Symbols[i]
+		if sym.ChangeType != changeTypeAdded || sym.shape == "" {
+			continue
+		}
+		candidates := removed[sym.shape]
+		if len(candidates) == 0 {
+			continue
+		}
+		from := candidates[0]
+		removed[sym.shape] = candidates[1:]
+		dropped[from] = true
+		sym.ChangeType = changeTypeRenamed
+		sym.RenamedFrom = result.Symbols[from].QualifiedName
+	}
+	if len(dropped) == 0 {
+		return
+	}
+	kept := result.Symbols[:0]
+	for i, sym := range result.Symbols {
+		if !dropped[i] {
+			kept = append(kept, sym)
+		}
+	}
+	result.Symbols = kept
+	result.Summary = recountChangedSummary(result.Symbols, result.Summary.FilesChanged, result.Summary.Renamed)
+}
+
+// maskedShape returns a declaration's text with its declared identifier
+// replaced by a marker, so a rename leaves the shape unchanged while any other
+// edit does not. Masking is by AST offset, not text substitution: a body string
+// literal containing the old name must not defeat the match. A grouped spec is
+// sliced to its own range, so renaming one entry does not make its siblings
+// look modified.
+func maskedShape(fset *token.FileSet, data []byte, node ast.Node, bare string) string {
+	if spec := specForName(node, bare); spec != nil {
+		node = spec
+	}
+	start := fset.Position(node.Pos()).Offset
+	end := fset.Position(node.End()).Offset
+	name := shapeIdent(node, bare)
+	if name == nil {
+		return string(data[start:end])
+	}
+	nameOff := fset.Position(name.Pos()).Offset
+	return string(data[start:nameOff]) + "\x00name\x00" + string(data[nameOff+len(name.Name):end])
+}
+
+// specForName narrows a grouped declaration to the spec declaring bare, so the
+// shape covers one entry instead of the whole block.
+func specForName(node ast.Node, bare string) ast.Node {
+	d, ok := node.(*ast.GenDecl)
+	if !ok {
+		return nil
+	}
+	for _, spec := range d.Specs {
+		switch s := spec.(type) {
+		case *ast.TypeSpec:
+			if s.Name != nil && s.Name.Name == bare {
+				return s
+			}
+		case *ast.ValueSpec:
+			for _, n := range s.Names {
+				if n != nil && n.Name == bare {
+					return s
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// shapeIdent returns the identifier a rename would replace in node.
+func shapeIdent(node ast.Node, bare string) *ast.Ident {
+	switch d := node.(type) {
+	case *ast.FuncDecl:
+		return d.Name
+	case *ast.TypeSpec:
+		return d.Name
+	case *ast.ValueSpec:
+		for _, n := range d.Names {
+			if n != nil && n.Name == bare {
+				return n
+			}
+		}
+	}
+	return nil
+}
+
+// recountChangedSummary rebuilds the per-change-type counters from the final
+// symbol list, so a rename reclassification cannot leave the totals stale.
+func recountChangedSummary(syms []ChangedSymbol, filesChanged, renamedFiles int) ChangedSymbolsSummary {
+	summary := ChangedSymbolsSummary{FilesChanged: filesChanged, Renamed: renamedFiles}
+	for _, sym := range syms {
+		switch sym.ChangeType {
+		case changeTypeAdded:
+			summary.Added++
+		case changeTypeModified:
+			summary.Modified++
+		case changeTypeRemoved:
+			summary.Removed++
+		case changeTypeRenamed:
+			summary.Renamed++
+		}
+	}
+	return summary
 }
 
 // WorkspaceChangedSymbols computes a workspace-wide diff: changed symbols from
@@ -2612,7 +3431,7 @@ func WorkspaceChangedSymbols(s *store.Store, withBlast, includeBodies, includeTe
 		return nil, err
 	}
 
-	result := &ChangedSymbolsResult{}
+	result := &ChangedSymbolsResult{Renamed: []RenamedFile{}}
 	for _, r := range repos {
 		if r.Missing {
 			continue
@@ -2636,7 +3455,7 @@ func WorkspaceChangedSymbols(s *store.Store, withBlast, includeBodies, includeTe
 	return result, nil
 }
 
-func processDeletedFile(s *store.Store, repoDir, ref string, result *ChangedSymbolsResult, file string, withBlast, _ bool, seen map[string]bool) error {
+func processDeletedFile(s *store.Store, repoDir, ref string, result *ChangedSymbolsResult, file string, withBlast bool, seen map[string]bool) error {
 	syms, err := symbolsAtRef(repoDir, ref, file)
 	if err != nil {
 		return fmt.Errorf("changed_symbols: symbols at %s@%s: %w", file, ref, err)
@@ -2689,64 +3508,210 @@ func incSummary(ct string, result *ChangedSymbolsResult) {
 	}
 }
 
-func processChangedFile(s *store.Store, result *ChangedSymbolsResult, file, changeType string, withBlast, includeBodies, includeTests bool, seen map[string]bool, hunks []vcs.Hunk) error {
-	syms, err := s.SearchSymbolsByFile(file, "", nil, includeTests, store.GeneratedAny)
+// processChangedFile classifies each symbol in a changed file by comparing its
+// masked declaration shape at ref with the shape on disk. A hunk-overlap test
+// cannot do this: git reports an insertion as a zero-length old range *before*
+// the hunk, so an appended function looked modified, and a renamed function was
+// reported under its new name as a modification of itself.
+func processChangedFile(s *store.Store, repoDir, ref string, result *ChangedSymbolsResult, file string, withBlast, includeBodies, includeTests bool, seen map[string]bool) error {
+	syms, err := s.SymbolsInFile(file, includeTests)
 	if err != nil {
 		return fmt.Errorf("changed_symbols: symbols in %s: %w", file, err)
 	}
+	if len(syms) == 0 {
+		return nil
+	}
+	pkgPath := syms[0].PackagePath
+
+	rel, relErr := filepath.Rel(repoDir, file)
+	if relErr != nil {
+		return fmt.Errorf("changed_symbols: relative path for %s: %w", file, relErr)
+	}
+	oldText, oldErr := symbolTextsAtRef(repoDir, ref, rel, pkgPath)
+	if oldErr != nil {
+		return oldErr
+	}
+	curText := symbolTextsOnDisk(syms)
+
 	for _, sym := range syms {
 		if seen[sym.QualifiedName] {
 			continue
 		}
 		seen[sym.QualifiedName] = true
 
-		ct := refinedChangeType(sym, changeType, hunks)
+		ct := classifySymbol(sym.QualifiedName, curText, oldText)
 		if ct == "" {
 			continue
 		}
-
-		cs := ChangedSymbol{
-			QualifiedName: sym.QualifiedName,
-			Kind:          sym.Kind,
-			ChangeType:    ct,
-			PosFile:       sym.PosFile,
-			PosLine:       sym.PosLine,
+		if err := appendChangedSymbol(s, result, sym, ct, "", curText[sym.QualifiedName], withBlast, includeBodies); err != nil {
+			return err
 		}
+	}
+	return appendRemovedFromRef(s, result, oldText, curText, pkgPath, withBlast, seen)
+}
 
-		if ct != changeTypeRemoved {
-			body, berr := readChangedBody(sym.PosFile, sym.Name, sym.Kind, sym.Receiver, sym.PosLine, includeBodies)
-			if berr != nil {
-				return berr
-			}
-			cs.Body = body
+// appendRemovedFromRef reports the declarations that existed at ref but not on
+// disk. They are absent from the index, so nothing in the current symbol set
+// can surface them; the ref-side parse is the only source for a removal or the
+// "from" half of a rename.
+func appendRemovedFromRef(s *store.Store, result *ChangedSymbolsResult, oldText, curText map[string]string, pkgPath string, withBlast bool, seen map[string]bool) error {
+	names := make([]string, 0, len(oldText))
+	for qn := range oldText {
+		if _, exists := curText[qn]; !exists {
+			names = append(names, qn)
 		}
-
-		if withBlast {
-			br, berr := blastRadiusFor(s, sym.QualifiedName)
-			if berr != nil {
-				return berr
-			}
-			cs.BlastRadius = br
+	}
+	sort.Strings(names)
+	for _, qn := range names {
+		if seen[qn] {
+			continue
 		}
-		result.Symbols = append(result.Symbols, cs)
-		incSummary(ct, result)
+		seen[qn] = true
+		sym := store.Symbol{QualifiedName: qn, PackagePath: pkgPath, Kind: kindOfQualifiedName(qn)}
+		if err := appendChangedSymbol(s, result, sym, changeTypeRemoved, "", oldText[qn], withBlast, false); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-// refinedChangeType narrows a coarse added/modified status to the per-symbol
-// change type using the file's hunks; "" means the symbol was not touched by
-// any hunk.
-func refinedChangeType(sym store.Symbol, changeType string, hunks []vcs.Hunk) string {
-	ct := changeType
-	if ct == changeTypeModified && hunks != nil {
-		endLine := sym.PosLine
-		if el, elErr := symbolEndLine(sym.PosFile, sym.PosLine, sym.Receiver, sym.Name, sym.Kind); elErr == nil && el > 0 {
-			endLine = el
-		}
-		ct = refineChangeType(sym.PosLine, endLine, hunks)
+// appendChangedSymbol records one changed symbol and its counters.
+func appendChangedSymbol(s *store.Store, result *ChangedSymbolsResult, sym store.Symbol, ct, renamedFrom, shape string, withBlast, includeBodies bool) error {
+	cs := ChangedSymbol{
+		QualifiedName: sym.QualifiedName,
+		Kind:          sym.Kind,
+		ChangeType:    ct,
+		RenamedFrom:   renamedFrom,
+		PosFile:       sym.PosFile,
+		PosLine:       sym.PosLine,
+		shape:         shape,
 	}
-	return ct
+	if ct != changeTypeRemoved {
+		body, err := readChangedBody(sym.PosFile, sym.Name, sym.Kind, sym.Receiver, sym.PosLine, includeBodies)
+		if err != nil {
+			return err
+		}
+		cs.Body = body
+	}
+	if withBlast {
+		br, err := blastRadiusFor(s, sym.QualifiedName)
+		if err != nil {
+			return err
+		}
+		cs.BlastRadius = br
+	}
+	result.Symbols = append(result.Symbols, cs)
+	incSummary(ct, result)
+	return nil
+}
+
+// kindOfQualifiedName recovers a symbol kind from a qualified name. The ref-side
+// parse knows the declaration form, so this only has to tell a method from a
+// function: a name with three dot-separated parts is pkg.Receiver.Method.
+func kindOfQualifiedName(qn string) string {
+	if strings.Count(qn, ".") >= 2 {
+		return kindMethod
+	}
+	return kindFunction
+}
+
+// classifySymbol reports how one symbol changed. A name present only now was
+// added, a name present only at ref was removed (or renamed — see
+// reportRenames), and a name whose declaration text differs was modified. A
+// symbol whose text is identical was not touched, even if a hunk covers its
+// line range.
+func classifySymbol(qn string, cur, old map[string]string) string {
+	curText, inCur := cur[qn]
+	oldText, inOld := old[qn]
+	switch {
+	case inCur && !inOld:
+		return changeTypeAdded
+	case !inCur && inOld:
+		return changeTypeRemoved
+	case curText != oldText:
+		return changeTypeModified
+	default:
+		return ""
+	}
+}
+
+// symbolTextsOnDisk reads each symbol's masked declaration shape from the
+// working tree. A symbol whose span cannot be located is skipped rather than
+// failing the whole diff: an unparsable file is already reported by diagnostics.
+func symbolTextsOnDisk(syms []store.Symbol) map[string]string {
+	out := make(map[string]string, len(syms))
+	for _, sym := range syms {
+		span, err := symbolSpan(sym.PosFile, sym.PosLine, sym.Receiver, sym.Name, sym.Kind)
+		if err != nil {
+			continue
+		}
+		out[sym.QualifiedName] = maskedShape(span.fset, span.data, span.node, sym.Name)
+	}
+	return out
+}
+
+// symbolTextsAtRef parses the file as it exists at ref and returns each
+// declaration's masked shape keyed by the qualified name the current index
+// would use. The key is file-based like the removed-symbol path, so a symbol
+// that only exists at ref is still nameable.
+func symbolTextsAtRef(repoDir, ref, file, pkgPath string) (map[string]string, error) {
+	data, err := vcs.GitShowFile(repoDir, ref, file)
+	if errors.Is(err, vcs.ErrFileNotInRef) {
+		return map[string]string{}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("changed_symbols: %s@%s: %w", file, ref, err)
+	}
+	fset := token.NewFileSet()
+	f, perr := parser.ParseFile(fset, file, data, parser.ParseComments)
+	if perr != nil {
+		return nil, fmt.Errorf("changed_symbols: parse %s@%s: %w", file, ref, perr)
+	}
+	out := make(map[string]string)
+	for _, decl := range f.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			if d.Name == nil {
+				continue
+			}
+			out[funcSymbolKey(pkgPath, d)] = maskedShape(fset, data, d, d.Name.Name)
+		case *ast.GenDecl:
+			for _, spec := range d.Specs {
+				for _, key := range genDeclKeys(pkgPath, spec) {
+					bare := key[strings.LastIndex(key, ".")+1:]
+					out[key] = maskedShape(fset, data, spec, bare)
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
+// funcSymbolKey rebuilds the qualified name the index uses for a function or
+// method declaration: pkg.Func, or pkg.Receiver.Func for a method.
+func funcSymbolKey(pkgPath string, d *ast.FuncDecl) string {
+	if d.Recv == nil || len(d.Recv.List) == 0 {
+		return pkgPath + "." + d.Name.Name
+	}
+	return pkgPath + "." + astReceiverName(d.Recv.List[0].Type) + "." + d.Name.Name
+}
+
+func genDeclKeys(pkgPath string, spec ast.Spec) []string {
+	switch s := spec.(type) {
+	case *ast.TypeSpec:
+		if s.Name != nil {
+			return []string{pkgPath + "." + s.Name.Name}
+		}
+	case *ast.ValueSpec:
+		keys := make([]string, 0, len(s.Names))
+		for _, n := range s.Names {
+			if n != nil {
+				keys = append(keys, pkgPath+"."+n.Name)
+			}
+		}
+		return keys
+	}
+	return nil
 }
 
 // blastRadiusFor computes a symbol's blast radius, tolerating symbols that are
@@ -2836,24 +3801,6 @@ func varOrConstKind(tok token.Token) string {
 	return ""
 }
 
-func refineChangeType(startLine, endLine int, hunks []vcs.Hunk) string {
-	for _, h := range hunks {
-		hunkStart := h.NewStart
-		hunkEnd := h.NewStart + h.NewCount - 1
-		if h.NewCount == 0 {
-			hunkStart = h.NewStart
-			hunkEnd = h.NewStart
-		}
-		if startLine <= hunkEnd && endLine >= hunkStart {
-			if h.OldCount == 0 {
-				return changeTypeAdded
-			}
-			return changeTypeModified
-		}
-	}
-	return ""
-}
-
 func resolveRepoDir(repoDir string) (string, error) {
 	if repoDir == "" {
 		repoDir = "."
@@ -2925,20 +3872,91 @@ func ContextBundle(s *store.Store, qualifiedName string, tokenBudget int) (*Bund
 	return bundle, nil
 }
 
+// estimateTokens mirrors the rendered bundle at roughly four bytes per token,
+// counting every header the renderer emits. Measuring only the body and the
+// edges under-reported a 1.2 KB bundle as 115 tokens: at a small budget the
+// fixed symbol block is most of the output, so the number must include it.
 func estimateTokens(b *Bundle) int {
-	tokens := len(b.Body) / 4
-	for _, c := range b.Callees {
-		tokens += len(c.FromRef) + len(c.ToRef) + 10
+	n := len(b.QualifiedName) + bundleHeaderBytes
+	n += bundleSymbolBytes(b.Symbol)
+	if b.Body != "" {
+		n += len(b.Body) + bundleBodyFenceBytes
 	}
-	for _, c := range b.Callers {
-		tokens += len(c.FromRef) + len(c.ToRef) + 10
+	if len(b.Callees) > 0 {
+		n += bundleSectionBytes
+		for _, c := range b.Callees {
+			n += len(c.ToRef) + len(c.EdgeType) + bundleEntryBytes
+		}
 	}
-	for _, s := range b.SameFile {
-		tokens += len(s.QualifiedName) + len(s.Signature) + 10
+	if len(b.Callers) > 0 {
+		n += bundleSectionBytes
+		for _, c := range b.Callers {
+			n += len(c.FromRef) + len(c.EdgeType) + bundleEntryBytes
+		}
 	}
-	return tokens
+	if len(b.SameFile) > 0 {
+		n += bundleSectionBytes
+		for _, s := range b.SameFile {
+			n += len(s.QualifiedName) + len(s.Kind) + bundleEntryBytes
+		}
+	}
+	return n / 4
 }
 
+// Fixed per-section costs in the rendered bundle, in bytes.
+const (
+	bundleHeaderBytes    = 40 // "Bundle: <qn> (est. N tokens)\n\n"
+	bundleSectionBytes   = 24 // "Callees (12):\n" and friends
+	bundleBodyFenceBytes = 13 // "```go\n" ... "\n```\n\n"
+	bundleEntryBytes     = 10 // "  -> " + " (calls)" + "\n"
+)
+
+// bundleSymbolBytes measures the symbol block rendered ahead of the body. The
+// doc is trimmed the way the renderer trims it, and nested anonymous structs
+// count their own entries because the renderer recurses into them.
+func bundleSymbolBytes(sym *SymbolDetail) int {
+	if sym == nil {
+		return 0
+	}
+	n := len(sym.QualifiedName) + len(sym.Kind) + len(sym.Signature) + len(sym.PosFile) + 50
+	if doc := firstSentenceLen(sym.Doc); doc > 0 {
+		n += doc + 8
+	}
+	return n + bundleFieldBytes(sym.Fields)
+}
+
+// bundleFieldBytes measures one level of the fields tree.
+func bundleFieldBytes(fields []store.SymbolField) int {
+	if len(fields) == 0 {
+		return 0
+	}
+	n := 10 // "  fields:\n"
+	for _, f := range fields {
+		n += len(f.GoName) + len(f.GoType) + 5
+		if f.WireName != f.GoName {
+			n += len(f.WireName) + 7
+		}
+		n += bundleFieldBytes(f.Fields)
+	}
+	return n
+}
+
+// firstSentenceLen returns the byte length the renderer would keep.
+func firstSentenceLen(s string) int {
+	s = strings.TrimSpace(s)
+	if i := strings.Index(s, "."); i >= 0 {
+		return i + 1
+	}
+	if len(s) > 100 {
+		return 103
+	}
+	return len(s)
+}
+
+// trimBundle drops the least essential sections until the estimate fits, then
+// recomputes so the reported number describes what is actually returned. The
+// symbol block is measured but never dropped: a bundle without its signature
+// is not a bundle.
 func trimBundle(b *Bundle, budget int) {
 	for len(b.SameFile) > 0 && estimateTokens(b) > budget {
 		b.SameFile = b.SameFile[:len(b.SameFile)-1]
@@ -2949,6 +3967,7 @@ func trimBundle(b *Bundle, budget int) {
 	for len(b.Callees) > 0 && estimateTokens(b) > budget {
 		b.Callees = b.Callees[:len(b.Callees)-1]
 	}
+	b.TokenEstimate = estimateTokens(b)
 }
 
 // filterOutGenerated drops generated-code symbols. hotspots, importance, and

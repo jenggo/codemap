@@ -184,7 +184,7 @@ func estimatePackageRaw(st *store.Store, result any) int64 {
 		return 0
 	}
 	var total int64
-	for _, sym := range pkg.ExportedSymbols {
+	for _, sym := range pkg.Symbols {
 		body, err := query.GetSymbolBody(st, sym.QualifiedName, 0, false)
 		if err != nil {
 			continue

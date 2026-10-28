@@ -84,8 +84,8 @@ func TestGateResponseViaHandleToolNotMarkedError(t *testing.T) {
 	s := newTestServer(t)
 	t.Setenv(responseLimitEnv, "512")
 
-	// The overview of the tiny testdata repo still exceeds a 512-byte limit.
-	result, isErr := s.handleTool("overview", map[string]any{})
+	// The full symbol inventory of the tiny testdata repo still exceeds 512 bytes.
+	result, _, isErr := s.handleTool("overview", map[string]any{"symbols": true})
 	if isErr {
 		t.Fatalf("gated response flagged as tool error: %s", result)
 	}
@@ -109,7 +109,7 @@ func TestReadResponseSectionByIndex(t *testing.T) {
 		t.Fatalf("save: %v", err)
 	}
 
-	result, isErr := s.handleTool(responseSectionTool, map[string]any{
+	result, _, isErr := s.handleTool(responseSectionTool, map[string]any{
 		"response_id": id,
 		"section":     float64(1),
 	})
@@ -122,7 +122,7 @@ func TestReadResponseSectionByIndex(t *testing.T) {
 	}
 
 	// Out-of-range index names the valid range.
-	result, isErr = s.handleTool(responseSectionTool, map[string]any{
+	result, _, isErr = s.handleTool(responseSectionTool, map[string]any{
 		"response_id": id,
 		"section":     float64(7),
 	})
@@ -145,7 +145,7 @@ func TestReadResponseSectionByKeyword(t *testing.T) {
 		t.Fatalf("save: %v", err)
 	}
 
-	result, isErr := s.handleTool(responseSectionTool, map[string]any{
+	result, _, isErr := s.handleTool(responseSectionTool, map[string]any{
 		"response_id": id,
 		"query":       "needleTokenInsideDeepSection",
 	})
@@ -157,7 +157,7 @@ func TestReadResponseSectionByKeyword(t *testing.T) {
 	}
 
 	// No match reports cleanly without an error flag.
-	result, isErr = s.handleTool(responseSectionTool, map[string]any{
+	result, _, isErr = s.handleTool(responseSectionTool, map[string]any{
 		"response_id": id,
 		"query":       "zzzNoMatchzzz",
 	})
@@ -168,7 +168,7 @@ func TestReadResponseSectionByKeyword(t *testing.T) {
 
 func TestReadResponseSectionUnknownID(t *testing.T) {
 	s := newTestServer(t)
-	result, isErr := s.handleTool(responseSectionTool, map[string]any{
+	result, _, isErr := s.handleTool(responseSectionTool, map[string]any{
 		"response_id": "resp-00000000000000000000-0000000000000000",
 	})
 	if !isErr {
@@ -178,7 +178,7 @@ func TestReadResponseSectionUnknownID(t *testing.T) {
 		t.Errorf("error text = %q, want unknown response_id distinction", result)
 	}
 
-	result, isErr = s.handleTool(responseSectionTool, map[string]any{})
+	result, _, isErr = s.handleTool(responseSectionTool, map[string]any{})
 	if !isErr || !strings.Contains(result, "response_id is required") {
 		t.Errorf("missing id result = (%q, %v)", result, isErr)
 	}
@@ -244,9 +244,7 @@ func TestGateManifestUnknownToolWithStoreError(t *testing.T) {
 	s := &Server{
 		dbPath:             t.TempDir() + "/missing.db",
 		repoPath:           t.TempDir(),
-		freshness:          make(map[string]freshnessEntry),
 		failedIndexes:      make(map[string]failedIndex),
-		freshnessTTL:       defaultFreshnessTTL,
 		failedIndexBackoff: defaultFailedIndexBackoff,
 	}
 	s.indexFn = func(string) error { return errors.New("no index available") }
@@ -271,7 +269,7 @@ func TestReadAllSectionsConcatenation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("save: %v", err)
 	}
-	result, isErr := s.handleTool(responseSectionTool, map[string]any{"response_id": id})
+	result, _, isErr := s.handleTool(responseSectionTool, map[string]any{"response_id": id})
 	if isErr {
 		t.Fatalf("read all failed: %s", result)
 	}
@@ -307,4 +305,108 @@ func TestResponseSectionsStoreRoundTripThroughGate(t *testing.T) {
 
 func isUnknownResponseErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "unknown response_id")
+}
+
+// TestGatedResponseCountsDeliveredBytes pins that a gated call is scored at the
+// manifest the client received, not at the stored payload. Recording the
+// pre-gate string made stats report ~100 KB for a ~1.5 KB response.
+func TestGatedResponseCountsDeliveredBytes(t *testing.T) {
+	s := newTestServer(t)
+	t.Setenv(responseLimitEnv, "512")
+
+	manifest, _, isErr := s.handleTool("overview", map[string]any{"symbols": true})
+	if isErr {
+		t.Fatalf("gated response flagged as tool error: %s", manifest)
+	}
+	if !strings.Contains(manifest, "Oversized response stored") {
+		t.Fatalf("expected a manifest, got:\n%s", manifest)
+	}
+
+	snap := s.usage.snapshot()
+	for _, row := range snap.Rows {
+		if row.Tool != "overview" {
+			continue
+		}
+		if row.RespBytes != int64(len(manifest)) {
+			t.Errorf("response_bytes = %d, want the delivered manifest size %d", row.RespBytes, len(manifest))
+		}
+		return
+	}
+	t.Fatalf("no usage row for overview: %+v", snap.Rows)
+}
+
+// TestReadAllSectionsStaysUnderGate pins that reading a whole oversized payload
+// back does not itself overflow. Concatenating every section reproduced the
+// 53 KB original, so the gate replaced the read-back with a fresh manifest: the
+// manifest's own "returns every section" promise produced another manifest.
+func TestReadAllSectionsStaysUnderGate(t *testing.T) {
+	s := newTestServer(t)
+	t.Setenv(responseLimitEnv, "512")
+
+	st, err := s.getStore()
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	sections := make([]chunk.Section, 0, 40)
+	for i := range 40 {
+		sections = append(sections, chunk.Section{
+			Title:   fmt.Sprintf("part%d", i),
+			Content: strings.Repeat(fmt.Sprintf("row %d payload\n", i), 8),
+		})
+	}
+	id, err := st.SaveResponseChunks("overview", sections)
+	if err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	result, _, isErr := s.handleTool(responseSectionTool, map[string]any{"response_id": id})
+	if isErr {
+		t.Fatalf("read all failed: %s", result)
+	}
+	if strings.Contains(result, "Oversized response stored") {
+		t.Errorf("read-all re-gated its own output (%d bytes):\n%.300s", len(result), result)
+	}
+	if len(result) > responseLimit() {
+		t.Errorf("read-all returned %d bytes, above the %d byte limit", len(result), responseLimit())
+	}
+	if !strings.Contains(result, "stopped after section") {
+		t.Errorf("truncated read-all must say where it stopped:\n%.300s", result)
+	}
+	if !strings.Contains(result, `"section": N`) {
+		t.Errorf("truncated read-all must name the resume call:\n%.300s", result)
+	}
+
+	// The first section is still complete: truncation drops the tail only.
+	if !strings.Contains(result, sections[0].Content) {
+		t.Errorf("read-all dropped the first section's content")
+	}
+}
+
+// TestReadAllSectionsTruncatesOversizedFirstSection pins that reading back a
+// payload whose first section alone exceeds the budget does not re-gate. The
+// old path wrote section 0 whole, the result crossed the limit again, and the
+// gate stored it as a second manifest — so "return every section" cost one call
+// per section and never terminated in a readable payload.
+func TestReadAllSectionsTruncatesOversizedFirstSection(t *testing.T) {
+	t.Setenv(responseLimitEnv, "2048")
+	s := newTestServer(t)
+	big := strings.Repeat("line of a very large section\n", 500)
+	id, err := s.store.SaveResponseChunks("overview", []chunk.Section{{Title: "part-0", Content: big}})
+	if err != nil {
+		t.Fatalf("save sections: %v", err)
+	}
+
+	out, _, isErr := handleReadResponseSection(s.store, nil, nil, map[string]any{"response_id": id})
+	if isErr {
+		t.Fatalf("read failed: %s", out)
+	}
+	if len(out) > 2048 {
+		t.Fatalf("read-back is %d bytes, above the 2048 limit: it would be gated again", len(out))
+	}
+	if !strings.Contains(out, "truncated") {
+		t.Errorf("expected a truncation notice naming the section to fetch, got:\n%s", out)
+	}
+	if !strings.Contains(out, id) {
+		t.Errorf("truncation notice must name the response id, got:\n%s", out)
+	}
 }

@@ -122,7 +122,7 @@ func Run(parseResult *parse.Result) *Result {
 		}
 	}
 
-	resolveCrossPackageSatisfaction(typePackages, ctx.pkgPaths, result)
+	resolveCrossPackageSatisfaction(typePackages, ctx.pkgPaths, ctx.fset, result)
 
 	sort.Slice(result.Symbols, func(i, j int) bool {
 		return result.Symbols[i].Symbol.QualifiedName < result.Symbols[j].Symbol.QualifiedName
@@ -226,7 +226,7 @@ func underlyingNamed(t types.Type) *types.Named {
 	return named
 }
 
-func resolveCrossPackageSatisfaction(typePackages []*types.Package, indexed map[string]bool, result *Result) {
+func resolveCrossPackageSatisfaction(typePackages []*types.Package, indexed map[string]bool, fset *token.FileSet, result *Result) {
 	type pkgTypes struct {
 		pkg    *types.Package
 		types  map[string]*types.Named
@@ -244,7 +244,7 @@ func resolveCrossPackageSatisfaction(typePackages []*types.Package, indexed map[
 			if pt.pkg == other.pkg {
 				continue
 			}
-			findCrossPackageSatisfies(pt.types, other.ifaces, result)
+			findCrossPackageSatisfies(pt.types, other.ifaces, fset, result)
 		}
 	}
 }
@@ -266,7 +266,7 @@ func classifyTypes(pkg *types.Package, indexed map[string]bool) (constructors, i
 // Both maps are keyed by the symbol name the edge should reference, so aliases
 // of the same type are visited once and the edge is reported under the
 // definition site.
-func findCrossPackageSatisfies(ctors, ifaces map[string]*types.Named, result *Result) {
+func findCrossPackageSatisfies(ctors, ifaces map[string]*types.Named, fset *token.FileSet, result *Result) {
 	for ctorName, ctorType := range ctors {
 		for ifaceName, ifaceType := range ifaces {
 			if satisfiesInterface(ctorType, ifaceType) {
@@ -275,12 +275,22 @@ func findCrossPackageSatisfies(ctors, ifaces map[string]*types.Named, result *Re
 						FromRef:  ctorName,
 						ToRef:    ifaceName,
 						EdgeType: "satisfies",
-						Pos:      extract.Position{File: "", Line: 0},
+						Pos:      declPosition(ctorType, fset),
 					},
 				})
 			}
 		}
 	}
+}
+
+// declPosition is the implementing type's declaration site. Without it a
+// satisfies edge has no location, so all_edges rows cannot be jumped to.
+func declPosition(named *types.Named, fset *token.FileSet) extract.Position {
+	if named == nil || named.Obj() == nil || fset == nil {
+		return extract.Position{}
+	}
+	pos := fset.Position(named.Obj().Pos())
+	return extract.Position{File: pos.Filename, Line: pos.Line, Column: pos.Column}
 }
 
 // satisfiesInterface reports whether ctorType implements ifaceType.
@@ -445,7 +455,7 @@ func processPackage(imp *importer, ctx *parseContext, pkgInfo parse.PackageInfo,
 	imp.mu.Unlock()
 
 	if typePkg != nil {
-		resolveInterfaceSatisfaction(typePkg, ctx.pkgPaths, result)
+		resolveInterfaceSatisfaction(typePkg, ctx.pkgPaths, ctx.fset, result)
 		resolveStructEmbedding(typePkg, pkgInfo.ImportPath, result)
 	}
 	resolveCgoRefs(fileMap, ctx.fset, pkgInfo.ImportPath, result)
@@ -487,15 +497,18 @@ func resolveCallExpr(node *ast.CallExpr, currentFunc string, fset *token.FileSet
 	}
 
 	var callee string
-	switch fun := node.Fun.(type) {
+	switch fun := unwrapCallee(node.Fun).(type) {
 	case *ast.Ident:
-		if obj, ok := info.Uses[fun]; ok {
+		// A local variable holding a func value (cancel, fn, inspectCancel) is
+		// not a package symbol, so naming it "<pkg>.<var>" emits a callee that
+		// no other tool can resolve. resolveIdentRef guards this already.
+		if obj, ok := info.Uses[fun]; ok && isCallableRef(obj) {
 			callee = objectQualifiedName(obj)
 		}
 	case *ast.SelectorExpr:
 		if sel, ok := info.Selections[fun]; ok {
 			callee = selectionQualifiedName(sel)
-		} else if obj, ok := info.Uses[fun.Sel]; ok {
+		} else if obj, ok := info.Uses[fun.Sel]; ok && isCallableRef(obj) {
 			callee = objectQualifiedName(obj)
 		}
 	}
@@ -514,6 +527,24 @@ func resolveCallExpr(node *ast.CallExpr, currentFunc string, fset *token.FileSet
 				},
 			},
 		})
+	}
+}
+
+// unwrapCallee strips the type arguments from a generic call's function
+// expression, so f[T]() resolves to f. The type arguments are types, not the
+// callee, and the callee's own edges are emitted separately.
+func unwrapCallee(fun ast.Expr) ast.Expr {
+	for {
+		switch f := fun.(type) {
+		case *ast.IndexExpr:
+			fun = f.X
+		case *ast.IndexListExpr:
+			fun = f.X
+		case *ast.ParenExpr:
+			fun = f.X
+		default:
+			return fun
+		}
 	}
 }
 
@@ -542,8 +573,29 @@ func isUsefulRef(obj types.Object) bool {
 		return false
 	}
 	switch obj.(type) {
-	case *types.Builtin, *types.Nil:
+	case *types.Builtin, *types.Nil, *types.PkgName, *types.Label:
+		// A goto label is scoped to its function and has no qualified name.
 		return false
+	case *types.Var, *types.Const, *types.TypeName:
+		// Only package-scope objects have a "<pkg>.<name>" form that resolves.
+		// A struct field has no parent scope; a local var, const, or type is
+		// parented by a function or block. Naming either emits a reference no
+		// other tool can find. Functions are exempt: a method has no parent
+		// scope either, and funcQualifiedName names it through its receiver.
+		return obj.Parent() == obj.Pkg().Scope()
+	}
+	return true
+}
+
+// isCallableRef reports whether a callee object names a real package-level
+// symbol. Local variables, struct fields and other scope-bound objects would
+// render as "<pkg>.<name>" and resolve to nothing.
+func isCallableRef(obj types.Object) bool {
+	if obj == nil || obj.Pkg() == nil {
+		return false
+	}
+	if v, ok := obj.(*types.Var); ok {
+		return v.Parent() == v.Pkg().Scope()
 	}
 	return true
 }
@@ -750,10 +802,13 @@ func objectQualifiedName(obj types.Object) string {
 	if obj == nil {
 		return ""
 	}
-	pkgPath := ""
-	if obj.Pkg() != nil {
-		pkgPath = obj.Pkg().Path()
+	// An object with no package is predeclared (error, any) or a local: its
+	// name has no package prefix to build, and emitting one produced refs like
+	// ".error.Error" that read as a package named "." and resolved to nothing.
+	if obj.Pkg() == nil {
+		return ""
 	}
+	pkgPath := obj.Pkg().Path()
 
 	if fn, ok := obj.(*types.Func); ok {
 		return funcQualifiedName(fn, pkgPath)
@@ -767,19 +822,19 @@ func selectionQualifiedName(sel *types.Selection) string {
 	if obj == nil {
 		return ""
 	}
+	// A func-valued struct field (dq.now(), tc.mutate()) is a FieldVal, not a
+	// method: its object has no parent scope, so "<pkg>.<field>" names nothing.
+	if sel.Kind() == types.FieldVal {
+		return ""
+	}
 
+	if obj.Pkg() == nil {
+		return ""
+	}
 	if fn, ok := obj.(*types.Func); ok {
-		pkgPath := ""
-		if fn.Pkg() != nil {
-			pkgPath = fn.Pkg().Path()
-		}
-		return funcQualifiedName(fn, pkgPath)
+		return funcQualifiedName(fn, fn.Pkg().Path())
 	}
-
-	pkgPath := ""
-	if obj.Pkg() != nil {
-		pkgPath = obj.Pkg().Path()
-	}
+	pkgPath := obj.Pkg().Path()
 	return pkgPath + "." + obj.Name()
 }
 
@@ -796,7 +851,10 @@ func funcQualifiedName(fn *types.Func, pkgPath string) string {
 	}
 	named := underlyingNamed(recvType)
 	if named == nil {
-		return pkgPath + "." + fn.Name()
+		// A method on an anonymous type (an inline interface from a type
+		// assertion, e.g. `w.(interface{ Fd() uintptr }).Fd()`) has no
+		// receiver name, so "<pkg>.<method>" would name nothing.
+		return ""
 	}
 	return pkgPath + "." + named.Obj().Name() + "." + fn.Name()
 }
@@ -804,18 +862,19 @@ func funcQualifiedName(fn *types.Func, pkgPath string) string {
 // resolveInterfaceSatisfaction records same-package implementation edges. Both
 // sides are keyed by the stored symbol name, so an alias never produces a
 // second edge for the same (implementer, interface) pair.
-func resolveInterfaceSatisfaction(pkg *types.Package, indexed map[string]bool, result *Result) {
+func resolveInterfaceSatisfaction(pkg *types.Package, indexed map[string]bool, fset *token.FileSet, result *Result) {
 	constructors, ifaces := classifyTypes(pkg, indexed)
-	findCrossPackageSatisfies(constructors, ifaces, result)
+	findCrossPackageSatisfies(constructors, ifaces, fset, result)
 }
 
 func resolveStructEmbedding(pkg *types.Package, pkgPath string, result *Result) {
 	scope := pkg.Scope()
 	for _, name := range scope.Names() {
+		// Embedding is a structural fact, not an exported-only one: an
+		// unexported wrapper type embeds its target exactly like an exported
+		// one, and skipping it made every embed in such a type invisible, so
+		// blast_radius reported zero embedders by construction.
 		obj := scope.Lookup(name)
-		if !obj.Exported() {
-			continue
-		}
 		named := underlyingNamed(obj.Type())
 		if named == nil {
 			continue

@@ -3,7 +3,6 @@ package vcs
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -315,33 +314,31 @@ func ResolveRepoDir(repoDir string) (string, error) {
 	return abs, nil
 }
 
+// GitUntrackedFiles returns .go files git does not track yet. They are absent
+// from `git diff <ref>`, so a brand-new file was invisible to every
+// working-tree diff even though its symbols were already indexed.
+func GitUntrackedFiles(repoDir string) ([]string, error) {
+	if err := IsGitRepo(repoDir); err != nil {
+		return nil, err
+	}
+	records, err := runGitNUL(repoDir, "ls-files", "--others", "--exclude-standard", "-z")
+	if err != nil {
+		return nil, err
+	}
+	return filterGoPaths(records), nil
+}
 func GitShowFile(repoDir, ref, file string) ([]byte, error) {
 	if err := IsGitRepo(repoDir); err != nil {
 		return nil, err
 	}
 	out, err := runGit(repoDir, "show", ref+":"+file)
 	if err != nil {
+		if strings.Contains(err.Error(), "does not exist") || strings.Contains(err.Error(), "exists on disk, but not in") || strings.Contains(err.Error(), "unknown revision") {
+			return nil, fmt.Errorf("%w: %s@%s", ErrFileNotInRef, file, ref)
+		}
 		return nil, err
 	}
 	return []byte(out), nil
-}
-
-// GitDirtyDiff reports whether repoDir has uncommitted .go changes relative to
-// ref and returns a fingerprint of that diff. The fingerprint lets callers
-// check whether an index already reflects this exact working-tree state, so a
-// repo that is legitimately dirty (in-progress edits) is not reindexed after
-// every query. Returns an error when git is unavailable or repoDir is not a
-// repository, so callers can fall back to mtime-only staleness checks.
-func GitDirtyDiff(repoDir, ref string) (bool, string, error) {
-	if err := IsGitRepo(repoDir); err != nil {
-		return false, "", err
-	}
-	out, err := runGit(repoDir, "diff", ref, "--", "*.go")
-	if err != nil {
-		return false, "", err
-	}
-	sum := sha256.Sum256([]byte(out))
-	return strings.TrimSpace(out) != "", fmt.Sprintf("%x", sum[:]), nil
 }
 
 // ErrNoCommits reports a repository that has never had a commit. Churn is
@@ -351,11 +348,20 @@ var ErrNoCommits = errors.New("no commits in repository")
 // GitFileChurn returns per-file commit counts for .go files in repoDir, or an
 // error when git itself fails (missing binary, not a repository, corrupt repo).
 // A repository with no commits yields ErrNoCommits, not an empty map with nil.
+//
+// Keys are absolute paths: symbols.pos_file is absolute, so churn only joins
+// against the symbol table when both sides share the same form.
 func GitFileChurn(repoDir, ref string) (map[string]int, error) {
 	if err := IsGitRepo(repoDir); err != nil {
 		return nil, err
 	}
-	args := []string{"log", "--format=format:", "--name-only", "-z"}
+	absDir, err := filepath.Abs(repoDir)
+	if err != nil {
+		return nil, err
+	}
+	// --relative keeps names relative to repoDir when it is a subdirectory of
+	// the repository, so joining with absDir yields the real file path.
+	args := []string{"log", "--format=format:", "--name-only", "--relative", "-z"}
 	if ref != "" {
 		args = append(args, ref)
 	}
@@ -374,7 +380,7 @@ func GitFileChurn(repoDir, ref string) (map[string]int, error) {
 		if !strings.HasSuffix(name, ".go") {
 			continue
 		}
-		churn[name]++
+		churn[filepath.Join(absDir, filepath.FromSlash(name))]++
 	}
 	return churn, nil
 }
@@ -389,3 +395,8 @@ func isNoCommitsErr(err error) bool {
 		strings.Contains(msg, "unknown revision") ||
 		strings.Contains(msg, "unknown revision or path not in the working tree")
 }
+
+// ErrFileNotInRef reports a path that does not exist at the requested ref, as
+// opposed to a git failure. A file added since the ref legitimately has no
+// earlier version, so callers treat it as empty rather than as an error.
+var ErrFileNotInRef = errors.New("file not in ref")

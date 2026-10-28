@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"codemap/store"
-	"codemap/vcs"
 )
 
 // initHealthRepo creates a git repo with one tracked .go file, returning HEAD
@@ -41,7 +40,7 @@ func initHealthRepo(t *testing.T, dir string) string {
 	return strings.TrimSpace(string(out))
 }
 
-func TestHandleHealthDirtySuffix(t *testing.T) {
+func TestHandleHealthStaleSuffix(t *testing.T) {
 	repo := filepath.Join(t.TempDir(), "repo")
 	head := initHealthRepo(t, repo)
 
@@ -56,13 +55,14 @@ func TestHandleHealthDirtySuffix(t *testing.T) {
 	if err := st.SetIndexedAt(time.Now()); err != nil {
 		t.Fatal(err)
 	}
+	st.RecordSourceFingerprint("", repo, nil)
 
 	out, _, isErr := handleHealth(st, nil, nil, map[string]any{})
 	if isErr {
 		t.Fatalf("health failed: %s", out)
 	}
-	if strings.Contains(out, "dirty=") {
-		t.Fatalf("clean tree must have no dirty suffix: %q", out)
+	if strings.Contains(out, "stale=") {
+		t.Fatalf("unchanged source must have no stale suffix: %q", out)
 	}
 
 	if err := os.WriteFile(filepath.Join(repo, "a.go"), []byte("package a\n\nvar X = 1\n"), 0o644); err != nil {
@@ -72,22 +72,7 @@ func TestHandleHealthDirtySuffix(t *testing.T) {
 	if isErr {
 		t.Fatalf("health failed: %s", out)
 	}
-	if !strings.Contains(out, "dirty=true (stale)") {
-		t.Errorf("want dirty=true (stale), got %q", out)
-	}
-
-	_, fp, derr := vcs.GitDirtyDiff(repo, "HEAD")
-	if derr != nil {
-		t.Fatal(derr)
-	}
-	if err := st.SetDirtyFingerprint("", fp); err != nil {
-		t.Fatal(err)
-	}
-	out, _, isErr = handleHealth(st, nil, nil, map[string]any{})
-	if isErr {
-		t.Fatalf("health failed: %s", out)
-	}
-	if !strings.Contains(out, "dirty=true (indexed)") {
-		t.Errorf("want dirty=true (indexed), got %q", out)
+	if !strings.Contains(out, "stale=true") {
+		t.Errorf("want stale=true, got %q", out)
 	}
 }

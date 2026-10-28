@@ -41,6 +41,7 @@ const ToolsAndTipsBlock = `## Available Tools
 | ` + "`get_context_bundle`" + ` | Symbol body, callees, callers, same-file symbols | LLM context preparation |
 | ` + "`get_hotspots`" + ` | Symbols ranked by complexity x churn (mode churn) or PageRank centrality (mode pagerank) | Finding risky or critical code |
 | ` + "`changed_symbols`" + ` | Symbols changed in the working tree; renames reported as from -> to; workspace: true covers every member repo | One line per symbol with ` + "`compact: true`" + ` |
+| ` + "`affected_tests`" + ` | Test files that reach the changed files, by call graph or ` + "`_test.go`" + ` convention, each with the symbols that reach it | Deciding which tests to run after an edit |
 | ` + "`read_response_section`" + ` | Stored sections of an oversized response, by index or keyword | Reading back an oversized-response manifest |
 | ` + "`stats`" + ` | Per-tool calls, errors, response bytes, estimated raw-read bytes, reduction % | Verifying context savings and tuning output formats |
 | ` + "`contracts`" + ` | Cross-repo producer/consumer contract edges (shared constants + shape match) | Tracking wire contracts in multi-repo workspaces |
@@ -906,43 +907,7 @@ func UpdateAgents() error {
 		return nil
 	}
 
-	// Find the Tips section and append
-	lines := strings.Split(content, "\n")
-	var out []string
-	tipsFound := false
-	for _, line := range lines {
-		out = append(out, line)
-		if strings.HasPrefix(strings.TrimSpace(line), "## Tips") {
-			tipsFound = true
-		}
-	}
-
-	if !tipsFound {
-		// No Tips section, append at end
-		out = append(out, "", "## Tips", "", "- Qualified names use `package/path.SymbolName` format", fmt.Sprintf("- %s — unexported (lowercase) functions/types are not indexed. Use `package` with `include_unexported: true` to find them.", tip))
-	} else {
-		// Find the end of tips section (next ## or EOF) and insert before it
-		var final []string
-		inTips := false
-		inserted := false
-		for _, line := range out {
-			if strings.HasPrefix(strings.TrimSpace(line), "## Tips") {
-				inTips = true
-			} else if inTips && strings.HasPrefix(strings.TrimSpace(line), "## ") {
-				// Next section starts, insert before
-				if !inserted {
-					final = append(final, "", fmt.Sprintf("- %s — unexported (lowercase) functions/types are not indexed. Use `package` with `include_unexported: true` to find them.", tip))
-					inserted = true
-				}
-				inTips = false
-			}
-			final = append(final, line)
-		}
-		if !inserted && inTips {
-			final = append(final, "", fmt.Sprintf("- %s — unexported (lowercase) functions/types are not indexed. Use `package` with `include_unexported: true` to find them.", tip))
-		}
-		out = final
-	}
+	out := insertTip(strings.Split(content, "\n"), tip)
 
 	if err := os.WriteFile(agentsPath, []byte(strings.Join(out, "\n")), 0644); err != nil {
 		return fmt.Errorf("writing AGENTS.md: %w", err)
@@ -950,4 +915,35 @@ func UpdateAgents() error {
 
 	fmt.Printf("agents: updated %s\n", agentsPath)
 	return nil
+}
+
+// insertTip adds the tip bullet to the document's Tips section, creating that
+// section at the end when it is absent.
+func insertTip(lines []string, tip string) []string {
+	bullet := fmt.Sprintf("- %s — unexported (lowercase) functions/types are not indexed. Use `package` with `include_unexported: true` to find them.", tip)
+
+	tipsAt := -1
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "## Tips") {
+			tipsAt = i
+			break
+		}
+	}
+	if tipsAt < 0 {
+		return append(lines, "", "## Tips", "", "- Qualified names use `package/path.SymbolName` format", bullet)
+	}
+
+	// The section ends at the next heading, or at EOF when Tips is last.
+	end := len(lines)
+	for i := tipsAt + 1; i < len(lines); i++ {
+		if strings.HasPrefix(strings.TrimSpace(lines[i]), "## ") {
+			end = i
+			break
+		}
+	}
+
+	out := make([]string, 0, len(lines)+2)
+	out = append(out, lines[:end]...)
+	out = append(out, "", bullet)
+	return append(out, lines[end:]...)
 }

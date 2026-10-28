@@ -267,3 +267,66 @@ func TestSearchTextRegexModeUnchanged(t *testing.T) {
 		t.Fatalf("regex output changed:\ngot  %+v\nwant %+v", matches, want)
 	}
 }
+
+// signalsFor returns the signals of the match whose line contains substr, and
+// whether such a match exists.
+func signalsFor(matches []store.FileMatch, lineSubstr string) ([]string, bool) {
+	for _, m := range matches {
+		if strings.Contains(m.Line, lineSubstr) {
+			return m.Signals, true
+		}
+	}
+	return nil, false
+}
+
+// TestSearchTextSignals pins per-row retrieval provenance: a row both
+// strategies matched names both, a row only the substring scan matched names
+// only that one.
+func TestSearchTextSignals(t *testing.T) {
+	s := buildTextSearchStore(t, map[string]string{
+		"both.go":    "package fused\n\n// alpha beta together\n",
+		"partial.go": "package fused\n\n// alpha alone here\n\n// beta alone here\n",
+	})
+
+	matches, err := query.SearchText(s, "alpha beta", "", false, 0)
+	if err != nil {
+		t.Fatalf("SearchText: %v", err)
+	}
+
+	got, ok := signalsFor(matches, "alpha beta together")
+	if !ok {
+		t.Fatalf("line matched by both strategies missing from results: %+v", matches)
+	}
+	if !reflect.DeepEqual(got, []string{"fts", "substring"}) {
+		t.Fatalf("both-strategy signals = %v, want [fts substring]", got)
+	}
+
+	got, ok = signalsFor(matches, "alpha alone here")
+	if !ok {
+		t.Fatalf("substring-only line missing from results: %+v", matches)
+	}
+	if !reflect.DeepEqual(got, []string{"substring"}) {
+		t.Fatalf("substring-only signals = %v, want [substring]", got)
+	}
+}
+
+// TestSearchTextRegexModeHasNoSignals pins that regex mode reports no
+// provenance, since it runs no fusion.
+func TestSearchTextRegexModeHasNoSignals(t *testing.T) {
+	s := buildTextSearchStore(t, map[string]string{
+		"regex.go": "package fused\n\n// alpha beta\n",
+	})
+
+	matches, err := query.SearchText(s, "alpha", "", true, 0)
+	if err != nil {
+		t.Fatalf("SearchText regex: %v", err)
+	}
+	if len(matches) == 0 {
+		t.Fatal("regex search returned no matches")
+	}
+	for _, m := range matches {
+		if m.Signals != nil {
+			t.Fatalf("regex match %s:%d carried signals %v", m.FilePath, m.LineNumber, m.Signals)
+		}
+	}
+}

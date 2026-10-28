@@ -1,5 +1,4 @@
 openspec/
-.opencode/
 *.md
 !README.md
-.codemap/
+!test-codemap.md

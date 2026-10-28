@@ -47,7 +47,7 @@ func TestSearchToolGeneratedArgument(t *testing.T) {
 	s := newGeneratedTestServer(t)
 	pattern := "example.com/generated"
 
-	only, isErr := s.handleTool("search", map[string]any{"pattern": pattern, "generated": "only"})
+	only, _, isErr := s.handleTool("search", map[string]any{"pattern": pattern, "generated": "only"})
 	if isErr {
 		t.Fatalf("generated=only search failed: %s", only)
 	}
@@ -58,7 +58,7 @@ func TestSearchToolGeneratedArgument(t *testing.T) {
 		t.Errorf("generated=only must drop hand-written symbols, got %s", only)
 	}
 
-	excluded, isErr := s.handleTool("search", map[string]any{"pattern": pattern, "generated": "exclude"})
+	excluded, _, isErr := s.handleTool("search", map[string]any{"pattern": pattern, "generated": "exclude"})
 	if isErr {
 		t.Fatalf("generated=exclude search failed: %s", excluded)
 	}
@@ -75,7 +75,7 @@ func TestSearchToolGeneratedArgument(t *testing.T) {
 func TestSearchToolRanksGeneratedLast(t *testing.T) {
 	s := newGeneratedTestServer(t)
 
-	out, isErr := s.handleTool("search", map[string]any{"pattern": "example.com/generated"})
+	out, _, isErr := s.handleTool("search", map[string]any{"pattern": "example.com/generated"})
 	if isErr {
 		t.Fatalf("default search failed: %s", out)
 	}
@@ -87,7 +87,7 @@ func TestSearchToolRanksGeneratedLast(t *testing.T) {
 	if zulu > alpha {
 		t.Errorf("hand-written Zulu must rank before generated AlphaAuto, got %s", out)
 	}
-	if !strings.Contains(out, "Generated") {
+	if !strings.Contains(out, "generated") {
 		t.Errorf("search output must expose the generated flag, got %s", out)
 	}
 }

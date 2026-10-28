@@ -45,21 +45,21 @@ func newFieldsServer(t *testing.T) *Server {
 
 func TestShowToolIncludesFieldsForStructs(t *testing.T) {
 	s := newFieldsServer(t)
-	out, isErr := s.handleTool("show", map[string]any{"qualified_name": "example.com/fields.Tagged"})
+	out, _, isErr := s.handleTool("show", map[string]any{"qualified_name": "example.com/fields.Tagged"})
 	if isErr {
 		t.Fatalf("show failed: %s", out)
 	}
-	for _, want := range []string{"go_name", "wire_name", "go_type", "user_id", "cbor_name"} {
+	for _, want := range []string{"UserID:user_id:string", "Both:cbor_name:string"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("show output missing %q:\n%s", want, out)
 		}
 	}
 
-	out, isErr = s.handleTool("show", map[string]any{"qualified_name": "example.com/fields.F"})
+	out, _, isErr = s.handleTool("show", map[string]any{"qualified_name": "example.com/fields.F"})
 	if isErr {
 		t.Fatalf("show failed: %s", out)
 	}
-	if strings.Contains(out, "wire_name") {
+	if strings.Contains(out, "user_id") {
 		t.Errorf("show for a function must omit fields:\n%s", out)
 	}
 }
@@ -72,35 +72,35 @@ func TestPackageAndSearchToolFieldsOptIn(t *testing.T) {
 		{"path": pkgPath},
 		{"path": pkgPath, keyIncludeFields: true},
 	} {
-		out, isErr := s.handleTool(keyToolPackage, args)
+		out, _, isErr := s.handleTool(keyToolPackage, args)
 		if isErr {
 			t.Fatalf("package %v failed: %s", args, out)
 		}
 		want := args[keyIncludeFields] == true
-		if got := strings.Contains(out, "wire_name"); got != want {
+		if got := strings.Contains(out, "user_id"); got != want {
 			t.Errorf("package %v: fields present = %v, want %v", args, got, want)
 		}
 	}
 
-	out, isErr := s.handleTool("search", map[string]any{"pattern": "Tagged"})
+	out, _, isErr := s.handleTool("search", map[string]any{"pattern": "Tagged"})
 	if isErr {
 		t.Fatalf("search failed: %s", out)
 	}
-	if strings.Contains(out, "wire_name") {
+	if strings.Contains(out, "user_id") {
 		t.Errorf("search without include_fields must omit fields:\n%s", out)
 	}
 
-	out, isErr = s.handleTool("search", map[string]any{"pattern": "Tagged", keyIncludeFields: true})
+	out, _, isErr = s.handleTool("search", map[string]any{"pattern": "Tagged", keyIncludeFields: true})
 	if isErr {
 		t.Fatalf("search with fields failed: %s", out)
 	}
-	if !strings.Contains(out, "wire_name") {
+	if !strings.Contains(out, "user_id") {
 		t.Errorf("search with include_fields must carry fields:\n%s", out)
 	}
 }
 
 func TestSchemaDocumentsFields(t *testing.T) {
-	out, isErr := newFieldsServer(t).handleTool("schema", map[string]any{})
+	out, _, isErr := newFieldsServer(t).handleTool("schema", map[string]any{})
 	if isErr {
 		t.Fatalf("schema failed: %s", out)
 	}

@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"strings"
 	"testing"
 )
 
@@ -263,5 +264,267 @@ func TestExprStringArrayTypes(t *testing.T) {
 				t.Fatalf("exprString(%q) = %q, want %q", tt.expr, got, tt.want)
 			}
 		})
+	}
+}
+
+// extractSource runs the extractor over one in-memory file, the same way the
+// index pipeline does, so symbol kinds and receivers match production.
+func extractSource(t *testing.T, code string) *Result {
+	t.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "test.go", code, 0)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	return Run("example.com/x", map[string]*ast.File{"test.go": f}, fset, false, nil)
+}
+
+func symbolsNamed(res *Result, name string) []Symbol {
+	var out []Symbol
+	for _, s := range res.Symbols {
+		if s.Name == name {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// An interface's unexported method is still part of its contract: Go uses it
+// for constraint interfaces and internal seams. Dropping the symbol made
+// interface_impls fall back to reporting the implementer's whole method set.
+func TestExtractUnexportedInterfaceMethod(t *testing.T) {
+	res := extractSource(t, `package p
+
+type task interface {
+	getIDs() (string, string)
+}
+`)
+	got := symbolsNamed(res, "getIDs")
+	if len(got) != 1 {
+		t.Fatalf("expected 1 getIDs symbol, got %d (%d total)", len(got), len(res.Symbols))
+	}
+	sym := got[0]
+	if sym.Kind != "method" {
+		t.Errorf("kind = %q, want method", sym.Kind)
+	}
+	if sym.Receiver != "task" {
+		t.Errorf("receiver = %q, want task", sym.Receiver)
+	}
+	if sym.Exported {
+		t.Error("exported = true, want false for an unexported method")
+	}
+	if sym.QualifiedName != "example.com/x.task.getIDs" {
+		t.Errorf("qualified name = %q", sym.QualifiedName)
+	}
+}
+
+// Visibility must be read from the name, not hardcoded: an interface can
+// declare both kinds, and each symbol has to carry its own answer.
+func TestExtractInterfaceMethodVisibility(t *testing.T) {
+	res := extractSource(t, `package p
+
+type Store interface {
+	Save() error
+	reset()
+}
+`)
+	for _, tc := range []struct {
+		name     string
+		exported bool
+	}{
+		{"Save", true},
+		{"reset", false},
+	} {
+		got := symbolsNamed(res, tc.name)
+		if len(got) != 1 {
+			t.Fatalf("%s: expected 1 symbol, got %d", tc.name, len(got))
+		}
+		if got[0].Exported != tc.exported {
+			t.Errorf("%s: exported = %v, want %v", tc.name, got[0].Exported, tc.exported)
+		}
+		if got[0].Receiver != "Store" {
+			t.Errorf("%s: receiver = %q, want Store", tc.name, got[0].Receiver)
+		}
+	}
+}
+
+// A union-only constraint declares no methods, so it must yield the interface
+// symbol and no method symbols — and must not error.
+func TestExtractUnionOnlyConstraintHasNoMethods(t *testing.T) {
+	res := extractSource(t, `package p
+
+type Number interface {
+	int | int64 | float64
+}
+`)
+	types := symbolsNamed(res, "Number")
+	if len(types) != 1 {
+		t.Fatalf("expected 1 Number symbol, got %d", len(types))
+	}
+	if types[0].Kind != "interface" {
+		t.Errorf("kind = %q, want interface", types[0].Kind)
+	}
+	for _, s := range res.Symbols {
+		if s.Kind == "method" && s.Receiver == "Number" {
+			t.Errorf("unexpected method symbol on a union-only constraint: %s", s.QualifiedName)
+		}
+	}
+}
+
+// TestExtractInlineStructFields verifies an inline anonymous struct field keeps
+// its own fields. Without them every nested config section rendered as
+// "struct{}", so a whole config tree was invisible to show and package.
+func TestExtractInlineStructFields(t *testing.T) {
+	res := extractSource(t, `package p
+
+type config struct {
+	Warns struct {
+		Buffer struct {
+			Duration    int
+			MinBreaches int `+"`json:\"min_breaches\"`"+`
+		}
+	}
+	Named Inner
+}
+
+type Inner struct{ A int }
+`)
+
+	syms := symbolsNamed(res, "config")
+	if len(syms) != 1 {
+		t.Fatalf("expected 1 config symbol, got %d", len(syms))
+	}
+	fields := syms[0].Fields
+	if len(fields) != 2 {
+		t.Fatalf("expected 2 top-level fields, got %d", len(fields))
+	}
+
+	warns := fields[0]
+	if warns.GoName != "Warns" || len(warns.Fields) != 1 {
+		t.Fatalf("Warns should carry its inline struct fields, got %+v", warns)
+	}
+	buffer := warns.Fields[0]
+	if buffer.GoName != "Buffer" || len(buffer.Fields) != 2 {
+		t.Fatalf("Buffer should carry its inline struct fields, got %+v", buffer)
+	}
+	if got := buffer.Fields[1]; got.WireName != "min_breaches" {
+		t.Errorf("nested wire name = %q, want min_breaches", got.WireName)
+	}
+
+	// A named type resolves through its own symbol, so it carries no inline
+	// subtree and must not be expanded here.
+	if named := fields[1]; named.GoName != "Named" || len(named.Fields) != 0 {
+		t.Errorf("named type field should not be expanded, got %+v", named)
+	}
+}
+
+// TestExtractGenericSignatureKeepsTypeParams pins that a generic declaration's
+// type-parameter clause survives into the indexed signature. Without it every
+// generic function looked non-generic and the signature could not be used to
+// call the function.
+func TestExtractGenericSignatureKeepsTypeParams(t *testing.T) {
+	res := extractSource(t, `package p
+
+func Fetch[T any](label string, fn func() (T, error)) T { var z T; return z }
+
+type Box[T any] struct{ V T }
+
+type Pair[K comparable, V any] struct {
+	Key K
+	Val V
+}
+`)
+
+	cases := []struct{ name, want string }{
+		{"Fetch", "func[T any](label string, fn func() (T, error)) T"},
+		{"Box", "[T any] struct { V T }"},
+		{"Pair", "[K comparable, V any] struct { Key K; Val V }"},
+	}
+	for _, tc := range cases {
+		syms := symbolsNamed(res, tc.name)
+		if len(syms) != 1 {
+			t.Fatalf("%s: expected 1 symbol, got %d", tc.name, len(syms))
+		}
+		if got := syms[0].Signature; got != tc.want {
+			t.Errorf("%s signature = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestExtractNestedStructSignatureDoesNotClaimEmpty pins that a struct field
+// with fields renders as struct{...}, not struct{}, so a signature never
+// contradicts the fields column.
+func TestExtractNestedStructSignatureDoesNotClaimEmpty(t *testing.T) {
+	res := extractSource(t, `package p
+
+type cfg struct {
+	Warns struct{ Level int }
+	Empty struct{}
+}
+`)
+	syms := symbolsNamed(res, "cfg")
+	if len(syms) != 1 {
+		t.Fatalf("expected 1 symbol, got %d", len(syms))
+	}
+	sig := syms[0].Signature
+	if !strings.Contains(sig, "Warns struct{...}") {
+		t.Errorf("non-empty nested struct should render struct{...}, got %q", sig)
+	}
+	if !strings.Contains(sig, "Empty struct{}") {
+		t.Errorf("empty nested struct should stay struct{}, got %q", sig)
+	}
+}
+
+// TestIotaConstantsCarryResolvedValue pins that an iota block reports each
+// constant's value. Without it the first constant's signature was the literal
+// "iota" and every later one was empty, so the only thing a reader looks up an
+// enum constant for had to be re-derived from source.
+func TestIotaConstantsCarryResolvedValue(t *testing.T) {
+	src := `package p
+
+type state int
+
+const (
+	stateNew state = iota
+	stateReady
+	stateClosed
+)
+
+const (
+	flagA = 1 << iota
+	flagB
+	flagC
+)
+
+const (
+	offset = iota + 10
+	offset2
+)
+
+const name = "not-an-int"
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "test.go", src, 0)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	syms := Run("p", map[string]*ast.File{"test.go": f}, fset, false, nil).Symbols
+	want := map[string]string{
+		"p.stateNew":    "0",
+		"p.stateReady":  "1",
+		"p.stateClosed": "2",
+		"p.flagA":       "1",
+		"p.flagB":       "2",
+		"p.flagC":       "4",
+		"p.offset":      "10",
+		"p.offset2":     "11",
+		"p.name":        `"not-an-int"`,
+	}
+	for _, sym := range syms {
+		if exp, ok := want[sym.QualifiedName]; ok {
+			if sym.Signature != exp {
+				t.Errorf("%s signature = %q, want %q", sym.QualifiedName, sym.Signature, exp)
+			}
+		}
 	}
 }

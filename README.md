@@ -184,8 +184,19 @@ codemap <command> [args] [flags]
 ## How It Works
 
 1. **Parse** — enumerates packages with `go list` (falling back to a directory walk) and walks Go source files using `go/parser` and `go/ast` to extract symbols and import edges
-2. **Resolve** — uses `go/types` to resolve type information, method receivers, interface satisfaction, and embedded types
+2. **Resolve** — uses `go/types` to resolve type information, method receivers, interface satisfaction, and embedded types, loading dependency export data with a single `go list -export -deps` call
 3. **Store** — persists the graph (symbols + typed edges), file contents, and churn data in a local SQLite database
 4. **Query** — provides a query layer with filtering, traversal, and analysis on top of the stored graph
 
 The CLI reads an existing index and errors with a hint when none is present, so run `codemap index` (or `codemap index --workspace`) first. The MCP server indexes automatically on first use and re-indexes when source files change.
+
+### First Index Is Slow Once
+
+The first `codemap index` in a repo is dominated by the Go build cache, not by codemap. Step 2's `go list -export -deps` makes Go compile every transitive dependency so their export data can be read; on a cold cache that can take tens of seconds (a cgo dependency alone can account for most of it). Every run afterwards reuses the cache and finishes in well under a second.
+
+Deleting `.codemap` does not reset this — the cache lives in `GOCACHE` (`go env GOCACHE`), not in the index. If you need to reproduce a cold start, point the cache somewhere empty:
+
+```
+GOCACHE=$(mktemp -d) codemap index
+```
+

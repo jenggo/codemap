@@ -19,10 +19,14 @@ type Position struct {
 // falling back to the Go name) and Go type. Contract analysis compares structs
 // on effective wire name + type, so fields are captured at index time and
 // served from the symbol table, never re-walked.
+//
+// Fields is populated for an inline anonymous struct field, whose own fields
+// have no symbol of their own to be looked up through.
 type StructField struct {
-	GoName   string `json:"go_name,omitempty"`
-	WireName string `json:"wire_name,omitempty"`
-	GoType   string `json:"go_type,omitempty"`
+	GoName   string        `json:"go_name,omitempty"`
+	WireName string        `json:"wire_name,omitempty"`
+	GoType   string        `json:"go_type,omitempty"`
+	Fields   []StructField `json:"fields,omitempty"`
 }
 
 type Symbol struct {
@@ -210,12 +214,28 @@ func (e *fileExtractor) extractGenDecl(gd *ast.GenDecl) {
 		return
 	}
 
+	// A const block repeats its value expression down the spec list, and `iota`
+	// advances per ConstSpec rather than per name. Resolving the value here
+	// keeps the signature meaningful: without it every constant after the first
+	// had an empty signature and the first read literally "iota", which is the
+	// one thing a reader looking up an enum constant needs to know.
+	iotaVal := -1
+	var prevValues []ast.Expr
 	for _, spec := range gd.Specs {
+		iotaVal++
 		switch s := spec.(type) {
 		case *ast.TypeSpec:
 			e.extractTypeSpec(s, kind, gd.Doc)
 		case *ast.ValueSpec:
-			e.extractValueSpec(s, kind, gd.Doc)
+			values := s.Values
+			if len(values) == 0 && kind == kindConst {
+				// An omitted ConstSpec repeats the previous expression list.
+				values = prevValues
+			}
+			if len(values) > 0 {
+				prevValues = values
+			}
+			e.extractValueSpec(s, kind, gd.Doc, iotaVal, values)
 		}
 	}
 }
@@ -225,7 +245,7 @@ func tokenKind(tok token.Token) string {
 		return "type"
 	}
 	if tok == token.CONST {
-		return "const"
+		return kindConst
 	}
 	if tok == token.VAR {
 		return "var"
@@ -235,6 +255,7 @@ func tokenKind(tok token.Token) string {
 
 const kindType = "type"
 const kindAlias = "alias"
+const kindConst = "const"
 
 func (e *fileExtractor) extractTypeSpec(ts *ast.TypeSpec, kind string, doc *ast.CommentGroup) {
 	pos := e.fset.Position(ts.Pos())
@@ -255,7 +276,7 @@ func (e *fileExtractor) extractTypeSpec(ts *ast.TypeSpec, kind string, doc *ast.
 		QualifiedName: qualifiedName,
 		Name:          ts.Name.Name,
 		Kind:          actualKind,
-		Signature:     typeSignatureString(ts.Type),
+		Signature:     typeSignatureString(ts),
 		Doc:           docString(doc),
 		Pos: Position{
 			File: pos.Filename,
@@ -309,9 +330,6 @@ func (e *fileExtractor) extractInterfaceMethods(ifaceName string, methods *ast.F
 			continue
 		}
 		for _, name := range field.Names {
-			if !name.IsExported() {
-				continue
-			}
 			pos := e.fset.Position(name.Pos())
 			sym := Symbol{
 				QualifiedName: e.pkgPath + "." + ifaceName + "." + name.Name,
@@ -324,7 +342,7 @@ func (e *fileExtractor) extractInterfaceMethods(ifaceName string, methods *ast.F
 					File: pos.Filename,
 					Line: pos.Line,
 				},
-				Exported:    true,
+				Exported:    name.IsExported(),
 				IsTest:      e.isTest,
 				IsGenerated: e.isGenerated,
 			}
@@ -351,9 +369,21 @@ func extractStructFields(st *ast.StructType) []StructField {
 			GoName:   goName,
 			WireName: wireName(f, goName),
 			GoType:   exprString(f.Type),
+			Fields:   inlineStructFields(f.Type),
 		})
 	}
 	return fields
+}
+
+// inlineStructFields returns the fields of an anonymous struct type, so a
+// nested config tree is visible without a symbol lookup that cannot exist for
+// an unnamed type. Named types resolve through their own symbol instead.
+func inlineStructFields(expr ast.Expr) []StructField {
+	st, ok := expr.(*ast.StructType)
+	if !ok {
+		return nil
+	}
+	return extractStructFields(st)
 }
 
 // wireTagPriority lists the serialization tags consulted to derive a field's
@@ -386,7 +416,7 @@ func wireName(f *ast.Field, goName string) string {
 	return goName
 }
 
-func (e *fileExtractor) extractValueSpec(vs *ast.ValueSpec, kind string, doc *ast.CommentGroup) {
+func (e *fileExtractor) extractValueSpec(vs *ast.ValueSpec, kind string, doc *ast.CommentGroup, iotaVal int, values []ast.Expr) {
 	for i, name := range vs.Names {
 		// The blank identifier declares nothing addressable, so a `var _ = f()`
 		// must not create a symbol. Emitting one folds every such declaration
@@ -400,9 +430,14 @@ func (e *fileExtractor) extractValueSpec(vs *ast.ValueSpec, kind string, doc *as
 		qualifiedName := e.pkgPath + "." + name.Name
 
 		sig := ""
-		if i < len(vs.Values) {
-			sig = valueString(vs.Values[i])
-		} else if vs.Type != nil {
+		switch {
+		case i < len(values):
+			if kind == kindConst {
+				sig = resolveConstValue(values[i], iotaVal)
+			} else {
+				sig = valueString(values[i])
+			}
+		case vs.Type != nil:
 			sig = exprString(vs.Type)
 		}
 
@@ -454,14 +489,22 @@ func typeString(expr ast.Expr) string {
 	}
 }
 
+// signatureString renders a function type, including its type-parameter
+// clause. Dropping the clause made every generic declaration unsearchable by
+// its own source text ("fetchWithFallback[T any]") and hid that the function
+// was generic at all.
 func signatureString(ft *ast.FuncType) string {
-	parts := []string{"func"}
+	// Go spells a generic function "func f[T any](...)", so the clause sits
+	// tight against both "func" and the parameter list.
+	head := "func" + typeParamsString(ft.TypeParams)
+	parts := []string{head}
 	if ft.Params != nil {
 		params := make([]string, 0, ft.Params.NumFields())
 		for _, f := range ft.Params.List {
 			params = append(params, fieldListString(f))
 		}
-		parts = append(parts, "("+strings.Join(params, ", ")+")")
+		head += "(" + strings.Join(params, ", ") + ")"
+		parts = []string{head}
 	}
 	if ft.Results != nil && ft.Results.NumFields() > 0 {
 		results := make([]string, 0, ft.Results.NumFields())
@@ -475,6 +518,19 @@ func signatureString(ft *ast.FuncType) string {
 		}
 	}
 	return strings.Join(parts, " ")
+}
+
+// typeParamsString renders a declaration's type-parameter clause, e.g.
+// "[T any, K comparable]", or "" when the declaration is not generic.
+func typeParamsString(params *ast.FieldList) string {
+	if params == nil || params.NumFields() == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(params.List))
+	for _, f := range params.List {
+		parts = append(parts, fieldListString(f))
+	}
+	return "[" + strings.Join(parts, ", ") + "]"
 }
 
 func fieldListString(f *ast.Field) string {
@@ -508,11 +564,17 @@ func exprString(expr ast.Expr) string {
 	case *ast.InterfaceType:
 		return "interface{}"
 	case *ast.StructType:
-		return "struct{}"
+		if e.Fields == nil || len(e.Fields.List) == 0 {
+			return "struct{}"
+		}
+		// "struct{}" claims the struct is empty. A signature is not the place
+		// for the whole subtree (the fields column carries it), but it must
+		// not deny that fields exist.
+		return "struct{...}"
 	case *ast.ChanType:
 		return "chan " + exprString(e.Value)
 	case *ast.FuncType:
-		return "func(...)"
+		return signatureString(e)
 	case *ast.IndexExpr:
 		return exprString(e.X) + "[" + exprString(e.Index) + "]"
 	case *ast.IndexListExpr:
@@ -556,22 +618,30 @@ func valueString(expr ast.Expr) string {
 	}
 }
 
-func typeSignatureString(expr ast.Expr) string {
-	switch t := expr.(type) {
+// typeSignatureString renders a type declaration's underlying type, prefixed
+// by its type-parameter clause when it is generic.
+func typeSignatureString(ts *ast.TypeSpec) string {
+	var body string
+	switch t := ts.Type.(type) {
 	case *ast.StructType:
 		if t.Fields == nil || len(t.Fields.List) == 0 {
-			return "struct{}"
+			body = "struct{}"
+			break
 		}
 		fields := make([]string, 0, len(t.Fields.List))
 		for _, f := range t.Fields.List {
 			fields = append(fields, fieldListString(f))
 		}
-		return "struct { " + strings.Join(fields, "; ") + " }"
+		body = "struct { " + strings.Join(fields, "; ") + " }"
 	case *ast.InterfaceType:
-		return "interface"
+		body = "interface"
 	default:
-		return exprString(expr)
+		body = exprString(ts.Type)
 	}
+	if clause := typeParamsString(ts.TypeParams); clause != "" {
+		return clause + " " + body
+	}
+	return body
 }
 
 func docString(doc *ast.CommentGroup) string {
@@ -579,4 +649,91 @@ func docString(doc *ast.CommentGroup) string {
 		return ""
 	}
 	return doc.Text()
+}
+
+// resolveConstValue renders a const initializer with iota substituted. Anything
+// that is not a plain integer expression keeps its source form, so a string or
+// a call is not misreported as a number.
+func resolveConstValue(expr ast.Expr, iotaVal int) string {
+	if v, ok := constIntValue(expr, iotaVal); ok {
+		return strconv.FormatInt(v, 10)
+	}
+	return valueString(expr)
+}
+
+// constIntValue evaluates the integer subset of Go's constant expressions that
+// an iota-based enum actually uses: literals, iota, unary minus, and binary
+// arithmetic. Anything else reports ok=false.
+func constIntValue(expr ast.Expr, iotaVal int) (int64, bool) {
+	switch e := expr.(type) {
+	case *ast.BasicLit:
+		if e.Kind != token.INT {
+			return 0, false
+		}
+		v, err := strconv.ParseInt(e.Value, 0, 64)
+		return v, err == nil
+	case *ast.Ident:
+		if e.Name == "iota" {
+			return int64(iotaVal), true
+		}
+		return 0, false
+	case *ast.ParenExpr:
+		return constIntValue(e.X, iotaVal)
+	case *ast.UnaryExpr:
+		v, ok := constIntValue(e.X, iotaVal)
+		if !ok {
+			return 0, false
+		}
+		return constUnaryValue(e.Op, v)
+	case *ast.BinaryExpr:
+		return constBinaryValue(e, iotaVal)
+	default:
+		return 0, false
+	}
+}
+
+// constUnaryValue applies a sign operator to an already-evaluated constant.
+func constUnaryValue(op token.Token, v int64) (int64, bool) {
+	if op == token.SUB {
+		return -v, true
+	}
+	if op == token.ADD {
+		return v, true
+	}
+	return 0, false
+}
+
+// constBinaryValue evaluates the arithmetic operator of a constant expression
+// whose operands both evaluate to integers.
+func constBinaryValue(e *ast.BinaryExpr, iotaVal int) (int64, bool) {
+	left, okL := constIntValue(e.X, iotaVal)
+	right, okR := constIntValue(e.Y, iotaVal)
+	if !okL || !okR {
+		return 0, false
+	}
+	return applyConstOp(e.Op, left, right)
+}
+
+// applyConstOp applies an arithmetic operator to two evaluated constants.
+func applyConstOp(op token.Token, left, right int64) (int64, bool) {
+	// A map lookup rather than a switch: token.Token has ~80 values, and an
+	// exhaustive switch over it is noise for the six that matter here.
+	binops := map[token.Token]func(int64, int64) (int64, bool){
+		token.ADD: func(a, b int64) (int64, bool) { return a + b, true },
+		token.SUB: func(a, b int64) (int64, bool) { return a - b, true },
+		token.MUL: func(a, b int64) (int64, bool) { return a * b, true },
+		token.QUO: func(a, b int64) (int64, bool) {
+			if b == 0 {
+				return 0, false
+			}
+			return a / b, true
+		},
+		token.SHL: func(a, b int64) (int64, bool) { return a << uint(b), true },
+		token.SHR: func(a, b int64) (int64, bool) { return a >> uint(b), true },
+	}
+	fn, ok := binops[op]
+	if !ok {
+		return 0, false
+	}
+	return fn(left, right)
 }

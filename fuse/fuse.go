@@ -18,14 +18,16 @@ import (
 const DefaultK = 60.0
 
 // Candidate is one line-level match produced by a retrieval strategy. The
-// fields mirror store.FileMatch so conversion is a plain field copy; Score
-// carries the fused (and proximity-multiplied) ranking weight and is not
-// part of the match output shape.
+// content fields mirror store.FileMatch so conversion is a plain field copy;
+// Score carries the fused (and proximity-multiplied) ranking weight and
+// Sources holds the indices of the input lists that contained the candidate.
+// Neither Score nor Sources is part of the match output shape.
 type Candidate struct {
 	FilePath      string
 	Line          string
 	ContextBefore string
 	ContextAfter  string
+	Sources       []int
 	LineNumber    int
 	Score         float64
 }
@@ -39,14 +41,15 @@ type Candidate struct {
 // in only one list still appears — fusion widens recall, it never drops a
 // single-strategy hit. A candidate ranked in both lists outranks
 // single-strategy candidates of comparable rank because its contributions
-// add. k <= 0 falls back to DefaultK.
+// add. Sources records the index of each list that contained the candidate,
+// in ascending order. k <= 0 falls back to DefaultK.
 func Fuse(a, b []Candidate, k float64) []Candidate {
 	if k <= 0 {
 		k = DefaultK
 	}
 	scores := make(map[string]float64)
 	first := make(map[string]Candidate)
-	add := func(list []Candidate) {
+	add := func(list []Candidate, idx int) {
 		seen := make(map[string]bool, len(list))
 		for i, c := range list {
 			kk := c.FilePath + "\x00" + strconv.Itoa(c.LineNumber)
@@ -55,13 +58,16 @@ func Fuse(a, b []Candidate, k float64) []Candidate {
 			}
 			seen[kk] = true
 			scores[kk] += 1.0 / (k + float64(i+1))
-			if _, ok := first[kk]; !ok {
-				first[kk] = c
+			cur, ok := first[kk]
+			if !ok {
+				cur = c
 			}
+			cur.Sources = append(cur.Sources, idx)
+			first[kk] = cur
 		}
 	}
-	add(a)
-	add(b)
+	add(a, 0)
+	add(b, 1)
 
 	out := make([]Candidate, 0, len(first))
 	for kk, c := range first {

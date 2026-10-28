@@ -43,6 +43,7 @@ type parsedFlags struct {
 	edgeTypes         []string
 	format            render.Format
 	contextLines      int
+	depth             int
 	topN              int
 	minComplexity     int
 	minChurn          int
@@ -139,6 +140,8 @@ func handleValueFlags(arg string, args []string, i int, flags *parsedFlags) (boo
 		return consumeStringArg(args, i, &flags.generated)
 	case "--context-lines":
 		return consumeIntArg(args, i, &flags.contextLines)
+	case "--depth":
+		return consumeIntArg(args, i, &flags.depth)
 	case "--top-n":
 		return consumeIntArg(args, i, &flags.topN)
 	case "--min-complexity":
@@ -271,6 +274,8 @@ func dispatchCommand(cmd string, args []string, flags parsedFlags, queryOpts []q
 		cmdInit()
 	case "changed-symbols":
 		return cmdChangedSymbols(flags.dbPath, flags.ref, renderOpts)
+	case "affected":
+		return cmdAffected(args, flags, renderOpts)
 	case "update-agents":
 		if err := initcmd.UpdateAgents(); err != nil {
 			return err
@@ -431,10 +436,12 @@ func cmdIndex(path, dbPath string, workspace, discover bool) {
 
 	writeIndexStore(s, absPath, parseResult, resolveResult)
 
-	fmt.Printf("Indexed %d packages, %d symbols, %d edges\n",
-		len(resolveResult.Packages),
-		len(resolveResult.Symbols),
-		len(resolveResult.Edges))
+	pkgs, syms, edges, err := s.Counts()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Count error: %v\n", err)
+		return
+	}
+	fmt.Printf("Indexed %d packages, %d symbols, %d edges\n", pkgs, syms, edges)
 }
 
 func writeIndexStore(s *store.Store, absPath string, parseResult *parse.Result, resolveResult *resolve.Result) {
@@ -455,11 +462,19 @@ func writeIndexStore(s *store.Store, absPath string, parseResult *parse.Result, 
 	if parseResult.Fallback {
 		indexedVia = "dir-walk"
 	}
-	if err := s.SetRepoMetaWith(absPath, head, len(resolveResult.Packages), len(resolveResult.Symbols), indexedVia); err != nil {
+	pkgCount, symCount, _, err := s.Counts()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Count index rows error: %v\n", err)
+		return
+	}
+	if err := s.SetRepoMetaWith(absPath, head, pkgCount, symCount, indexedVia); err != nil {
 		fmt.Fprintf(os.Stderr, "Set repo meta error: %v\n", err)
 		return
 	}
-	s.RecordDirtyFingerprint(absPath, "")
+	s.RecordSourceFingerprint("", absPath, parse.FileContents(parseResult))
+	if _, err := contract.ReanalyzeStaleContracts(s, contract.DefaultConfig()); err != nil {
+		fmt.Fprintf(os.Stderr, "Contract analysis error: %v\n", err)
+	}
 	if err := s.RecordChurnDegradation(churnErr); err != nil {
 		fmt.Fprintf(os.Stderr, "Set churn degradation error: %v\n", err)
 		return
@@ -695,6 +710,24 @@ func cmdChangedSymbols(dbPath, ref string, renderOpts []render.Option) error {
 		return err
 	}
 	fmt.Print(render.RenderChangedSymbols(result, renderOpts...))
+	return nil
+}
+
+// cmdAffected maps changed files to the test files that exercise them.
+func cmdAffected(args []string, flags parsedFlags, renderOpts []render.Option) error {
+	s, err := store.Open(flags.dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return err
+	}
+	defer func() { _ = s.Close() }()
+
+	result, err := query.AffectedTests(s, ".", flags.ref, args, flags.depth)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return err
+	}
+	fmt.Print(render.RenderAffectedTests(result, renderOpts...))
 	return nil
 }
 
@@ -1064,6 +1097,7 @@ func printUsage() {
 	fmt.Println("  hotspots                  Show code hotspots (complexity x churn)")
 	fmt.Println("  importance                Show symbol importance (PageRank)")
 	fmt.Println("  changed-symbols [--ref R] Show symbols changed vs R (default: integration branch)")
+	fmt.Println("  affected [files...]       Show test files impacted by changed files (default: working tree)")
 	fmt.Println("  diagnostics [file]        Show indexed compile errors (type-check/parse)")
 	fmt.Println("  contracts                 List contract edges across repos")
 	fmt.Println("  contract-drift            List structural drift reports")
@@ -1091,6 +1125,7 @@ func printUsageFlags() {
 	fmt.Println("  --generated <mode>        Generated-code handling for search: any (default), exclude, or only (generated matches are down-ranked, never hidden)")
 	fmt.Println("  --repo <module>           Scope query to one workspace repo (search/show/callers-of/callees-of/importers-of/imports-of/blast-radius/pattern)")
 	fmt.Println("  --ref <git-ref>           Diff base for changed-symbols (default: integration branch)")
+	fmt.Println("  --depth <n>               Traversal depth (for affected; default 3)")
 	fmt.Println("  --file-pattern <glob>     Filter by file-path substring (for pattern)")
 	fmt.Println("  --regex                   Use regex mode (for search-text)")
 	fmt.Println("  --context-lines <n>       Context lines around matches (for search-text)")

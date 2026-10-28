@@ -27,11 +27,13 @@ const (
 	keyPackages = "packages"
 	keySymbols  = "symbols"
 	keyEdges    = "edges"
+	keyFields   = "fields"
 )
 
 type Options struct {
-	Format   Format
-	FullDocs bool
+	Format     Format
+	FullDocs   bool
+	FileScoped bool
 }
 
 // Option mutates render Options. Alias of opt.Option[Options], so existing
@@ -45,6 +47,17 @@ var WithFormat = opt.New(func(o *Options, f Format) { o.Format = f })
 func WithFullDocs() Option {
 	return func(o *Options) {
 		o.FullDocs = true
+	}
+}
+
+// WithFileScoped projects symbol rows to the fields a single-file inventory
+// needs. pos_file is the same path on every row and the qualified name already
+// carries the receiver, so both are dropped to keep a large file in one
+// response. Only the caller knows a list is one file; search spans files and
+// keeps pos_file.
+func WithFileScoped() Option {
+	return func(o *Options) {
+		o.FileScoped = true
 	}
 }
 
@@ -80,10 +93,12 @@ type symJSON struct {
 
 func renderOverviewJSON(result *query.OverviewResult, fullDocs bool) string {
 	type pkgJSON struct {
-		Path            string    `json:"path"`
-		Name            string    `json:"name"`
-		ExportedSymbols []symJSON `json:"exported_symbols"`
-		ImportCount     int       `json:"import_count"`
+		Path        string    `json:"path"`
+		Name        string    `json:"name"`
+		Doc         string    `json:"doc"`
+		Symbols     []symJSON `json:"symbols,omitempty"`
+		ImportCount int       `json:"import_count"`
+		SymCount    int       `json:"sym_count"`
 	}
 
 	type overviewJSON struct {
@@ -97,15 +112,17 @@ func renderOverviewJSON(result *query.OverviewResult, fullDocs bool) string {
 
 	pkgs := make([]pkgJSON, len(result.Packages))
 	for i, s := range result.Packages {
-		syms := make([]symJSON, len(s.ExportedSymbols))
-		for j, sym := range s.ExportedSymbols {
+		syms := make([]symJSON, len(s.Symbols))
+		for j, sym := range s.Symbols {
 			syms[j] = symToJSON(sym, fullDocs)
 		}
 		pkgs[i] = pkgJSON{
-			Path:            s.Path,
-			Name:            s.Name,
-			ExportedSymbols: syms,
-			ImportCount:     s.ImportCount,
+			Path:        s.Path,
+			Name:        s.Name,
+			Doc:         s.Doc,
+			Symbols:     syms,
+			ImportCount: s.ImportCount,
+			SymCount:    s.SymCount,
 		}
 	}
 
@@ -123,9 +140,9 @@ func renderOverviewText(result *query.OverviewResult) string {
 	fmt.Fprintf(&b, "Summary: %d packages, %d symbols, %d edges\n\n", result.TotalPackages, result.TotalSymbols, result.TotalEdges)
 	for _, s := range result.Packages {
 		fmt.Fprintf(&b, "%s (%s)\n", s.Path, s.Name)
-		fmt.Fprintf(&b, "  exports: %d symbols\n", len(s.ExportedSymbols))
+		fmt.Fprintf(&b, "  symbols: %d (exported shown: %d)\n", s.SymCount, len(s.Symbols))
 		fmt.Fprintf(&b, "  imports: %d packages\n", s.ImportCount)
-		for _, sym := range s.ExportedSymbols {
+		for _, sym := range s.Symbols {
 			fmt.Fprintf(&b, "    - %s (%s)\n", sym.QualifiedName, sym.Kind)
 		}
 		b.WriteString("\n")
@@ -137,7 +154,7 @@ func renderOverviewCompact(result *query.OverviewResult) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Summary: %d packages, %d symbols, %d edges\n", result.TotalPackages, result.TotalSymbols, result.TotalEdges)
 	for _, s := range result.Packages {
-		fmt.Fprintf(&b, "%s: %d exports, %d imports\n", s.Path, len(s.ExportedSymbols), s.ImportCount)
+		fmt.Fprintf(&b, "%s: %d symbols, %d imports\n", s.Path, s.SymCount, s.ImportCount)
 	}
 	return b.String()
 }
@@ -240,12 +257,18 @@ func renderShowCompact(r *query.ShowResult) string {
 }
 
 // fieldList renders fields as go_name:go_type pairs for one-line formats,
-// adding the wire name when it differs from the Go name.
+// adding the wire name when it differs from the Go name. An inline anonymous
+// struct recurses into braces so a nested tree stays visible on one line.
 func fieldList(fields []store.SymbolField) string {
 	parts := make([]string, 0, len(fields))
 	for _, f := range fields {
 		part := f.GoName + ":" + f.GoType
-		if f.WireName != f.GoName {
+		switch {
+		case len(f.Fields) > 0 && f.WireName == f.GoName:
+			part = f.GoName + ":{" + fieldList(f.Fields) + "}"
+		case len(f.Fields) > 0:
+			part = f.GoName + ":" + f.WireName + ":{" + fieldList(f.Fields) + "}"
+		case f.WireName != f.GoName:
 			part = f.GoName + ":" + f.WireName + ":" + f.GoType
 		}
 		parts = append(parts, part)
@@ -254,18 +277,29 @@ func fieldList(fields []store.SymbolField) string {
 }
 
 // writeFieldLines renders one indented line per field, keeping the wire name
-// visible in formats that have room for it.
+// visible in formats that have room for it. An inline anonymous struct recurses
+// so a nested config tree is readable; without it every level printed
+// "struct{}" and the whole subtree was invisible.
 func writeFieldLines(b *strings.Builder, indent string, fields []store.SymbolField) {
 	if len(fields) == 0 {
 		return
 	}
 	fmt.Fprintf(b, "%sfields:\n", indent)
+	writeFieldEntries(b, indent+"  ", fields)
+}
+
+func writeFieldEntries(b *strings.Builder, indent string, fields []store.SymbolField) {
 	for _, f := range fields {
-		if f.WireName == f.GoName {
-			fmt.Fprintf(b, "%s  %s %s\n", indent, f.GoName, f.GoType)
+		if len(f.Fields) > 0 {
+			fmt.Fprintf(b, "%s%s struct:\n", indent, f.GoName)
+			writeFieldEntries(b, indent+"  ", f.Fields)
 			continue
 		}
-		fmt.Fprintf(b, "%s  %s %s wire=%s\n", indent, f.GoName, f.GoType, f.WireName)
+		if f.WireName == f.GoName {
+			fmt.Fprintf(b, "%s%s %s\n", indent, f.GoName, f.GoType)
+			continue
+		}
+		fmt.Fprintf(b, "%s%s %s wire=%s\n", indent, f.GoName, f.GoType, f.WireName)
 	}
 }
 
@@ -327,8 +361,11 @@ func RenderSearch(results []query.SearchResult, opts ...Option) string {
 
 	switch options.Format {
 	case FormatTOON:
-		return renderSearchTOON(results)
+		return renderSearchTOON(results, options)
 	case FormatJSON:
+		if options.FileScoped {
+			return marshalJSON(FileScopedRows(results, options.FullDocs))
+		}
 		return marshalJSON(results)
 	case FormatCompact:
 		var b strings.Builder
@@ -348,7 +385,7 @@ func RenderSearch(results []query.SearchResult, opts ...Option) string {
 		}
 		return b.String()
 	default:
-		return renderSearchTOON(results)
+		return renderSearchTOON(results, options)
 	}
 }
 
@@ -463,7 +500,7 @@ func renderPackageText(pkg *query.PackageResult) string {
 	fmt.Fprintf(&b, "  imports: %d packages\n", pkg.ImportCount)
 	exportedCount := 0
 	unexportedCount := 0
-	for _, sym := range pkg.ExportedSymbols {
+	for _, sym := range pkg.Symbols {
 		if sym.Exported {
 			exportedCount++
 		} else {
@@ -474,7 +511,7 @@ func renderPackageText(pkg *query.PackageResult) string {
 	if unexportedCount > 0 {
 		fmt.Fprintf(&b, "  unexported: %d symbols\n", unexportedCount)
 	}
-	for _, sym := range pkg.ExportedSymbols {
+	for _, sym := range pkg.Symbols {
 		label := sym.QualifiedName
 		if !sym.Exported {
 			label = "unexported " + label
@@ -499,12 +536,12 @@ func renderPackageJSON(pkg *query.PackageResult) string {
 
 func renderPackageCompact(pkg *query.PackageResult) string {
 	exportedCount := 0
-	for _, sym := range pkg.ExportedSymbols {
+	for _, sym := range pkg.Symbols {
 		if sym.Exported {
 			exportedCount++
 		}
 	}
-	unexportedCount := len(pkg.ExportedSymbols) - exportedCount
+	unexportedCount := len(pkg.Symbols) - exportedCount
 	if unexportedCount > 0 {
 		return fmt.Sprintf("%s: %d exports, %d unexported, %d imports", pkg.Path, exportedCount, unexportedCount, pkg.ImportCount)
 	}
@@ -531,7 +568,7 @@ func encodeTOON(v any) string {
 }
 
 // toonValue normalizes v the way gotoon does (struct -> map via json tags) but
-// omits repo keys whose value is empty.
+// omits repo keys whose value is empty and keeps struct fields in one column.
 func toonValue(v any) any {
 	rv := reflect.ValueOf(v)
 	switch rv.Kind() {
@@ -547,6 +584,7 @@ func toonValue(v any) any {
 		for i := 0; i < rv.Len(); i++ {
 			out[i] = toonValue(rv.Index(i).Interface())
 		}
+		padFieldColumn(out)
 		return out
 	case reflect.Map:
 		return toonMap(rv)
@@ -560,6 +598,30 @@ func toonValue(v any) any {
 	}
 }
 
+// padFieldColumn gives every row the fields key once any row carries one, so
+// the column exists even for the rows whose symbol is not a struct.
+func padFieldColumn(rows []any) {
+	withFields := false
+	for _, v := range rows {
+		if obj, ok := v.(map[string]any); ok {
+			if s, ok := obj[keyFields].(string); ok && s != "" {
+				withFields = true
+			}
+		}
+	}
+	if !withFields {
+		return
+	}
+	for _, v := range rows {
+		if obj, ok := v.(map[string]any); ok {
+			if _, ok := obj[keyFields]; !ok {
+				obj[keyFields] = ""
+			}
+		}
+	}
+}
+
+// toonStruct converts one struct via its json tags, dropping empty repo keys.
 func toonStruct(rv reflect.Value) any {
 	obj := make(map[string]any)
 	t := rv.Type()
@@ -569,6 +631,16 @@ func toonStruct(rv reflect.Value) any {
 			continue
 		}
 		name := toonFieldName(f)
+		// Fields render as one string column. As a nested array they give each
+		// row a different key set, and gotoon then drops the whole table to
+		// indented records, so one include_fields=true call changed the shape
+		// a client parses.
+		if fields, ok := reflect.TypeAssert[[]store.SymbolField](rv.Field(i)); ok {
+			if len(fields) > 0 {
+				obj[name] = fieldList(fields)
+			}
+			continue
+		}
 		val := toonValue(rv.Field(i).Interface())
 		if isRepoKey(name) && isEmptyValue(val) {
 			continue
@@ -693,6 +765,13 @@ func renderShowTOON(result *query.ShowResult) string {
 		"incoming_edges": result.IncomingEdges,
 		"outgoing_edges": result.OutgoingEdges,
 	}
+	// A qualified name shared by several declarations means the payload shows
+	// one of them and merges every declaration's edges. Surfaced at the top so
+	// it survives gating: inside the symbol block it can land in a later
+	// section than the header a reader scans.
+	if n := result.Declarations; n > 1 {
+		data["declarations"] = n
+	}
 	out := encodeTOON(data)
 	return out
 }
@@ -703,10 +782,55 @@ func renderEdgesTOON(edges []query.EdgeDetail) string {
 	return out
 }
 
-func renderSearchTOON(results []query.SearchResult) string {
-	data := map[string]any{"results": results}
-	out := encodeTOON(data)
-	return out
+// FileScopedRow is one symbol of a list already narrowed to a single file.
+// pos_file would repeat the same path on every row and the qualified name
+// already carries the receiver, so both are dropped.
+type FileScopedRow struct {
+	QualifiedName string `json:"qualified_name"`
+	Kind          string `json:"kind"`
+	Signature     string `json:"signature"`
+	Doc           string `json:"doc"`
+	PosLine       int    `json:"pos_line"`
+}
+
+// FileScopedRows projects a single file's symbol list. The caller decides that
+// a list is one file: search spans files and keeps its positions. Structured
+// content uses the same rows so the payload never advertises fields the text
+// render dropped.
+func FileScopedRows(results []query.SearchResult, fullDocs bool) []FileScopedRow {
+	rows := make([]FileScopedRow, len(results))
+	for i, r := range results {
+		doc := r.Doc
+		if !fullDocs {
+			doc = firstSentence(doc)
+		}
+		rows[i] = FileScopedRow{
+			QualifiedName: r.QualifiedName,
+			Kind:          r.Kind,
+			Signature:     r.Signature,
+			Doc:           doc,
+			PosLine:       r.PosLine,
+		}
+	}
+	return rows
+}
+
+func renderSearchTOON(results []query.SearchResult, options *Options) string {
+	var out any
+	if options.FileScoped {
+		out = FileScopedRows(results, options.FullDocs)
+	} else {
+		rows := make([]query.SearchResult, len(results))
+		copy(rows, results)
+		if !options.FullDocs {
+			for i := range rows {
+				rows[i].Doc = firstSentence(rows[i].Doc)
+			}
+		}
+		out = rows
+	}
+	data := map[string]any{"results": out}
+	return encodeTOON(data)
 }
 
 func renderListPackagesTOON(pkgs []store.Package) string {
@@ -723,10 +847,11 @@ func renderMethodsOfTOON(methods []query.SymbolDetail) string {
 
 func renderPackageTOON(pkg *query.PackageResult) string {
 	data := map[string]any{
-		"path":             pkg.Path,
-		"name":             pkg.Name,
-		"import_count":     pkg.ImportCount,
-		"exported_symbols": pkg.ExportedSymbols,
+		"path":         pkg.Path,
+		"name":         pkg.Name,
+		"doc":          pkg.Doc,
+		"import_count": pkg.ImportCount,
+		"symbols":      pkg.Symbols,
 	}
 	out := encodeTOON(data)
 	return out
@@ -926,10 +1051,10 @@ func RenderDependencyFlow(result *query.FlowResult, opts ...Option) string {
 
 func renderDependencyFlowTOON(r *query.FlowResult) string {
 	data := map[string]any{
-		"package":            r.Package,
-		"imports":            r.Imports,
-		"importers":          r.Importers,
-		"transitive_imports": r.TransitiveImports,
+		"package":                    r.Package,
+		"imports":                    r.Imports,
+		"importers":                  r.Importers,
+		"transitive_project_imports": r.TransitiveProjectImports,
 	}
 	out := encodeTOON(data)
 	return out
@@ -956,10 +1081,10 @@ func renderDependencyFlowText(r *query.FlowResult) string {
 	}
 
 	b.WriteString("\ntransitive imports:\n")
-	if len(r.TransitiveImports) == 0 {
+	if len(r.TransitiveProjectImports) == 0 {
 		b.WriteString("  (none)\n")
 	}
-	for _, e := range r.TransitiveImports {
+	for _, e := range r.TransitiveProjectImports {
 		fmt.Fprintf(&b, "  -> %s [%s:%d]\n", e.ToRef, e.PosFile, e.PosLine)
 	}
 	return b.String()
@@ -967,7 +1092,7 @@ func renderDependencyFlowText(r *query.FlowResult) string {
 
 func renderDependencyFlowCompact(r *query.FlowResult) string {
 	return fmt.Sprintf("%s: %d imports, %d importers, %d transitive",
-		r.Package, len(r.Imports), len(r.Importers), len(r.TransitiveImports))
+		r.Package, len(r.Imports), len(r.Importers), len(r.TransitiveProjectImports))
 }
 
 func RenderEntryPoints(entries []query.EntryPoint, opts ...Option) string {
@@ -989,16 +1114,10 @@ func RenderEntryPoints(entries []query.EntryPoint, opts ...Option) string {
 }
 
 func renderEntryPointsTOON(entries []query.EntryPoint) string {
-	byReason := make(map[string][]query.EntryPoint)
-	for _, e := range entries {
-		byReason[e.Reason] = append(byReason[e.Reason], e)
-	}
-	data := map[string]any{
-		"entry_points": entries,
-		"by_reason":    byReason,
-	}
-	out := encodeTOON(data)
-	return out
+	// Each row carries its own reason, so a by_reason grouping repeats the whole
+	// payload: the same 25 symbols arrived twice, doubling the bytes and making
+	// any count taken from the text wrong by 2x.
+	return encodeTOON(map[string]any{"entry_points": entries})
 }
 
 func renderEntryPointsText(entries []query.EntryPoint) string {
@@ -1050,6 +1169,9 @@ func renderChangedSymbolsTOON(r *query.ChangedSymbolsResult) string {
 		"summary": r.Summary,
 		"symbols": r.Symbols,
 	}
+	if len(r.CompileErrors) > 0 {
+		data["compile_errors"] = r.CompileErrors
+	}
 	out := encodeTOON(data)
 	return out
 }
@@ -1062,8 +1184,16 @@ func renderChangedSymbolsText(r *query.ChangedSymbolsResult) string {
 		fmt.Fprintf(&b, ", renamed: %d", r.Summary.Renamed)
 	}
 	b.WriteString("\n")
-	for _, rn := range r.Renamed {
-		fmt.Fprintf(&b, "renamed: %s -> %s\n", rn.From, rn.To)
+	if len(r.CompileErrors) == 0 {
+		b.WriteString("compile errors: none\n")
+	}
+	for _, d := range r.CompileErrors {
+		fmt.Fprintf(&b, "compile error: %s:%d:%d: %s\n", d.File, d.Line, d.Col, d.Message)
+	}
+	b.WriteString("\n")
+
+	for _, d := range r.CompileErrors {
+		fmt.Fprintf(&b, "compile error: %s:%d:%d: %s\n", d.File, d.Line, d.Col, d.Message)
 	}
 	b.WriteString("\n")
 	for _, sym := range r.Symbols {
@@ -1135,22 +1265,7 @@ func RenderTextMatches(matches []store.FileMatch, opts ...Option) string {
 		}
 		return b.String()
 	case FormatTOON, FormatText:
-		var b strings.Builder
-		for _, m := range matches {
-			fmt.Fprintf(&b, "%s:%d\n", m.FilePath, m.LineNumber)
-			if m.Line != "" {
-				fmt.Fprintf(&b, "  %s\n", m.Line)
-			}
-			if m.ContextBefore != "" {
-				b.WriteString(indentEach(m.ContextBefore))
-				b.WriteString("\n")
-			}
-			if m.ContextAfter != "" {
-				b.WriteString(indentEach(m.ContextAfter))
-				b.WriteString("\n")
-			}
-		}
-		return b.String()
+		return renderTextMatchesBlocks(matches)
 	default:
 		var b strings.Builder
 		for _, m := range matches {
@@ -1161,6 +1276,72 @@ func RenderTextMatches(matches []store.FileMatch, opts ...Option) string {
 		}
 		return b.String()
 	}
+}
+
+// renderTextMatchesBlocks renders each match as a path:line header carrying
+// its retrieval signals, followed by its context and line.
+func renderTextMatchesBlocks(matches []store.FileMatch) string {
+	var b strings.Builder
+	for _, m := range matches {
+		fmt.Fprintf(&b, "%s:%d", m.FilePath, m.LineNumber)
+		if len(m.Signals) > 0 {
+			fmt.Fprintf(&b, " [%s]", strings.Join(m.Signals, ","))
+		}
+		b.WriteString("\n")
+		if m.ContextBefore != "" {
+			b.WriteString(indentEach(m.ContextBefore))
+			b.WriteString("\n")
+		}
+		if m.Line != "" {
+			fmt.Fprintf(&b, "  %s\n", m.Line)
+		}
+		if m.ContextAfter != "" {
+			b.WriteString(indentEach(m.ContextAfter))
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
+// RenderAffectedTests renders the changed-file to test-file mapping. The
+// evidence list makes the result nested, so TOON gains nothing here: JSON
+// carries it structurally and every other format falls back to prose.
+func RenderAffectedTests(result *query.AffectedTestsResult, opts ...Option) string {
+	options := &Options{}
+	opt.Apply(options, opts)
+
+	switch options.Format {
+	case FormatJSON:
+		return marshalJSON(result)
+	case FormatCompact:
+		var b strings.Builder
+		for _, f := range result.Files {
+			fmt.Fprintf(&b, "%s %s\n", f.File, f.Reason)
+		}
+		return b.String()
+	case FormatTOON, FormatText:
+		return renderAffectedTestsText(result)
+	default:
+		return renderAffectedTestsText(result)
+	}
+}
+
+func renderAffectedTestsText(r *query.AffectedTestsResult) string {
+	var b strings.Builder
+	if len(r.Files) > 0 {
+		fmt.Fprintf(&b, "Affected test files: %d\n", len(r.Files))
+	}
+	for _, f := range r.Files {
+		fmt.Fprintf(&b, "\n%s (%s)\n", f.File, f.Reason)
+		fmt.Fprintf(&b, "  via: %s\n", strings.Join(f.Via, ", "))
+		if f.ViaTruncated {
+			fmt.Fprintf(&b, "  (truncated to the first %d symbols)\n", len(f.Via))
+		}
+	}
+	b.WriteString("\nNote: ")
+	b.WriteString(r.Note)
+	b.WriteString("\n")
+	return b.String()
 }
 
 // RenderDiagnostics renders indexed compile errors in compiler notice style

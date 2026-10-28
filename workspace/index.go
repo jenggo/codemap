@@ -111,7 +111,7 @@ func writeWorkspaceStore(s *store.Store, cfg *Config, resolveResult *resolve.Res
 		if err := s.SetRepoIndexedAt(m.Module, now); err != nil {
 			return fmt.Errorf("set indexed_at for %s: %w", m.Module, err)
 		}
-		s.RecordDirtyFingerprint(m.Dir, m.Module)
+		s.RecordSourceFingerprint(m.Module, m.Dir, contents)
 	}
 	if err := s.SetChurnDegraded(churnReason(churnErr)); err != nil {
 		return fmt.Errorf("set churn degradation: %w", err)
@@ -157,13 +157,14 @@ func ReindexRepo(dbPath, modulePath, dir string) (*IndexSummary, error) {
 	defer func() { _ = s.Close() }()
 
 	churn, churnErr := vcs.GitFileChurn(dir, "HEAD")
-	if err := s.ReplaceRepo(resolveResult, parse.FileContents(parseResult), churn, modulePath); err != nil {
+	contents := parse.FileContents(parseResult)
+	if err := s.ReplaceRepo(resolveResult, contents, churn, modulePath); err != nil {
 		return nil, fmt.Errorf("replace repo %s: %w", modulePath, err)
 	}
 	if err := s.SetRepoIndexedAt(modulePath, time.Now()); err != nil {
 		return nil, err
 	}
-	s.RecordDirtyFingerprint(dir, modulePath)
+	s.RecordSourceFingerprint(modulePath, dir, contents)
 	if err := s.SetChurnDegraded(churnReason(churnErr)); err != nil {
 		return nil, fmt.Errorf("set churn degradation: %w", err)
 	}
@@ -176,8 +177,8 @@ func ReindexRepo(dbPath, modulePath, dir string) (*IndexSummary, error) {
 	}, nil
 }
 
-// ReindexStale re-indexes every member whose checkout has newer .go files than
-// its last index. Returns the list of repos that were reindexed and any errors
+// ReindexStale re-indexes every member whose indexed source no longer matches
+// its checkout. Returns the list of repos that were reindexed and any errors
 // (a member that cannot be reindexed is reported, not fatal).
 func ReindexStale(dbPath string) ([]string, error) {
 	s, err := store.Open(dbPath)

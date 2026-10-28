@@ -3,6 +3,7 @@ package query_test
 import (
 	"encoding/json"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -66,7 +67,7 @@ func TestShowStructFields(t *testing.T) {
 		if !ok {
 			t.Fatalf("missing field %s in %v", want.GoName, result.Symbol.Fields)
 		}
-		if got != want {
+		if !reflect.DeepEqual(got, want) {
 			t.Errorf("field %s = %+v, want %+v", want.GoName, got, want)
 		}
 	}
@@ -128,7 +129,7 @@ func TestPackageAndSearchFieldsOptIn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Package: %v", err)
 	}
-	for _, sym := range pkgDefault.ExportedSymbols {
+	for _, sym := range pkgDefault.Symbols {
 		if len(sym.Fields) != 0 {
 			t.Errorf("default package result %s carries fields", sym.QualifiedName)
 		}
@@ -139,7 +140,7 @@ func TestPackageAndSearchFieldsOptIn(t *testing.T) {
 		t.Fatalf("Package WithFields: %v", err)
 	}
 	var sawStruct, sawNonStruct bool
-	for _, sym := range pkgWith.ExportedSymbols {
+	for _, sym := range pkgWith.Symbols {
 		switch sym.QualifiedName {
 		case "example.com/fields.Tagged":
 			sawStruct = len(sym.Fields) > 0

@@ -7,6 +7,7 @@ import (
 
 	"codemap/parse"
 	"codemap/query"
+	"codemap/render"
 	"codemap/resolve"
 	"codemap/store"
 )
@@ -168,6 +169,44 @@ func TestContextBundleBudget(t *testing.T) {
 	}
 }
 
+// The estimate describes the returned bundle, so it must be recomputed after
+// trimming and must stay close to the rendered size. It previously counted
+// edge bytes as tokens, reporting ~10x the real cost, and was never recomputed,
+// so a 500-token budget returned the same number as a 2000-token one.
+func TestContextBundleEstimateTracksPayload(t *testing.T) {
+	s := setupStore(t)
+	const sym = "codemap/testdata/simple.NewParser"
+
+	wide, err := query.ContextBundle(s, sym, 0)
+	if err != nil {
+		t.Fatalf("ContextBundle: %v", err)
+	}
+	narrow, err := query.ContextBundle(s, sym, 100)
+	if err != nil {
+		t.Fatalf("ContextBundle: %v", err)
+	}
+
+	if narrow.TokenEstimate > wide.TokenEstimate {
+		t.Errorf("smaller budget produced a larger estimate: %d > %d", narrow.TokenEstimate, wide.TokenEstimate)
+	}
+
+	for _, tc := range []struct {
+		label  string
+		bundle *query.Bundle
+	}{{"default", wide}, {"budget=100", narrow}} {
+		rendered := render.RenderBundle(tc.bundle)
+		want := len(rendered) / 4
+		if want == 0 {
+			continue
+		}
+		ratio := float64(tc.bundle.TokenEstimate) / float64(want)
+		if ratio < 0.5 || ratio > 2 {
+			t.Errorf("%s: estimate %d is %.2fx the rendered bytes/4 (%d); want within 0.5-2x",
+				tc.label, tc.bundle.TokenEstimate, ratio, want)
+		}
+	}
+}
+
 func TestHotspotsDefault(t *testing.T) {
 	s := setupStore(t)
 	hotspots, err := query.Hotspots(s, 0, 0, 0)
@@ -222,5 +261,33 @@ func TestSymbolImportanceTopN(t *testing.T) {
 	}
 	if len(entries) > 3 {
 		t.Errorf("expected at most 3 entries, got %d", len(entries))
+	}
+}
+
+// The estimate must describe what the renderer emits, not just body plus edges.
+// Counting only those reported a 1.2 KB bundle as 115 tokens (2.9x under) at
+// budget 100, where the fixed symbol block is most of the output.
+func TestContextBundleEstimateMatchesRenderedSize(t *testing.T) {
+	s := setupStore(t)
+
+	for _, sym := range []string{
+		"codemap/testdata/simple.NewParser",
+		"codemap/testdata/simple.Parser",
+	} {
+		for _, budget := range []int{100, 300, 800, 4000} {
+			bundle, err := query.ContextBundle(s, sym, budget)
+			if err != nil {
+				t.Fatalf("ContextBundle(%s, %d): %v", sym, budget, err)
+			}
+			actual := len(render.RenderBundle(bundle)) / 4
+			if actual == 0 {
+				continue
+			}
+			ratio := float64(bundle.TokenEstimate) / float64(actual)
+			if ratio < 0.85 || ratio > 1.2 {
+				t.Errorf("%s budget=%d: estimate %d vs rendered %d tokens (%.2fx); want 0.85-1.2x",
+					sym, budget, bundle.TokenEstimate, actual, ratio)
+			}
+		}
 	}
 }

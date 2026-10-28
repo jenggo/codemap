@@ -108,16 +108,18 @@ func TestMalformedMethodJSONReturnsParseError(t *testing.T) {
 	}
 }
 
-// --- 2. Freshness TTL cache ---
+// --- 2. Freshness is checked on every call ---
 
-func TestFreshnessCacheWithinTTL(t *testing.T) {
+// TestFreshnessChecksEveryCall pins that no staleness result is memoized: the
+// first request after an edit must observe the edit. A 3s window used to answer
+// from the old index with no notice while health reported stale=true.
+func TestFreshnessChecksEveryCall(t *testing.T) {
 	s := newTestServer(t)
 	var checks int
 	s.stalenessCheck = func(dbPath, repoPath string) (bool, error) {
 		checks++
 		return false, nil
 	}
-	s.freshnessTTL = time.Minute
 
 	if _, err := s.getStore(); err != nil {
 		t.Fatalf("first getStore: %v", err)
@@ -125,17 +127,34 @@ func TestFreshnessCacheWithinTTL(t *testing.T) {
 	if _, err := s.getStore(); err != nil {
 		t.Fatalf("second getStore: %v", err)
 	}
-	if checks != 1 {
-		t.Fatalf("expected a single staleness check within the TTL, got %d", checks)
+	if checks != 2 {
+		t.Fatalf("expected a staleness check per call, got %d", checks)
+	}
+}
+
+// TestFreshnessObservesEditOnNextCall pins the read-your-writes case: an edit
+// made between two calls is seen by the second one.
+func TestFreshnessObservesEditOnNextCall(t *testing.T) {
+	s := newTestServer(t)
+	stale := false
+	s.stalenessCheck = func(dbPath, repoPath string) (bool, error) {
+		return stale, nil
 	}
 
-	// Expire the cached entry and confirm the next call rechecks.
-	s.freshness["single:"+s.repoPath] = freshnessEntry{checkedAt: time.Now().Add(-2 * time.Minute)}
 	if _, err := s.getStore(); err != nil {
-		t.Fatalf("getStore after TTL expiry: %v", err)
+		t.Fatalf("first getStore: %v", err)
 	}
-	if checks != 2 {
-		t.Fatalf("expected recheck after TTL expiry, got %d checks", checks)
+	stale = true
+	indexed := false
+	s.indexFn = func(absPath string) error {
+		indexed = true
+		return nil
+	}
+	if _, err := s.getStore(); err != nil {
+		t.Fatalf("second getStore: %v", err)
+	}
+	if !indexed {
+		t.Fatal("an edit made between calls was not observed: the stale answer was reused")
 	}
 }
 
@@ -315,14 +334,14 @@ func TestAutoReindexNoticeOnSuccess(t *testing.T) {
 	}
 }
 
-func TestRebuildNoticePointsAtChangedSymbolsWhenDirty(t *testing.T) {
-	dirty := rebuildNotice("uncommitted .go changes not covered by the current index")
-	if !strings.Contains(dirty, "codemap_changed_symbols") || !strings.Contains(dirty, "HEAD") {
-		t.Errorf("dirty notice lacks the changed_symbols pointer: %q", dirty)
+func TestRebuildNoticePointsAtChangedSymbolsWhenSourceChanged(t *testing.T) {
+	changed := rebuildNotice("indexed source no longer matches the working tree")
+	if !strings.Contains(changed, "codemap_changed_symbols") || !strings.Contains(changed, "HEAD") {
+		t.Errorf("source-change notice lacks the changed_symbols pointer: %q", changed)
 	}
-	clean := rebuildNotice("a .go file is newer than the last index")
+	clean := rebuildNotice("index was built by a different analyzer version")
 	if strings.Contains(clean, "codemap_changed_symbols") {
-		t.Errorf("non-dirty notice must not point at changed_symbols: %q", clean)
+		t.Errorf("non-source notice must not point at changed_symbols: %q", clean)
 	}
 }
 

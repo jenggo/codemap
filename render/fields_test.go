@@ -80,7 +80,7 @@ func TestRenderPackageAndSearchFieldsWhenPopulated(t *testing.T) {
 	pkg := &query.PackageResult{
 		Path: "example.com/model",
 		Name: "model",
-		ExportedSymbols: []query.SymbolDetail{
+		Symbols: []query.SymbolDetail{
 			{QualifiedName: "example.com/model.Tagged", Kind: "type", Exported: true, Fields: []store.SymbolField{
 				{GoName: "UserID", WireName: "user_id", GoType: "string"},
 			}},
@@ -127,7 +127,7 @@ func TestRenderPackageAndSearchWithoutFieldsOmitKey(t *testing.T) {
 	pkg := &query.PackageResult{
 		Path: "example.com/model",
 		Name: "model",
-		ExportedSymbols: []query.SymbolDetail{
+		Symbols: []query.SymbolDetail{
 			{QualifiedName: "example.com/model.Tagged", Kind: "type", Exported: true},
 		},
 	}
@@ -181,5 +181,45 @@ func TestRenderBundleOmitsFieldsForNonStruct(t *testing.T) {
 		if strings.Contains(out, `"fields"`) || strings.Contains(out, "fields:") || strings.Contains(out, "wire=") {
 			t.Errorf("bundle format %v must omit fields for a function, got %s", f, out)
 		}
+	}
+}
+
+// A nested array of field rows made gotoon fall back to indented records for
+// the whole symbols table, so one include_fields=true call changed the shape
+// that a client parses. The fields column must stay tabular.
+func TestRenderPackageFieldsKeepTabularShape(t *testing.T) {
+	pkg := &query.PackageResult{
+		Path: "example.com/model",
+		Name: "model",
+		Symbols: []query.SymbolDetail{
+			{QualifiedName: "example.com/model.Tagged", Kind: "type", Exported: true, Fields: []store.SymbolField{
+				{GoName: "UserID", WireName: "user_id", GoType: "string"},
+				{GoName: "Sentry", WireName: "sentry", GoType: "struct{...}", Fields: []store.SymbolField{
+					{GoName: "URL", WireName: "url", GoType: "string"},
+				}},
+			}},
+			{QualifiedName: "example.com/model.F", Kind: "function", Exported: true},
+		},
+	}
+
+	out := RenderPackage(pkg, WithFormat(FormatTOON))
+	if !strings.Contains(out, "symbols[2]{doc,exported,fields,") {
+		t.Errorf("package TOON must keep one tabular header:\n%s", out)
+	}
+	if !strings.Contains(out, "Sentry:sentry:{URL:url:string}") {
+		t.Errorf("nested struct must render inline, not as struct{}:\n%s", out)
+	}
+	if strings.Contains(out, "- doc:") {
+		t.Errorf("package TOON must not flip to indented records:\n%s", out)
+	}
+
+	search := RenderSearch([]query.SearchResult{
+		{QualifiedName: "example.com/model.Tagged", Kind: "type", Exported: true, Fields: []store.SymbolField{
+			{GoName: "UserID", WireName: "user_id", GoType: "string"},
+		}},
+		{QualifiedName: "example.com/model.F", Kind: "function", Exported: true},
+	}, WithFormat(FormatTOON))
+	if !strings.HasPrefix(search, "results[2]{doc,exported,fields,") {
+		t.Errorf("search TOON must keep one tabular header:\n%s", search)
 	}
 }

@@ -194,7 +194,7 @@ func TestRecordUsageIdentityFallbackForUnregisteredTool(t *testing.T) {
 func TestStatsRecordsSymbolBodyEstimator(t *testing.T) {
 	s := newTestServer(t)
 	qn := "codemap/testdata/simple.NewParser"
-	out, isErr := s.handleTool("show", map[string]any{"qualified_name": qn, "source": true})
+	out, _, isErr := s.handleTool("show", map[string]any{"qualified_name": qn, "source": true})
 	if isErr {
 		t.Fatalf("show source failed: %s", out)
 	}
@@ -258,7 +258,7 @@ func TestStatsMixedShowCallsReportSavings(t *testing.T) {
 		{"qualified_name": "codemap/testdata/simple.Parser"},
 	}
 	for _, args := range calls {
-		if out, isErr := s.handleTool("show", args); isErr {
+		if out, _, isErr := s.handleTool("show", args); isErr {
 			t.Fatalf("show failed: %s", out)
 		}
 	}
@@ -276,7 +276,7 @@ func TestStatsMixedShowCallsReportSavings(t *testing.T) {
 func TestStatsRecordsPackageEstimator(t *testing.T) {
 	s := newTestServer(t)
 	pkgPath := "codemap/testdata/simple"
-	out, isErr := s.handleTool(keyToolPackage, map[string]any{"path": pkgPath})
+	out, _, isErr := s.handleTool(keyToolPackage, map[string]any{"path": pkgPath})
 	if isErr {
 		t.Fatalf("package failed: %s", out)
 	}
@@ -285,7 +285,7 @@ func TestStatsRecordsPackageEstimator(t *testing.T) {
 		t.Fatalf("query.Package: %v", err)
 	}
 	var wantRaw int64
-	for _, sym := range pkg.ExportedSymbols {
+	for _, sym := range pkg.Symbols {
 		body, berr := query.GetSymbolBody(s.store, sym.QualifiedName, 0, false)
 		if berr != nil {
 			continue
@@ -312,7 +312,7 @@ func TestStatsRecordsPackageEstimator(t *testing.T) {
 func TestStatsRecordsContextBundleEstimator(t *testing.T) {
 	s := newTestServer(t)
 	qn := "codemap/testdata/simple.NewParser"
-	out, isErr := s.handleTool("get_context_bundle", map[string]any{"qualified_name": qn})
+	out, _, isErr := s.handleTool("get_context_bundle", map[string]any{"qualified_name": qn})
 	if isErr {
 		t.Fatalf("get_context_bundle failed: %s", out)
 	}
@@ -404,7 +404,7 @@ func TestToolsListIncludesStats(t *testing.T) {
 
 func TestStatsEmptySessionZeroed(t *testing.T) {
 	s := newTestServer(t)
-	out, isErr := s.handleTool("stats", map[string]any{})
+	out, _, isErr := s.handleTool("stats", map[string]any{})
 	if isErr {
 		t.Fatalf("stats failed: %s", out)
 	}
@@ -425,7 +425,7 @@ func TestStatsReductionMathOnScriptedUsage(t *testing.T) {
 	s.usage.record("beta", 50, 50, false)    // identity: 0%
 	s.usage.record("beta", 10, 10, true)     // error: identity, counted
 
-	out, isErr := s.handleTool("stats", map[string]any{})
+	out, _, isErr := s.handleTool("stats", map[string]any{})
 	if isErr {
 		t.Fatalf("stats failed: %s", out)
 	}
@@ -474,11 +474,11 @@ func TestStatsByteIdenticalRepeatCalls(t *testing.T) {
 	s.usage.record("zeta", 12, 340, false)
 	s.usage.record("kappa", 5, 5, true)
 
-	out1, isErr := s.handleTool("stats", map[string]any{})
+	out1, _, isErr := s.handleTool("stats", map[string]any{})
 	if isErr {
 		t.Fatalf("stats failed: %s", out1)
 	}
-	out2, isErr := s.handleTool("stats", map[string]any{})
+	out2, _, isErr := s.handleTool("stats", map[string]any{})
 	if isErr {
 		t.Fatalf("stats failed: %s", out2)
 	}
@@ -489,7 +489,7 @@ func TestStatsByteIdenticalRepeatCalls(t *testing.T) {
 
 func TestStatsErrorCallsCounted(t *testing.T) {
 	s := newTestServer(t)
-	out, isErr := s.handleTool("show", map[string]any{})
+	out, _, isErr := s.handleTool("show", map[string]any{})
 	if !isErr {
 		t.Fatalf("expected error from show without qualified_name, got: %s", out)
 	}
@@ -511,7 +511,7 @@ func TestStatsGatedResponseCount(t *testing.T) {
 	t.Setenv(responseLimitEnv, "512")
 	s.gateResponse("overview", oversizedPayload("gatedStatsToken"))
 
-	out, isErr := s.handleTool("stats", map[string]any{})
+	out, _, isErr := s.handleTool("stats", map[string]any{})
 	if isErr {
 		t.Fatalf("stats failed: %s", out)
 	}
@@ -529,7 +529,7 @@ func TestStatsResetOnNewServerInstance(t *testing.T) {
 	}
 
 	s2 := newTestServer(t)
-	out, isErr := s2.handleTool("stats", map[string]any{})
+	out, _, isErr := s2.handleTool("stats", map[string]any{})
 	if isErr {
 		t.Fatalf("stats failed: %s", out)
 	}

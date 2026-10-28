@@ -40,6 +40,9 @@ func ReanalyzeStaleContracts(st *store.Store, cfg Config) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(repos) == 0 {
+		return reanalyzeSingleRepo(st, cfg)
+	}
 
 	var staleRepos []string
 	for _, repo := range repos {
@@ -69,6 +72,41 @@ func ReanalyzeStaleContracts(st *store.Store, cfg Config) ([]string, error) {
 	return staleRepos, nil
 }
 
+// reanalyzeSingleRepo runs the analysis for a single-repo index, which has no
+// repos rows for the per-repo staleness loop to walk. Runtime contracts (Redis
+// keys, JetStream subjects, WS type strings) live inside one repo, so skipping
+// this left runtime_contracts empty for every single-repo index.
+func reanalyzeSingleRepo(st *store.Store, cfg Config) ([]string, error) {
+	h, err := st.Health()
+	if err != nil {
+		return nil, err
+	}
+	if h.IndexedAt == "" {
+		return nil, nil
+	}
+	indexedAt, err := time.Parse(time.RFC3339Nano, h.IndexedAt)
+	if err != nil {
+		return nil, fmt.Errorf("parse indexed_at %q: %w", h.IndexedAt, err)
+	}
+	analysisTime, ok, err := st.ContractAnalysisTime()
+	if err != nil {
+		return nil, err
+	}
+	if ok && !analysisTime.Before(indexedAt) {
+		return nil, nil
+	}
+
+	contracts, runtimeContracts, drifts, err := RunAnalysis(st, cfg)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	if err := st.WriteContractsAll(contracts, runtimeContracts, drifts, now); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
 // buildAnalysis reads from the namespaced symbol table to construct the
 // analysis context. This never re-walks source files.
 func buildAnalysis(st *store.Store) (*Analysis, error) {
@@ -85,10 +123,10 @@ func buildAnalysis(st *store.Store) (*Analysis, error) {
 	}
 
 	for _, sym := range symbols {
+		// Single-repo indexes carry no repo attribution; they bucket under ""
+		// so runtime-contract extraction still sees them. Cross-repo pairing
+		// skips same-repo pairs, so no contract edge is invented for them.
 		repo := sym.Repo
-		if repo == "" {
-			continue
-		}
 		if analysis.SymbolsByRepo[repo] == nil {
 			analysis.SymbolsByRepo[repo] = make(map[string]store.Symbol)
 		}

@@ -27,12 +27,10 @@ func TestEmptyResultsMarshalAsArray(t *testing.T) {
 		t.Errorf("DetectCycles empty should marshal to [], got %s (err %v)", data, err)
 	}
 
-	impls, err := query.InterfaceImplementations(s, "missing.Interface")
-	if err != nil {
-		t.Fatalf("InterfaceImplementations: %v", err)
-	}
-	if data, err := json.Marshal(impls); err != nil || string(data) != "[]" {
-		t.Errorf("InterfaceImplementations empty should marshal to [], got %s (err %v)", data, err)
+	// An unresolvable name is an error, not an empty list: "no implementers"
+	// and "no such type" are different answers.
+	if _, err := query.InterfaceImplementations(s, "missing.Interface"); err == nil {
+		t.Error("InterfaceImplementations on an unknown type should error")
 	}
 
 	unused, err := query.UnusedSymbols(s)

@@ -294,3 +294,291 @@ func TestChangedSymbolsReportsRename(t *testing.T) {
 		t.Errorf("expected old.go -> new.go, got %q -> %q", got.From, got.To)
 	}
 }
+
+// TestChangedSymbolsAppendIsAdded pins the distinction between an append and an
+// edit. git reports an insertion as a zero-length old range positioned before
+// the hunk, so a hunk-overlap test classified a brand-new function as modified
+// and the "added" counter never moved.
+func TestChangedSymbolsAppendIsAdded(t *testing.T) {
+	repo := setupGitRepo(t)
+	writeFile0644(t, filepath.Join(repo, "go.mod"), "module example.com/append\n\ngo 1.26.2\n")
+	writeFile0644(t, filepath.Join(repo, "a.go"), "package main\n\nfunc alpha() {}\n")
+	runGitIn(t, repo, "add", ".")
+	runGitIn(t, repo, "commit", "-q", "-m", "initial")
+
+	// Append only: alpha is untouched, beta is new.
+	writeFile0644(t, filepath.Join(repo, "a.go"), "package main\n\nfunc alpha() {}\n\nfunc beta() {}\n")
+	runGitIn(t, repo, "add", ".")
+
+	s := indexRepo(t, repo)
+	result, err := ChangedSymbols(s, repo, "HEAD", false, false, false)
+	if err != nil {
+		t.Fatalf("ChangedSymbols: %v", err)
+	}
+	got := map[string]string{}
+	for _, sym := range result.Symbols {
+		got[sym.QualifiedName] = sym.ChangeType
+	}
+	if got["example.com/append.beta"] != changeTypeAdded {
+		t.Errorf("beta = %q, want added (all: %v)", got["example.com/append.beta"], got)
+	}
+	if ct, ok := got["example.com/append.alpha"]; ok {
+		t.Errorf("alpha was not touched but reported as %q", ct)
+	}
+}
+
+// TestChangedSymbolsRenameIsRenamed pins that a rename is reported as one
+// renamed symbol carrying the old name, not as a modification of the new name
+// plus a phantom removal of the old one.
+func TestChangedSymbolsRenameIsRenamed(t *testing.T) {
+	repo := setupGitRepo(t)
+	writeFile0644(t, filepath.Join(repo, "go.mod"), "module example.com/ren\n\ngo 1.26.2\n")
+	writeFile0644(t, filepath.Join(repo, "a.go"), "package main\n\nfunc oldName(v int) int { return v + 1 }\n")
+	runGitIn(t, repo, "add", ".")
+	runGitIn(t, repo, "commit", "-q", "-m", "initial")
+
+	writeFile0644(t, filepath.Join(repo, "a.go"), "package main\n\nfunc newName(v int) int { return v + 1 }\n")
+	runGitIn(t, repo, "add", ".")
+
+	s := indexRepo(t, repo)
+	result, err := ChangedSymbols(s, repo, "HEAD", false, false, false)
+	if err != nil {
+		t.Fatalf("ChangedSymbols: %v", err)
+	}
+	if len(result.Symbols) != 1 {
+		t.Fatalf("expected exactly one changed symbol, got %+v", result.Symbols)
+	}
+	sym := result.Symbols[0]
+	if sym.ChangeType != changeTypeRenamed {
+		t.Fatalf("change_type = %q, want renamed", sym.ChangeType)
+	}
+	if sym.QualifiedName != "example.com/ren.newName" || sym.RenamedFrom != "example.com/ren.oldName" {
+		t.Errorf("rename = %q from %q, want newName from oldName", sym.QualifiedName, sym.RenamedFrom)
+	}
+	if result.Summary.Renamed != 1 || result.Summary.Added != 0 || result.Summary.Removed != 0 {
+		t.Errorf("summary = %+v, want one rename and nothing else", result.Summary)
+	}
+}
+
+// TestChangedSymbolsRemovedSurvivesInResult pins that deleting a function
+// reports it. The symbol is gone from the index, so only the ref-side parse can
+// name it.
+func TestChangedSymbolsRemovedSurvivesInResult(t *testing.T) {
+	repo := setupGitRepo(t)
+	writeFile0644(t, filepath.Join(repo, "go.mod"), "module example.com/rm\n\ngo 1.26.2\n")
+	writeFile0644(t, filepath.Join(repo, "a.go"), "package main\n\nfunc keep() {}\n\nfunc gone() {}\n")
+	runGitIn(t, repo, "add", ".")
+	runGitIn(t, repo, "commit", "-q", "-m", "initial")
+
+	writeFile0644(t, filepath.Join(repo, "a.go"), "package main\n\nfunc keep() {}\n")
+	runGitIn(t, repo, "add", ".")
+
+	s := indexRepo(t, repo)
+	result, err := ChangedSymbols(s, repo, "HEAD", false, false, false)
+	if err != nil {
+		t.Fatalf("ChangedSymbols: %v", err)
+	}
+	got := map[string]string{}
+	for _, sym := range result.Symbols {
+		got[sym.QualifiedName] = sym.ChangeType
+	}
+	if got["example.com/rm.gone"] != changeTypeRemoved {
+		t.Errorf("gone = %q, want removed (all: %v)", got["example.com/rm.gone"], got)
+	}
+	if ct, ok := got["example.com/rm.keep"]; ok {
+		t.Errorf("keep was not touched but reported as %q", ct)
+	}
+}
+
+// TestChangedSymbolsIncludesUntrackedFile pins that a brand-new file counts.
+// `git diff <ref>` never lists an untracked path, so an added file was
+// invisible while its symbols were already indexed.
+func TestChangedSymbolsIncludesUntrackedFile(t *testing.T) {
+	repo := setupGitRepo(t)
+	writeFile0644(t, filepath.Join(repo, "go.mod"), "module example.com/newfile\n\ngo 1.26.2\n")
+	writeFile0644(t, filepath.Join(repo, "a.go"), "package main\n\nfunc alpha() {}\n")
+	runGitIn(t, repo, "add", ".")
+	runGitIn(t, repo, "commit", "-q", "-m", "initial")
+
+	writeFile0644(t, filepath.Join(repo, "b.go"), "package main\n\nfunc brandNew() {}\n")
+
+	s := indexRepo(t, repo)
+	result, err := ChangedSymbols(s, repo, "HEAD", false, false, false)
+	if err != nil {
+		t.Fatalf("ChangedSymbols: %v", err)
+	}
+	got := map[string]string{}
+	for _, sym := range result.Symbols {
+		got[sym.QualifiedName] = sym.ChangeType
+	}
+	if got["example.com/newfile.brandNew"] != changeTypeAdded {
+		t.Errorf("brandNew = %q, want added (all: %v)", got["example.com/newfile.brandNew"], got)
+	}
+}
+
+// TestChangedSymbolsRenameWithNameInBody pins that rename detection masks the
+// declared identifier by AST position: a body string literal containing the old
+// name must not defeat the shape match, which text substitution did.
+func TestChangedSymbolsRenameWithNameInBody(t *testing.T) {
+	repo := setupGitRepo(t)
+	writeFile0644(t, filepath.Join(repo, "go.mod"), "module example.com/inbody\n\ngo 1.26.2\n")
+	writeFile0644(t, filepath.Join(repo, "a.go"), "package main\n\nimport \"fmt\"\n\nfunc RoundFloat(v float64) float64 {\n\tfmt.Println(\"RoundFloat\")\n\treturn v\n}\n")
+	runGitIn(t, repo, "add", ".")
+	runGitIn(t, repo, "commit", "-q", "-m", "initial")
+
+	writeFile0644(t, filepath.Join(repo, "a.go"), "package main\n\nimport \"fmt\"\n\nfunc RoundFloat2(v float64) float64 {\n\tfmt.Println(\"RoundFloat\")\n\treturn v\n}\n")
+	runGitIn(t, repo, "add", ".")
+
+	s := indexRepo(t, repo)
+	result, err := ChangedSymbols(s, repo, "HEAD", false, false, false)
+	if err != nil {
+		t.Fatalf("ChangedSymbols: %v", err)
+	}
+	if len(result.Symbols) != 1 {
+		t.Fatalf("expected 1 symbol, got %d (%+v)", len(result.Symbols), result.Symbols)
+	}
+	sym := result.Symbols[0]
+	if sym.ChangeType != changeTypeRenamed {
+		t.Errorf("change_type = %q, want renamed", sym.ChangeType)
+	}
+	if sym.RenamedFrom != "example.com/inbody.RoundFloat" {
+		t.Errorf("renamed_from = %q, want example.com/inbody.RoundFloat", sym.RenamedFrom)
+	}
+}
+
+// TestChangedSymbolsGroupedConstRename pins per-spec comparison inside a
+// grouped const block: both entries renamed with values unchanged is two
+// renames, not two additions plus two removals.
+func TestChangedSymbolsGroupedConstRename(t *testing.T) {
+	repo := setupGitRepo(t)
+	writeFile0644(t, filepath.Join(repo, "go.mod"), "module example.com/grouped\n\ngo 1.26.2\n")
+	writeFile0644(t, filepath.Join(repo, "a.go"), "package main\n\nconst (\n\tAlpha = \"alpha\"\n\tBeta  = \"beta\"\n)\n")
+	runGitIn(t, repo, "add", ".")
+	runGitIn(t, repo, "commit", "-q", "-m", "initial")
+
+	writeFile0644(t, filepath.Join(repo, "a.go"), "package main\n\nconst (\n\tAlpha2 = \"alpha\"\n\tBeta2  = \"beta\"\n)\n")
+	runGitIn(t, repo, "add", ".")
+
+	s := indexRepo(t, repo)
+	result, err := ChangedSymbols(s, repo, "HEAD", false, false, false)
+	if err != nil {
+		t.Fatalf("ChangedSymbols: %v", err)
+	}
+	if result.Summary.Renamed != 2 {
+		t.Fatalf("summary.renamed = %d, want 2 (symbols: %+v)", result.Summary.Renamed, result.Symbols)
+	}
+	got := map[string]string{}
+	from := map[string]string{}
+	for _, sym := range result.Symbols {
+		got[sym.QualifiedName] = sym.ChangeType
+		from[sym.QualifiedName] = sym.RenamedFrom
+	}
+	if got["example.com/grouped.Alpha2"] != changeTypeRenamed || got["example.com/grouped.Beta2"] != changeTypeRenamed {
+		t.Errorf("expected both entries renamed, got %v", got)
+	}
+	if from["example.com/grouped.Alpha2"] != "example.com/grouped.Alpha" || from["example.com/grouped.Beta2"] != "example.com/grouped.Beta" {
+		t.Errorf("unexpected renamed_from values: %v", from)
+	}
+	if got["example.com/grouped.Alpha2"] == changeTypeAdded || got["example.com/grouped.Alpha2"] == changeTypeRemoved {
+		t.Errorf("Alpha2 misclassified as %q", got["example.com/grouped.Alpha2"])
+	}
+}
+
+// TestChangedSymbolsGroupedSiblingUntouched pins that renaming one entry of a
+// grouped const block does not report its sibling as modified.
+func TestChangedSymbolsGroupedSiblingUntouched(t *testing.T) {
+	repo := setupGitRepo(t)
+	writeFile0644(t, filepath.Join(repo, "go.mod"), "module example.com/sibling\n\ngo 1.26.2\n")
+	writeFile0644(t, filepath.Join(repo, "a.go"), "package main\n\nconst (\n\tAlpha = \"alpha\"\n\tBeta  = \"beta\"\n)\n")
+	runGitIn(t, repo, "add", ".")
+	runGitIn(t, repo, "commit", "-q", "-m", "initial")
+
+	writeFile0644(t, filepath.Join(repo, "a.go"), "package main\n\nconst (\n\tAlpha = \"alpha\"\n\tBeta2  = \"beta\"\n)\n")
+	runGitIn(t, repo, "add", ".")
+
+	s := indexRepo(t, repo)
+	result, err := ChangedSymbols(s, repo, "HEAD", false, false, false)
+	if err != nil {
+		t.Fatalf("ChangedSymbols: %v", err)
+	}
+	got := map[string]string{}
+	for _, sym := range result.Symbols {
+		got[sym.QualifiedName] = sym.ChangeType
+	}
+	if got["example.com/sibling.Beta2"] != changeTypeRenamed {
+		t.Errorf("Beta2 = %q, want renamed (all: %v)", got["example.com/sibling.Beta2"], got)
+	}
+	if ct, ok := got["example.com/sibling.Alpha"]; ok && ct != "" {
+		t.Errorf("Alpha was untouched but reported as %q", ct)
+	}
+}
+
+// TestChangedSymbolsValueChangeIsNotRename pins that a rename plus a value edit
+// is not a rename: the masked shapes differ, so it reports the old name as
+// removed and the new one as added.
+func TestChangedSymbolsValueChangeIsNotRename(t *testing.T) {
+	repo := setupGitRepo(t)
+	writeFile0644(t, filepath.Join(repo, "go.mod"), "module example.com/valchange\n\ngo 1.26.2\n")
+	writeFile0644(t, filepath.Join(repo, "a.go"), "package main\n\nconst Alpha = \"alpha\"\n")
+	runGitIn(t, repo, "add", ".")
+	runGitIn(t, repo, "commit", "-q", "-m", "initial")
+
+	writeFile0644(t, filepath.Join(repo, "a.go"), "package main\n\nconst Beta = \"beta\"\n")
+	runGitIn(t, repo, "add", ".")
+
+	s := indexRepo(t, repo)
+	result, err := ChangedSymbols(s, repo, "HEAD", false, false, false)
+	if err != nil {
+		t.Fatalf("ChangedSymbols: %v", err)
+	}
+	got := map[string]string{}
+	for _, sym := range result.Symbols {
+		got[sym.QualifiedName] = sym.ChangeType
+	}
+	if result.Summary.Renamed != 0 {
+		t.Errorf("summary.renamed = %d, want 0", result.Summary.Renamed)
+	}
+	if got["example.com/valchange.Beta"] != changeTypeAdded {
+		t.Errorf("Beta = %q, want added (all: %v)", got["example.com/valchange.Beta"], got)
+	}
+	if got["example.com/valchange.Alpha"] != changeTypeRemoved {
+		t.Errorf("Alpha = %q, want removed (all: %v)", got["example.com/valchange.Alpha"], got)
+	}
+}
+
+// TestChangedSymbolsAttachesCompileErrors pins that the delta carries the
+// index's compile errors unfiltered: a rename that leaves a caller dangling in
+// a package the change did not touch is named, not merely counted.
+func TestChangedSymbolsAttachesCompileErrors(t *testing.T) {
+	repo := setupGitRepo(t)
+	if err := os.MkdirAll(filepath.Join(repo, "pkgA"), 0755); err != nil {
+		t.Fatalf("mkdir pkgA: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(repo, "pkgB"), 0755); err != nil {
+		t.Fatalf("mkdir pkgB: %v", err)
+	}
+	writeFile0644(t, filepath.Join(repo, "go.mod"), "module example.com/dangling\n\ngo 1.26.2\n")
+	writeFile0644(t, filepath.Join(repo, "pkgA", "a.go"), "package pkgA\n\nfunc Hello() string { return \"hi\" }\n")
+	writeFile0644(t, filepath.Join(repo, "pkgB", "b.go"), "package pkgB\n\nimport \"example.com/dangling/pkgA\"\n\nfunc Use() string { return pkgA.Hello() }\n")
+	runGitIn(t, repo, "add", ".")
+	runGitIn(t, repo, "commit", "-q", "-m", "initial")
+
+	writeFile0644(t, filepath.Join(repo, "pkgA", "a.go"), "package pkgA\n\nfunc Goodbye() string { return \"hi\" }\n")
+	runGitIn(t, repo, "add", ".")
+
+	s := indexRepo(t, repo)
+	result, err := ChangedSymbols(s, repo, "HEAD", false, false, false)
+	if err != nil {
+		t.Fatalf("ChangedSymbols: %v", err)
+	}
+	if len(result.CompileErrors) != 1 {
+		t.Fatalf("expected 1 compile error, got %d (%+v)", len(result.CompileErrors), result.CompileErrors)
+	}
+	e := result.CompileErrors[0]
+	if !strings.HasSuffix(filepath.ToSlash(e.File), "pkgB/b.go") {
+		t.Errorf("compile error file = %q, want the stale call site in pkgB/b.go", e.File)
+	}
+	if e.Line != 5 {
+		t.Errorf("compile error line = %d, want 5 (the pkgA.Hello call)", e.Line)
+	}
+}

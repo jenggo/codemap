@@ -1,10 +1,12 @@
 package resolve
 
 import (
-	"codemap/parse"
+	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	"codemap/parse"
 )
 
 func TestInterfaceMethodSymbols(t *testing.T) {
@@ -67,5 +69,56 @@ func TestInterfaceEmbedsEdge(t *testing.T) {
 	}
 	if count != 2 {
 		t.Errorf("expected 2 embeds edges from ReadWriter, got %d", count)
+	}
+}
+
+// TestStructEmbeddingCoversUnexportedTypes pins that an unexported wrapper gets
+// its embeds edge. Skipping unexported types made the embed invisible, so a
+// reader asking "what embeds X" got nothing and blast_radius reported zero
+// embedders by construction.
+func TestStructEmbeddingCoversUnexportedTypes(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/embed\n\ngo 1.21\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src := `package embed
+
+type Target interface {
+	Run()
+}
+
+// wrapper is unexported and embeds Target.
+type wrapper struct {
+	Target
+}
+
+// Outer is exported and embeds wrapper.
+type Outer struct {
+	wrapper
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "embed.go"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pr, err := parse.Run(dir)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	res := Run(pr)
+
+	found := map[string]bool{}
+	for _, e := range res.Edges {
+		if e.Edge.EdgeType == "embeds" {
+			found[e.Edge.FromRef+"->"+e.Edge.ToRef] = true
+		}
+	}
+	for _, want := range []string{
+		"example.com/embed.wrapper->example.com/embed.Target",
+		"example.com/embed.Outer->example.com/embed.wrapper",
+	} {
+		if !found[want] {
+			t.Errorf("missing embeds edge %s; got %v", want, found)
+		}
 	}
 }
